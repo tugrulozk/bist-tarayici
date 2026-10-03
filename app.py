@@ -26,7 +26,8 @@ NW_PENCERE = 50    # Nadaraya-Watson cekirdek uzunlugu (mum)
 MAE_PENCERE = 200  # bant genisligi icin ortalama hata penceresi (mum)
 
 
-SEMBOL_KALIBI = re.compile(r"^[A-Z0-9]{3,6}$")
+SEMBOL_KALIBI = re.compile(r"^(?=.*[A-Z])[A-Z0-9]{3,6}$")  # en az bir harf icermeli
+YOK_SAY = {"USD", "TRY", "EUR", "TTM", "EPS", "FKO", "POINT", "SEMBOL", "FIYAT", "HACIM", "PYS"}
 
 
 def liste_coz(metin):
@@ -38,9 +39,9 @@ def liste_coz(metin):
         parcalar = [p.upper().replace(".IS", "").split(":")[-1] for p in satir.split()]
         if not parcalar:
             continue
-        hepsi_kod = all(SEMBOL_KALIBI.match(p) for p in parcalar)
+        hepsi_kod = all(SEMBOL_KALIBI.match(p) and p not in YOK_SAY for p in parcalar)
         for p in (parcalar if hepsi_kod else parcalar[:1]):
-            if SEMBOL_KALIBI.match(p):
+            if SEMBOL_KALIBI.match(p) and p not in YOK_SAY:
                 sonuc.add(p)
     return sorted(sonuc)
 
