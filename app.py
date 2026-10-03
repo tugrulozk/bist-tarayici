@@ -1,4 +1,5 @@
 import datetime as dt
+import re
 from concurrent.futures import ThreadPoolExecutor
 
 import numpy as np
@@ -6,7 +7,7 @@ import pandas as pd
 import streamlit as st
 import yfinance as yf
 
-# Listeyi uygulama icinden de duzenleyebilirsin (kenar cubugundaki kutu).
+# Listeyi uygulama icinden de duzenleyebilirsin ("Hisse listesi" bolumu).
 VARSAYILAN_HISSELER = """AKBNK ALARK ARCLK ASELS ASTOR BIMAS BRSAN CCOLA CIMSA DOHOL
 EGEEN EKGYO ENJSA ENKAI EREGL FROTO GARAN GUBRF HALKB HEKTS ISCTR KCHOL KONTR
 KRDMD MAVI MGROS ODAS OYAKC PETKM PGSUS SAHOL SASA SISE SOKM TAVHL TCELL THYAO
@@ -14,33 +15,163 @@ TKFEN TOASO TSKB TTKOM TUPRS ULKER VAKBN VESTL YKBNK"""
 
 ARALIK_AYARLARI = {
     # aralik: (veri periyodu, mum suresi dakika)
-    "1h": ("60d", 60),
-    "30m": ("30d", 30),
-    "15m": ("30d", 15),
+    "1h": ("180d", 60),
+    "30m": ("60d", 30),
+    "15m": ("60d", 15),
 }
 
-MOD_KESISIM = "RSI eşiği yukarı kesti (dönüş sinyali)"
-MOD_ALTINDA = "RSI eşiğin altında (aşırı satış)"
+KRITERLER = ["MACD", "MFI", "Wave Trend", "Stoch RSI", "Nadaraya"]
+IDEAL_ARALIK = (-8.0, -2.0)  # gunluk degisim icin "ideal" bolge (%)
+NW_PENCERE = 50    # Nadaraya-Watson cekirdek uzunlugu (mum)
+MAE_PENCERE = 200  # bant genisligi icin ortalama hata penceresi (mum)
 
 
-def rsi_hesapla(kapanis: pd.Series, periyot: int = 14) -> pd.Series:
+SEMBOL_KALIBI = re.compile(r"^[A-Z0-9]{3,6}$")
+
+
+def liste_coz(metin):
+    """Kutuya yapistirilan metinden hisse kodlarini ayiklar.
+    Hem 'AKBNK GARAN THYAO' gibi kod listesini hem de kod + sirket adi iceren
+    tablo kopyalarini (her satirin ilk kelimesi) anlar."""
+    sonuc = set()
+    for satir in metin.replace(",", " ").replace(";", " ").splitlines():
+        parcalar = [p.upper().replace(".IS", "").split(":")[-1] for p in satir.split()]
+        if not parcalar:
+            continue
+        hepsi_kod = all(SEMBOL_KALIBI.match(p) for p in parcalar)
+        for p in (parcalar if hepsi_kod else parcalar[:1]):
+            if SEMBOL_KALIBI.match(p):
+                sonuc.add(p)
+    return sorted(sonuc)
+
+
+# ----------------------------------------------------------------- gostergeler
+def ema(s, n):
+    return s.ewm(span=n, adjust=False).mean()
+
+
+def dema(s, n):
+    e = ema(s, n)
+    return 2 * e - ema(e, n)
+
+
+def rsi_hesapla(kapanis, periyot=14):
     fark = kapanis.diff()
     kazanc = fark.clip(lower=0)
     kayip = -fark.clip(upper=0)
-    ort_kazanc = kazanc.ewm(alpha=1 / periyot, adjust=False, min_periods=periyot).mean()
-    ort_kayip = kayip.ewm(alpha=1 / periyot, adjust=False, min_periods=periyot).mean()
-    rs = ort_kazanc / ort_kayip.replace(0, np.nan)
+    ort_k = kazanc.ewm(alpha=1 / periyot, adjust=False, min_periods=periyot).mean()
+    ort_z = kayip.ewm(alpha=1 / periyot, adjust=False, min_periods=periyot).mean()
+    rs = ort_k / ort_z.replace(0, np.nan)
     rsi = 100 - 100 / (1 + rs)
-    rsi = rsi.where(ort_kayip != 0, 100.0)
-    return rsi.where(ort_kayip.notna())
+    rsi = rsi.where(ort_z != 0, 100.0)
+    return rsi.where(ort_z.notna())
 
 
+def mfi_hesapla(df, n=14):
+    tp = (df["High"] + df["Low"] + df["Close"]) / 3
+    akis = tp * df["Volume"]
+    poz = akis.where(tp > tp.shift(1), 0.0).rolling(n).sum()
+    neg = akis.where(tp < tp.shift(1), 0.0).rolling(n).sum()
+    oran = poz / neg.replace(0, np.nan)
+    mfi = 100 - 100 / (1 + oran)
+    return mfi.where(neg != 0, 100.0)
+
+
+def wave_trend(df, n1=10, n2=21):
+    ap = (df["High"] + df["Low"] + df["Close"]) / 3
+    esa = ema(ap, n1)
+    d = ema((ap - esa).abs(), n1)
+    ci = (ap - esa) / (0.015 * d.replace(0, np.nan))
+    wt1 = ema(ci, n2)
+    wt2 = wt1.rolling(4).mean()
+    return wt1, wt2
+
+
+def stoch_rsi(kapanis, rsi_n=14, stoch_n=14, k_n=3, d_n=3):
+    rsi = rsi_hesapla(kapanis, rsi_n)
+    alt = rsi.rolling(stoch_n).min()
+    ust = rsi.rolling(stoch_n).max()
+    st_ = (rsi - alt) / (ust - alt).replace(0, np.nan) * 100
+    k = st_.rolling(k_n).mean()
+    d = k.rolling(d_n).mean()
+    return k, d
+
+
+def nadaraya_watson(kapanis, h=8.0, carpan=3.0):
+    """Gecmisi degistirmeyen (sadece onceki mumlara bakan) versiyon."""
+    x = kapanis.to_numpy(dtype=float)
+    w = np.exp(-(np.arange(NW_PENCERE) ** 2) / (2 * h * h))
+    nw = np.convolve(x, w, mode="full")[: len(x)] / w.sum()
+    nw[: NW_PENCERE - 1] = np.nan
+    nw = pd.Series(nw, index=kapanis.index)
+    mae = (kapanis - nw).abs().rolling(MAE_PENCERE).mean() * carpan
+    return nw, nw - mae, nw + mae
+
+
+def yukari_kesti(a, b, son_n):
+    k = (a.shift(1) <= b.shift(1)) & (a > b)
+    return bool(k.iloc[-son_n:].any())
+
+
+# ------------------------------------------------------------------- kriterler
+def kriter_macd(df, p):
+    macd = dema(df["Close"], 12) - dema(df["Close"], 26)
+    sinyal = ema(macd, 9)
+    hist = macd - sinyal
+    altinda = bool(macd.iloc[-1] < p["macd_seviye"])
+    kesti = yukari_kesti(macd, sinyal, p["son_n"])
+    h1, h0 = hist.iloc[-1], hist.iloc[-2]
+    yakin = bool(h1 < 0 and h1 > h0 and abs(h1) <= p["macd_yakinlik"] * hist.abs().iloc[-50:].max())
+    durum = 2 if (altinda and kesti) else 1 if (altinda and yakin) else 0
+    return durum, f"{macd.iloc[-1]:.2f}"
+
+
+def kriter_mfi(df, p):
+    v = mfi_hesapla(df).iloc[-1]
+    durum = 2 if v <= p["mfi_os"] else 1 if v <= p["mfi_os"] + 8 else 0
+    return durum, f"{v:.0f}"
+
+
+def kriter_wt(df, p):
+    wt1, wt2 = wave_trend(df)
+    kesti = yukari_kesti(wt1, wt2, p["son_n"])
+    altta = bool(wt1.iloc[-1] < 0)
+    yaklasiyor = bool(wt1.iloc[-1] < wt2.iloc[-1] and wt1.iloc[-1] > wt1.iloc[-2]
+                      and (wt2.iloc[-1] - wt1.iloc[-1]) <= p["wt_yakin"] and altta)
+    durum = 2 if (kesti and altta) else 1 if yaklasiyor else 0
+    return durum, f"{wt1.iloc[-1]:.0f}"
+
+
+def kriter_stoch(df, p):
+    k, d = stoch_rsi(df["Close"])
+    kesti = yukari_kesti(k, d, p["son_n"])
+    asiri = bool(k.iloc[-(p["son_n"] + 1):].min() <= p["stoch_os"])
+    yakin_asiri = bool(k.iloc[-1] <= p["stoch_os"] + 10)
+    durum = 2 if (asiri and kesti) else 1 if (asiri or (yakin_asiri and kesti)) else 0
+    return durum, f"{k.iloc[-1]:.0f}"
+
+
+def kriter_nw(df, p):
+    nw, alt, ust = nadaraya_watson(df["Close"], p["nw_h"], p["nw_carpan"])
+    n = p["son_n"] + 1
+    degdi = bool((df["Low"].iloc[-n:] <= alt.iloc[-n:]).any())
+    donus = bool(df["Close"].iloc[-1] > df["Close"].iloc[-2])
+    kapanis = df["Close"].iloc[-1]
+    yakin = bool((kapanis - alt.iloc[-1]) <= 0.2 * (nw.iloc[-1] - alt.iloc[-1]))
+    durum = 2 if (degdi and donus) else 1 if (degdi or yakin) else 0
+    konum = (kapanis - alt.iloc[-1]) / (ust.iloc[-1] - alt.iloc[-1]) * 100
+    return durum, f"%{konum:.0f}"
+
+
+KRITER_FONKSIYONLARI = [kriter_macd, kriter_mfi, kriter_wt, kriter_stoch, kriter_nw]
+ISARET = {2: "✅", 1: "🟡", 0: "—"}
+
+
+# ------------------------------------------------------------------------ veri
 @st.cache_data(ttl=600, show_spinner=False)
-def veri_cek(sembol: str, periyot: str, aralik: str):
+def veri_cek(sembol, periyot, aralik):
     try:
-        df = yf.Ticker(sembol + ".IS").history(
-            period=periyot, interval=aralik, auto_adjust=True
-        )
+        df = yf.Ticker(sembol + ".IS").history(period=periyot, interval=aralik, auto_adjust=True)
     except Exception:
         return None
     if df is None or df.empty:
@@ -54,109 +185,91 @@ def veri_cek(sembol: str, periyot: str, aralik: str):
     return df
 
 
-def analiz_et(
-    df: pd.DataFrame,
-    sembol: str,
-    mum_dakika: int,
-    rsi_periyot: int,
-    esik: float,
-    mod: str,
-    geriye_bakis: int,
-    ema_filtre: bool,
-    ema_periyot: int,
-    hacim_periyot: int,
-    min_goreceli_hacim: float,
-    olusan_mumu_cikar: bool,
-    simdi=None,
-):
-    df = df.copy()
+def gunluk_degisim(df):
+    gunler = np.array(df.index.date)
+    onceki = df[gunler != gunler[-1]]
+    if onceki.empty:
+        return np.nan
+    return (df["Close"].iloc[-1] / onceki["Close"].iloc[-1] - 1) * 100
 
-    if olusan_mumu_cikar and len(df) > 0:
+
+def analiz_et(df, sembol, mum_dakika, p, simdi=None):
+    df = df.copy()
+    if p["olusan_mumu_cikar"] and len(df) > 0:
         if simdi is None:
             simdi = pd.Timestamp.now(tz="Europe/Istanbul")
-        son_baslangic = df.index[-1]
-        bitis = son_baslangic + pd.Timedelta(minutes=mum_dakika)
+        bas = df.index[-1]
+        bitis = bas + pd.Timedelta(minutes=mum_dakika)
         # Seans 18:00'de biter; ondan sonra son mum tamamlanmis sayilir.
-        if bitis > simdi and son_baslangic.date() == simdi.date() and simdi.hour < 18:
+        if bitis > simdi and bas.date() == simdi.date() and simdi.hour < 18:
             df = df.iloc[:-1]
 
-    gerekli = max(rsi_periyot, ema_periyot, hacim_periyot) + geriye_bakis + 5
-    if len(df) < gerekli:
+    if len(df) < NW_PENCERE + MAE_PENCERE + 20:
         return None
 
-    df["rsi"] = rsi_hesapla(df["Close"], rsi_periyot)
-    df["ema"] = df["Close"].ewm(span=ema_periyot, adjust=False).mean()
-    ort_hacim = df["Volume"].rolling(hacim_periyot).mean().shift(1)
-    df["gh"] = df["Volume"] / ort_hacim.replace(0, np.nan)
+    durumlar, metinler = [], []
+    for f in KRITER_FONKSIYONLARI:
+        d, t = f(df, p)
+        durumlar.append(d)
+        metinler.append(t)
 
-    son = df.iloc[-1]
-    if pd.isna(son["rsi"]):
-        return None
+    tam = sum(1 for d in durumlar if d == 2)
+    yakin = sum(1 for d in durumlar if d == 1)
+    puan = tam + (yakin if p["yakin_say"] else 0)
 
-    if mod == MOD_KESISIM:
-        kesis = (df["rsi"].shift(1) < esik) & (df["rsi"] >= esik)
-        rsi_sinyal = bool(kesis.iloc[-geriye_bakis:].any())
-    else:
-        rsi_sinyal = bool(son["rsi"] < esik)
-
-    ema_tamam = (not ema_filtre) or bool(son["Close"] > son["ema"])
-
-    gh_son = df["gh"].iloc[-geriye_bakis:].max()
-    gh_son = 0.0 if pd.isna(gh_son) else float(gh_son)
-    hacim_tamam = gh_son >= min_goreceli_hacim
-
-    return {
+    degisim = gunluk_degisim(df)
+    satir = {
         "Hisse": sembol,
-        "Fiyat": round(float(son["Close"]), 2),
-        "RSI": round(float(son["rsi"]), 1),
-        "EMA'ya uzaklık %": round(float((son["Close"] / son["ema"] - 1) * 100), 2),
-        "Göreceli hacim": round(gh_son, 2),
-        "Son mum (TR saati)": df.index[-1].strftime("%d.%m %H:%M"),
-        "_gecti": rsi_sinyal and ema_tamam and hacim_tamam,
+        "Fiyat": round(float(df["Close"].iloc[-1]), 2),
+        "Günlük %": round(float(degisim), 2) if not np.isnan(degisim) else np.nan,
+        "Puan": puan,
+        "İdeal": "⭐" if IDEAL_ARALIK[0] <= degisim <= IDEAL_ARALIK[1] else "",
     }
+    for ad, d, t in zip(KRITERLER, durumlar, metinler):
+        satir[ad] = f"{ISARET[d]} {t}"
+    satir["Son mum (TR)"] = df.index[-1].strftime("%d.%m %H:%M")
+    return satir
 
 
+# --------------------------------------------------------------------- arayuz
 def main():
     st.set_page_config(page_title="BIST Saatlik Tarayıcı", page_icon="📈", layout="wide")
     st.title("📈 BIST Saatlik Tarayıcı")
     st.caption(
         "Veriler ücretsiz kaynaktan gelir ve gecikmelidir (yaklaşık 15 dk). "
         "Bu araç sadece aday listesi üretir, yatırım tavsiyesi değildir. "
-        "İşleme girmeden önce güncel fiyatı aracı kurum ekranından kontrol et."
+        "İşleme girmeden önce grafikte teyit et ve güncel fiyatı aracı kurum ekranından kontrol et."
     )
 
     with st.sidebar:
         st.header("Ayarlar")
         aralik = st.selectbox("Zaman dilimi", list(ARALIK_AYARLARI.keys()), index=0)
-        mod = st.radio("Sinyal türü", [MOD_KESISIM, MOD_ALTINDA])
-        rsi_periyot = st.number_input("RSI periyodu", 2, 50, 14)
-        esik = st.slider("RSI eşiği", 10, 50, 30)
-        geriye_bakis = 1
-        if mod == MOD_KESISIM:
-            geriye_bakis = st.slider(
-                "Kesişim son kaç mumda olsun?", 1, 5, 1,
-                help="1 = sadece son kapanan mumda. 3 = son 3 mumdan birinde.",
-            )
-        st.divider()
-        ema_filtre = st.checkbox("Fiyat EMA üstünde olsun (trend filtresi)", value=True)
-        ema_periyot = st.number_input("EMA periyodu", 5, 200, 50)
-        st.divider()
-        min_gh = st.slider(
-            "Minimum göreceli hacim", 0.0, 3.0, 1.0, 0.1,
-            help="Mum hacmi / önceki ortalama hacim. 0 yaparsan hacim filtresi kapanır.",
+        en_az = st.slider("En az kaç kriter sağlansın?", 1, 5, 2)
+        max_degisim = st.slider(
+            "Günlük değişim bundan düşük olsun (%)", -10.0, 5.0, -1.0, 0.5,
+            help="Örn. -1 = hisse günü en az %1 eksi olsun. 5 yaparsan bu filtre fiilen kapanır. "
+                 "⭐ işareti -%2 ile -%8 arası ideal bölgeyi gösterir.",
         )
-        hacim_periyot = st.number_input("Ortalama hacim için mum sayısı", 5, 100, 20)
-        st.divider()
-        olusan_mumu_cikar = st.checkbox(
-            "Henüz kapanmamış mumu hariç tut", value=True,
-            help="Açıksa sadece kapanmış mumlara göre sinyal aranır.",
-        )
-        metin = st.text_area("Taranacak hisseler (boşluk veya virgülle ayır)",
-                             VARSAYILAN_HISSELER, height=200)
+        with st.expander("Hisse listesi"):
+            metin = st.text_area("Kodları yapıştır (boşluk, virgül veya alt alta)", VARSAYILAN_HISSELER, height=180)
+        with st.expander("Gelişmiş ayarlar"):
+            yakin_say = st.checkbox("🟡 'yakın' durumları da say", value=True)
+            olusan_mumu_cikar = st.checkbox("Kapanmamış mumu hariç tut", value=True)
+            son_n = st.slider("Kesişim/değme son kaç mumda aransın?", 1, 5, 2)
+            macd_seviye = st.number_input("MACD DEMA seviyesi", value=0.0, step=0.1)
+            macd_yakinlik = st.slider("MACD kesişime yakınlık", 0.1, 0.8, 0.3, 0.05)
+            mfi_os = st.slider("MFI aşırı satış", 10, 40, 20)
+            stoch_os = st.slider("Stoch RSI aşırı satış", 10, 40, 20)
+            wt_yakin = st.slider("Wave Trend kesişime yakınlık", 1.0, 10.0, 4.0, 0.5)
+            nw_h = st.slider("Nadaraya bant genişliği (h)", 3.0, 15.0, 8.0, 0.5)
+            nw_carpan = st.slider("Nadaraya bant çarpanı", 1.0, 5.0, 3.0, 0.5)
 
-    semboller = sorted({s.strip().upper().replace(".IS", "")
-                        for s in metin.replace(",", " ").split() if s.strip()})
+    p = dict(yakin_say=yakin_say, olusan_mumu_cikar=olusan_mumu_cikar, son_n=int(son_n),
+             macd_seviye=float(macd_seviye), macd_yakinlik=float(macd_yakinlik),
+             mfi_os=float(mfi_os), stoch_os=float(stoch_os), wt_yakin=float(wt_yakin),
+             nw_h=float(nw_h), nw_carpan=float(nw_carpan))
 
+    semboller = liste_coz(metin)
     st.write(f"**{len(semboller)}** hisse taranacak.")
     if not st.button("🔍 Tara", type="primary"):
         st.info("Soldaki ayarları kontrol edip **Tara** düğmesine bas.")
@@ -178,36 +291,33 @@ def main():
     sonuclar, verisiz = [], []
     for s in semboller:
         df = veriler.get(s)
-        if df is None:
-            verisiz.append(s)
-            continue
-        r = analiz_et(df, s, mum_dakika, int(rsi_periyot), float(esik), mod,
-                      int(geriye_bakis), ema_filtre, int(ema_periyot),
-                      int(hacim_periyot), float(min_gh), olusan_mumu_cikar)
+        r = analiz_et(df, s, mum_dakika, p) if df is not None else None
         if r is None:
             verisiz.append(s)
         else:
             sonuclar.append(r)
 
     st.caption(f"Tarama zamanı: {dt.datetime.now().strftime('%d.%m.%Y %H:%M')} (sunucu saati)")
-
     if not sonuclar:
         st.error("Hiçbir hissenin verisi alınamadı. Birkaç dakika sonra tekrar dene.")
         return
 
     tablo = pd.DataFrame(sonuclar)
-    gecenler = tablo[tablo["_gecti"]].drop(columns="_gecti").sort_values("RSI")
+    sinyal = tablo[(tablo["Puan"] >= en_az) & (tablo["Günlük %"] <= max_degisim)]
+    sinyal = sinyal.sort_values(["Puan", "Günlük %"], ascending=[False, True])
 
-    st.subheader(f"Sinyal veren hisseler ({len(gecenler)})")
-    if gecenler.empty:
-        st.warning("Şu an tüm şartları sağlayan hisse yok. Filtreleri gevşetmeyi deneyebilirsin.")
+    st.subheader(f"Aday hisseler ({len(sinyal)})")
+    st.caption("✅ = kriter sağlandı   🟡 = kriter yakın   — = sağlanmadı. "
+               "Yanındaki sayı göstergenin değeridir (Nadaraya'da %0 alt bant, %100 üst bant).")
+    if sinyal.empty:
+        st.warning("Şu an şartları sağlayan hisse yok. 'En az kriter' ya da günlük değişim filtresini gevşetmeyi dene.")
     else:
-        st.dataframe(gecenler, hide_index=True)
-        st.download_button("CSV olarak indir", gecenler.to_csv(index=False).encode("utf-8"),
+        st.dataframe(sinyal, hide_index=True)
+        st.download_button("CSV olarak indir", sinyal.to_csv(index=False).encode("utf-8"),
                            "tarama_sonucu.csv", "text/csv")
 
     with st.expander(f"Taranan tüm hisseler ({len(tablo)})"):
-        st.dataframe(tablo.drop(columns="_gecti").sort_values("RSI"), hide_index=True)
+        st.dataframe(tablo.sort_values("Puan", ascending=False), hide_index=True)
     if verisiz:
         st.caption("Verisi alınamayan veya yetersiz olan hisseler: " + ", ".join(verisiz))
 
