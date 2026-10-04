@@ -1,5 +1,6 @@
 import datetime as dt
 import re
+from pathlib import Path
 from concurrent.futures import ThreadPoolExecutor
 
 import numpy as np
@@ -30,7 +31,8 @@ MAE_PENCERE = 200  # bant genisligi icin ortalama hata penceresi (mum)
 
 
 SEMBOL_KALIBI = re.compile(r"^(?=.*[A-Z])[A-Z0-9]{3,6}$")  # en az bir harf icermeli
-YOK_SAY = {"USD", "TRY", "EUR", "TTM", "EPS", "FKO", "POINT", "SEMBOL", "FIYAT", "HACIM", "PYS"}
+YOK_SAY = {"USD", "TRY", "EUR", "TTM", "EPS", "FKO", "POINT", "SEMBOL", "FIYAT", "HACIM", "PYS",
+           "FINANS", "ENERJI", "SAT"}
 
 
 def liste_coz(metin):
@@ -47,6 +49,18 @@ def liste_coz(metin):
             if SEMBOL_KALIBI.match(p) and p not in YOK_SAY:
                 sonuc.add(p)
     return sorted(sonuc)
+
+
+def varsayilan_liste():
+    """Depodaki hisseler.txt dosyasi varsa onu, yoksa koddaki listeyi kullanir."""
+    try:
+        icerik = (Path(__file__).parent / "hisseler.txt").read_text(encoding="utf-8")
+        kodlar = liste_coz(icerik)
+        if kodlar:
+            return " ".join(kodlar)
+    except Exception:
+        pass
+    return VARSAYILAN_HISSELER
 
 
 # ----------------------------------------------------------------- gostergeler
@@ -197,17 +211,20 @@ def gunluk_degisim(df):
     return (df["Close"].iloc[-1] / onceki["Close"].iloc[-1] - 1) * 100
 
 
-def tepeden_dusus(df):
-    """Bugunku seansin en yuksek fiyatindan son kapanisa dusus (%)."""
+def bugunku_mumlar(df):
     gunler = np.array(df.index.date)
-    bugun = df[gunler == gunler[-1]]
-    return (df["Close"].iloc[-1] / bugun["High"].max() - 1) * 100
+    return df[gunler == gunler[-1]]
 
 
-def dusus_maskesi(tablo, min_dusus, tepe_say, taban_haric):
+def acilistan_dusus(df):
+    """Bugunku seansin acilis fiyatindan son kapanisa degisim (%)."""
+    return (df["Close"].iloc[-1] / bugunku_mumlar(df)["Open"].iloc[0] - 1) * 100
+
+
+def dusus_maskesi(tablo, min_dusus, acilis_say, taban_haric):
     maske = tablo["Günlük %"] <= -min_dusus
-    if tepe_say:
-        maske = maske | (tablo["Tepeden %"] <= -min_dusus)
+    if acilis_say:
+        maske = maske | (tablo["Açılıştan %"] <= -min_dusus)
     if taban_haric:
         maske = maske & ~(tablo["Günlük %"] <= TABAN_ESIGI)
     return maske
@@ -238,7 +255,9 @@ def analiz_et(df, sembol, mum_dakika, p, simdi=None):
     puan = tam + (yakin if p["yakin_say"] else 0)
 
     degisim = gunluk_degisim(df)
-    tepe = tepeden_dusus(df)
+    acilis = acilistan_dusus(df)
+    bugun = bugunku_mumlar(df)
+    tutar = float((bugun["Close"] * bugun["Volume"]).sum() / 1e6)
     if not np.isnan(degisim) and degisim <= TABAN_ESIGI:
         not_ = "⛔ taban"
     elif IDEAL_ARALIK[0] <= degisim <= IDEAL_ARALIK[1]:
@@ -249,7 +268,8 @@ def analiz_et(df, sembol, mum_dakika, p, simdi=None):
         "Hisse": sembol,
         "Fiyat": round(float(df["Close"].iloc[-1]), 2),
         "Günlük %": round(float(degisim), 2) if not np.isnan(degisim) else np.nan,
-        "Tepeden %": round(float(tepe), 2),
+        "Açılıştan %": round(float(acilis), 2),
+        "Tutar (mn TL)": round(tutar, 1),
         "Puan": puan,
         "Not": not_,
     }
@@ -275,8 +295,9 @@ def main():
         en_az = st.slider("En az kaç kriter sağlansın?", 1, 5, 2)
         min_dusus = st.slider(
             "Gün içinde en az % kaç düşmüş olsun?", 0.0, 9.0, 4.0, 0.5,
-            help="Hisse, önceki kapanışa göre (açılış boşluğu dahil) ya da gün içi tepesinden "
-                 "bu kadar düşmüş olmalı. ⭐ = -%4 ile -%8 arası. 0 yaparsan filtre fiilen kapanır.",
+            help="Hisse, önceki kapanışa göre (açılıştaki boşluk dahil) ya da bugünkü açılış "
+                 "fiyatına göre bu kadar düşmüş olmalı. ⭐ = -%4 ile -%8 arası. "
+                 "0 yaparsan filtre fiilen kapanır.",
         )
         taban_haric = st.checkbox(
             "Tabana oturmuşları hariç tut", value=True,
@@ -284,11 +305,13 @@ def main():
                  "(BIST'te alt limit %10).",
         )
         with st.expander("Hisse listesi"):
-            metin = st.text_area("Kodları yapıştır (boşluk, virgül veya alt alta)", VARSAYILAN_HISSELER, height=180)
+            metin = st.text_area("Kodları yapıştır (boşluk, virgül veya alt alta)", varsayilan_liste(), height=180)
         with st.expander("Gelişmiş ayarlar"):
-            tepe_say = st.checkbox("Gün içi tepeden düşüşü de say", value=True,
-                                   help="Açıksa hisse sadece önceki kapanışa göre değil, gün içi "
-                                        "zirvesinden de düşüşe bakılır.")
+            acilis_say = st.checkbox("Açılış fiyatına göre düşüşü de say", value=True,
+                                     help="Açıksa hisse sadece önceki kapanışa göre değil, bugünkü "
+                                          "açılış fiyatına göre düşüşe de bakılır.")
+            min_tutar = st.slider("Bugünkü minimum işlem tutarı (milyon TL)", 0, 100, 0,
+                                  help="Düşük hacimli hisseleri elemek için. 0 = filtre kapalı.")
             yakin_say = st.checkbox("🟡 'yakın' durumları da say", value=True)
             olusan_mumu_cikar = st.checkbox("Kapanmamış mumu hariç tut", value=True)
             son_n = st.slider("Kesişim/değme son kaç mumda aransın?", 1, 5, 4)
@@ -318,7 +341,7 @@ def main():
     def getir(s):
         return s, veri_cek(s, periyot, aralik)
 
-    with ThreadPoolExecutor(max_workers=5) as havuz:
+    with ThreadPoolExecutor(max_workers=8) as havuz:
         for i, (s, df) in enumerate(havuz.map(getir, semboller), start=1):
             veriler[s] = df
             ilerleme.progress(i / len(semboller), text=f"Veriler çekiliyor... {i}/{len(semboller)}")
@@ -339,7 +362,8 @@ def main():
         return
 
     tablo = pd.DataFrame(sonuclar)
-    sinyal = tablo[(tablo["Puan"] >= en_az) & dusus_maskesi(tablo, min_dusus, tepe_say, taban_haric)]
+    sinyal = tablo[(tablo["Puan"] >= en_az) & dusus_maskesi(tablo, min_dusus, acilis_say, taban_haric)
+                  & (tablo["Tutar (mn TL)"] >= min_tutar)]
     sinyal = sinyal.sort_values(["Puan", "Günlük %"], ascending=[False, True])
 
     st.subheader(f"Aday hisseler ({len(sinyal)})")
