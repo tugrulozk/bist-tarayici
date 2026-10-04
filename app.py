@@ -8,10 +8,12 @@ import streamlit as st
 import yfinance as yf
 
 # Listeyi uygulama icinden de duzenleyebilirsin ("Hisse listesi" bolumu).
-VARSAYILAN_HISSELER = """AKBNK ALARK ARCLK ASELS ASTOR BIMAS BRSAN CCOLA CIMSA DOHOL
-EGEEN EKGYO ENJSA ENKAI EREGL FROTO GARAN GUBRF HALKB HEKTS ISCTR KCHOL KONTR
-KRDMD MAVI MGROS ODAS OYAKC PETKM PGSUS SAHOL SASA SISE SOKM TAVHL TCELL THYAO
-TKFEN TOASO TSKB TTKOM TUPRS ULKER VAKBN VESTL YKBNK"""
+VARSAYILAN_HISSELER = """ASELS TUPRS GARAN KCHOL ENKAI BIMAS THYAO AKBNK ISCTR VAKBN HALKB YKBNK FROTO EREGL CCOLA
+ASTOR TCELL TTKOM SAHOL ISDMR TRALT GUBRF ENJSA TOASO ENERY AHGAZ SISE TURSG AEFES OYAKC SASA BRSAN TAVHL
+TRGYO MGROS AKSEN TKFEN MPARK AGHOL PGSUS EKGYO RGYAS AYGAZ TABGD ARCLK TRMET RYSAS PETKM CVKMD ANSGR
+KRDMD GLRMK ISMEN DOHOL ECILC ANHYT ALARK BRYAT AKSA OTKAR TTRAK CIMSA AKCNS SOKM ULKER GLYHO MAVI DOAS
+TSKB GRSEL AKFYE TRENJ ECZYT CWENE TCKRC ALBRK KCAER PAHOL HEKTS ENTRA EGEEN FENER OBAMS ALTNY LMKDC
+BTCIM KORDS GWIND SNGYO CANTE EGGUB ZOREN TUKAS ODAS BERA KARSN BINHO EUREN VESTL KATMR"""
 
 ARALIK_AYARLARI = {
     # aralik: (veri periyodu, mum suresi dakika)
@@ -21,7 +23,8 @@ ARALIK_AYARLARI = {
 }
 
 KRITERLER = ["MACD", "MFI", "Wave Trend", "Stoch RSI", "Nadaraya"]
-IDEAL_ARALIK = (-8.0, -2.0)  # gunluk degisim icin "ideal" bolge (%)
+IDEAL_ARALIK = (-8.0, -4.0)  # gunluk degisim icin "ideal" bolge (%)
+TABAN_ESIGI = -9.5  # BIST'te alt limit %10; bunun altindakiler tabana oturmus sayilir
 NW_PENCERE = 50    # Nadaraya-Watson cekirdek uzunlugu (mum)
 MAE_PENCERE = 200  # bant genisligi icin ortalama hata penceresi (mum)
 
@@ -194,6 +197,22 @@ def gunluk_degisim(df):
     return (df["Close"].iloc[-1] / onceki["Close"].iloc[-1] - 1) * 100
 
 
+def tepeden_dusus(df):
+    """Bugunku seansin en yuksek fiyatindan son kapanisa dusus (%)."""
+    gunler = np.array(df.index.date)
+    bugun = df[gunler == gunler[-1]]
+    return (df["Close"].iloc[-1] / bugun["High"].max() - 1) * 100
+
+
+def dusus_maskesi(tablo, min_dusus, tepe_say, taban_haric):
+    maske = tablo["Günlük %"] <= -min_dusus
+    if tepe_say:
+        maske = maske | (tablo["Tepeden %"] <= -min_dusus)
+    if taban_haric:
+        maske = maske & ~(tablo["Günlük %"] <= TABAN_ESIGI)
+    return maske
+
+
 def analiz_et(df, sembol, mum_dakika, p, simdi=None):
     df = df.copy()
     if p["olusan_mumu_cikar"] and len(df) > 0:
@@ -219,12 +238,20 @@ def analiz_et(df, sembol, mum_dakika, p, simdi=None):
     puan = tam + (yakin if p["yakin_say"] else 0)
 
     degisim = gunluk_degisim(df)
+    tepe = tepeden_dusus(df)
+    if not np.isnan(degisim) and degisim <= TABAN_ESIGI:
+        not_ = "⛔ taban"
+    elif IDEAL_ARALIK[0] <= degisim <= IDEAL_ARALIK[1]:
+        not_ = "⭐"
+    else:
+        not_ = ""
     satir = {
         "Hisse": sembol,
         "Fiyat": round(float(df["Close"].iloc[-1]), 2),
         "Günlük %": round(float(degisim), 2) if not np.isnan(degisim) else np.nan,
+        "Tepeden %": round(float(tepe), 2),
         "Puan": puan,
-        "İdeal": "⭐" if IDEAL_ARALIK[0] <= degisim <= IDEAL_ARALIK[1] else "",
+        "Not": not_,
     }
     for ad, d, t in zip(KRITERLER, durumlar, metinler):
         satir[ad] = f"{ISARET[d]} {t}"
@@ -246,17 +273,25 @@ def main():
         st.header("Ayarlar")
         aralik = st.selectbox("Zaman dilimi", list(ARALIK_AYARLARI.keys()), index=0)
         en_az = st.slider("En az kaç kriter sağlansın?", 1, 5, 2)
-        max_degisim = st.slider(
-            "Günlük değişim bundan düşük olsun (%)", -10.0, 5.0, -1.0, 0.5,
-            help="Örn. -1 = hisse günü en az %1 eksi olsun. 5 yaparsan bu filtre fiilen kapanır. "
-                 "⭐ işareti -%2 ile -%8 arası ideal bölgeyi gösterir.",
+        min_dusus = st.slider(
+            "Gün içinde en az % kaç düşmüş olsun?", 0.0, 9.0, 4.0, 0.5,
+            help="Hisse, önceki kapanışa göre (açılış boşluğu dahil) ya da gün içi tepesinden "
+                 "bu kadar düşmüş olmalı. ⭐ = -%4 ile -%8 arası. 0 yaparsan filtre fiilen kapanır.",
+        )
+        taban_haric = st.checkbox(
+            "Tabana oturmuşları hariç tut", value=True,
+            help="Günlük değişimi yaklaşık -%9,5 ve altında olan hisseler tabana oturmuş sayılır "
+                 "(BIST'te alt limit %10).",
         )
         with st.expander("Hisse listesi"):
             metin = st.text_area("Kodları yapıştır (boşluk, virgül veya alt alta)", VARSAYILAN_HISSELER, height=180)
         with st.expander("Gelişmiş ayarlar"):
+            tepe_say = st.checkbox("Gün içi tepeden düşüşü de say", value=True,
+                                   help="Açıksa hisse sadece önceki kapanışa göre değil, gün içi "
+                                        "zirvesinden de düşüşe bakılır.")
             yakin_say = st.checkbox("🟡 'yakın' durumları da say", value=True)
             olusan_mumu_cikar = st.checkbox("Kapanmamış mumu hariç tut", value=True)
-            son_n = st.slider("Kesişim/değme son kaç mumda aransın?", 1, 5, 2)
+            son_n = st.slider("Kesişim/değme son kaç mumda aransın?", 1, 5, 4)
             macd_seviye = st.number_input("MACD DEMA seviyesi", value=0.0, step=0.1)
             macd_yakinlik = st.slider("MACD kesişime yakınlık", 0.1, 0.8, 0.3, 0.05)
             mfi_os = st.slider("MFI aşırı satış", 10, 40, 20)
@@ -304,14 +339,14 @@ def main():
         return
 
     tablo = pd.DataFrame(sonuclar)
-    sinyal = tablo[(tablo["Puan"] >= en_az) & (tablo["Günlük %"] <= max_degisim)]
+    sinyal = tablo[(tablo["Puan"] >= en_az) & dusus_maskesi(tablo, min_dusus, tepe_say, taban_haric)]
     sinyal = sinyal.sort_values(["Puan", "Günlük %"], ascending=[False, True])
 
     st.subheader(f"Aday hisseler ({len(sinyal)})")
     st.caption("✅ = kriter sağlandı   🟡 = kriter yakın   — = sağlanmadı. "
                "Yanındaki sayı göstergenin değeridir (Nadaraya'da %0 alt bant, %100 üst bant).")
     if sinyal.empty:
-        st.warning("Şu an şartları sağlayan hisse yok. 'En az kriter' ya da günlük değişim filtresini gevşetmeyi dene.")
+        st.warning("Şu an şartları sağlayan hisse yok. 'En az kriter' sayısını ya da düşüş eşiğini gevşetmeyi dene.")
     else:
         st.dataframe(sinyal, hide_index=True)
         st.download_button("CSV olarak indir", sinyal.to_csv(index=False).encode("utf-8"),
