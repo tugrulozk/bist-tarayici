@@ -131,6 +131,25 @@ def yukari_kesti(a, b, son_n):
     return bool(k.iloc[-son_n:].any())
 
 
+def atr_hesapla(df, n=14):
+    """Ortalama gercek aralik (Wilder yontemi): mumun normal oynama miktari."""
+    onceki = df["Close"].shift(1)
+    tr = pd.concat([df["High"] - df["Low"],
+                    (df["High"] - onceki).abs(),
+                    (df["Low"] - onceki).abs()], axis=1).max(axis=1)
+    return tr.ewm(alpha=1 / n, adjust=False, min_periods=n).mean()
+
+
+def donus_teyidi(df):
+    """Dusen hissede tepki basladi mi? 3 basit kontrol (son kapanmis mum):
+    yesil mum, hacim son 20 mum ortalamasinin ustunde, onceki mumun dibi kirilmamis."""
+    yesil = bool(df["Close"].iloc[-1] > df["Open"].iloc[-1])
+    hacim = bool(df["Volume"].iloc[-1] > df["Volume"].iloc[-21:-1].mean())
+    dip = bool(df["Low"].iloc[-1] >= df["Low"].iloc[-2])
+    isaret = ("🟢" if yesil else "") + ("📊" if hacim else "") + ("🔒" if dip else "")
+    return int(yesil) + int(hacim) + int(dip), isaret
+
+
 # ------------------------------------------------------------------- kriterler
 def kriter_macd(df, p):
     macd = dema(df["Close"], 12) - dema(df["Close"], 26)
@@ -264,6 +283,14 @@ def analiz_et(df, sembol, mum_dakika, p, simdi=None):
         not_ = "⭐"
     else:
         not_ = ""
+    fiyat = float(df["Close"].iloc[-1])
+    atr = float(atr_hesapla(df).iloc[-1])
+    stop = fiyat - p["stop_atr"] * atr
+    nw_orta = float(nadaraya_watson(df["Close"], p["nw_h"], p["nw_carpan"])[0].iloc[-1])
+    hedef = nw_orta if nw_orta > fiyat else np.nan
+    risk = fiyat - stop
+    rg = (hedef - fiyat) / risk if (not np.isnan(hedef) and risk > 0) else np.nan
+    teyit_n, teyit_isaret = donus_teyidi(df)
     satir = {
         "Hisse": sembol,
         "Fiyat": round(float(df["Close"].iloc[-1]), 2),
@@ -275,6 +302,12 @@ def analiz_et(df, sembol, mum_dakika, p, simdi=None):
     }
     for ad, d, t in zip(KRITERLER, durumlar, metinler):
         satir[ad] = f"{ISARET[d]} {t}"
+    satir["Teyit"] = f"{teyit_n}/3 {teyit_isaret}".strip()
+    satir["ATR %"] = round(atr / fiyat * 100, 2)
+    satir["Stop"] = round(stop, 2)
+    satir["Hedef"] = round(hedef, 2) if not np.isnan(hedef) else np.nan
+    satir["R/G"] = round(rg, 1) if not np.isnan(rg) else np.nan
+    satir["Grafik"] = "https://www.tradingview.com/chart/?symbol=BIST%3A" + sembol
     satir["Son mum (TR)"] = df.index[-1].strftime("%d.%m %H:%M")
     return satir
 
@@ -299,6 +332,11 @@ def main():
                  "fiyatına göre bu kadar düşmüş olmalı. ⭐ = -%4 ile -%8 arası. "
                  "0 yaparsan filtre fiilen kapanır.",
         )
+        en_az_teyit = st.slider(
+            "En az kaç dönüş teyidi olsun?", 0, 3, 0,
+            help="🟢 son kapanmış mum yeşil, 📊 hacim son 20 mum ortalamasının üstünde, "
+                 "🔒 son mum bir öncekinin dibini kırmamış. 0 = filtre kapalı (sadece tabloda gösterilir).",
+        )
         taban_haric = st.checkbox(
             "Tabana oturmuşları hariç tut", value=True,
             help="Günlük değişimi yaklaşık -%9,5 ve altında olan hisseler tabana oturmuş sayılır "
@@ -322,11 +360,13 @@ def main():
             wt_yakin = st.slider("Wave Trend kesişime yakınlık", 1.0, 10.0, 4.0, 0.5)
             nw_h = st.slider("Nadaraya bant genişliği (h)", 3.0, 15.0, 8.0, 0.5)
             nw_carpan = st.slider("Nadaraya bant çarpanı", 1.0, 5.0, 3.0, 0.5)
+            stop_atr = st.slider("Örnek stop mesafesi (kaç ATR)", 0.5, 4.0, 1.5, 0.25,
+                                 help="Stop = fiyat − bu sayı × ATR. Küçük değer dar stop, büyük değer geniş stop.")
 
     p = dict(yakin_say=yakin_say, olusan_mumu_cikar=olusan_mumu_cikar, son_n=int(son_n),
              macd_seviye=float(macd_seviye), macd_yakinlik=float(macd_yakinlik),
              mfi_os=float(mfi_os), stoch_os=float(stoch_os), wt_yakin=float(wt_yakin),
-             nw_h=float(nw_h), nw_carpan=float(nw_carpan))
+             nw_h=float(nw_h), nw_carpan=float(nw_carpan), stop_atr=float(stop_atr))
 
     semboller = liste_coz(metin)
     st.write(f"**{len(semboller)}** hisse taranacak.")
@@ -363,21 +403,27 @@ def main():
 
     tablo = pd.DataFrame(sonuclar)
     sinyal = tablo[(tablo["Puan"] >= en_az) & dusus_maskesi(tablo, min_dusus, acilis_say, taban_haric)
-                  & (tablo["Tutar (mn TL)"] >= min_tutar)]
+                  & (tablo["Tutar (mn TL)"] >= min_tutar)
+                  & (tablo["Teyit"].str[0].astype(int) >= en_az_teyit)]
     sinyal = sinyal.sort_values(["Puan", "Günlük %"], ascending=[False, True])
+
+    kolonlar = {"Grafik": st.column_config.LinkColumn("Grafik", display_text="Aç")}
 
     st.subheader(f"Aday hisseler ({len(sinyal)})")
     st.caption("✅ = kriter sağlandı   🟡 = kriter yakın   — = sağlanmadı. "
                "Yanındaki sayı göstergenin değeridir (Nadaraya'da %0 alt bant, %100 üst bant).")
+    st.caption("Teyit: 🟢 son mum yeşil, 📊 hacim ortalamanın üstünde, 🔒 önceki mumun dibi kırılmamış. "
+               "Stop = fiyat − ATR × çarpan. Hedef = Nadaraya orta çizgisi (fiyatın üstündeyse). "
+               "R/G = potansiyel kazanç ÷ risk (2 ve üstü daha iyi). Bunlar örnek hesaplardır, karar sende.")
     if sinyal.empty:
         st.warning("Şu an şartları sağlayan hisse yok. 'En az kriter' sayısını ya da düşüş eşiğini gevşetmeyi dene.")
     else:
-        st.dataframe(sinyal, hide_index=True)
+        st.dataframe(sinyal, hide_index=True, column_config=kolonlar)
         st.download_button("CSV olarak indir", sinyal.to_csv(index=False).encode("utf-8"),
                            "tarama_sonucu.csv", "text/csv")
 
     with st.expander(f"Taranan tüm hisseler ({len(tablo)})"):
-        st.dataframe(tablo.sort_values("Puan", ascending=False), hide_index=True)
+        st.dataframe(tablo.sort_values("Puan", ascending=False), hide_index=True, column_config=kolonlar)
     if verisiz:
         st.caption("Verisi alınamayan veya yetersiz olan hisseler: " + ", ".join(verisiz))
 
