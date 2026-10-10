@@ -17,10 +17,11 @@ TSKB GRSEL AKFYE TRENJ ECZYT CWENE TCKRC ALBRK KCAER PAHOL HEKTS ENTRA EGEEN FEN
 BTCIM KORDS GWIND SNGYO CANTE EGGUB ZOREN TUKAS ODAS BERA KARSN BINHO EUREN VESTL KATMR"""
 
 ARALIK_AYARLARI = {
-    # aralik: (veri periyodu, mum suresi dakika)
-    "1h": ("180d", 60),
-    "30m": ("60d", 30),
-    "15m": ("60d", 15),
+    # aralik: (veri periyodu, Yahoo'dan cekilen aralik, mum suresi dakika)
+    # Saatlik mumlar 15 dakikalik veriden TAM SAATLERE birlestirilir (TradingView ile ayni kesim).
+    "1h": ("60d", "15m", 60),
+    "30m": ("60d", "30m", 30),
+    "15m": ("60d", "15m", 15),
 }
 
 KRITERLER = ["MACD", "MFI", "Wave Trend", "Stoch RSI", "Nadaraya"]
@@ -210,7 +211,7 @@ ISARET = {2: "✅", 1: "🟡", 0: "—"}
 
 # ------------------------------------------------------------------------ veri
 @st.cache_data(ttl=600, show_spinner=False)
-def veri_cek(sembol, periyot, aralik):
+def veri_cek(sembol, periyot, aralik, birlestir=0):
     try:
         df = yf.Ticker(sembol + ".IS").history(period=periyot, interval=aralik, auto_adjust=True)
     except Exception:
@@ -223,6 +224,13 @@ def veri_cek(sembol, periyot, aralik):
     if df.index.tz is None:
         df.index = df.index.tz_localize("UTC")
     df.index = df.index.tz_convert("Europe/Istanbul")
+    if birlestir and birlestir > 15:
+        # Kucuk mumlari tam saat basindan baslayan buyuk mumlara birlestir.
+        df = df.resample(f"{birlestir}min").agg(
+            {"Open": "first", "High": "max", "Low": "min", "Close": "last", "Volume": "sum"}
+        ).dropna(subset=["Open", "Close"])
+        if df.empty:
+            return None
     return df
 
 
@@ -326,6 +334,9 @@ def main():
         "İşleme girmeden önce grafikte teyit et ve güncel fiyatı aracı kurum ekranından kontrol et."
     )
 
+    st.caption("Saatlik mumlar, TradingView ile aynı olması için 15 dakikalık veriden tam saatlere "
+               "birleştirilir. Geçmiş en fazla 60 gündür.")
+
     with st.sidebar:
         st.header("Ayarlar")
         aralik = st.selectbox("Zaman dilimi", list(ARALIK_AYARLARI.keys()), index=0)
@@ -378,12 +389,12 @@ def main():
         st.info("Soldaki ayarları kontrol edip **Tara** düğmesine bas.")
         return
 
-    periyot, mum_dakika = ARALIK_AYARLARI[aralik]
+    periyot, cekilen_aralik, mum_dakika = ARALIK_AYARLARI[aralik]
     ilerleme = st.progress(0.0, text="Veriler çekiliyor...")
     veriler = {}
 
     def getir(s):
-        return s, veri_cek(s, periyot, aralik)
+        return s, veri_cek(s, periyot, cekilen_aralik, mum_dakika)
 
     with ThreadPoolExecutor(max_workers=8) as havuz:
         for i, (s, df) in enumerate(havuz.map(getir, semboller), start=1):
