@@ -177,11 +177,7 @@ def kriter_wt(df, p):
     yaklasiyor = bool(wt1.iloc[-1] < wt2.iloc[-1] and wt1.iloc[-1] > wt1.iloc[-2]
                       and (wt2.iloc[-1] - wt1.iloc[-1]) <= p["wt_yakin"] and altta)
     durum = 2 if (kesti and altta) else 1 if yaklasiyor else 0
-    # Kesisim hangi mumda olmus? (grafikle karsilastirmak icin saat gosterilir)
-    kes = (wt1.shift(1) <= wt2.shift(1)) & (wt1 > wt2)
-    son = kes.iloc[-p["son_n"]:]
-    ek = f" · kesiş {son[son].index[-1].strftime('%d.%m %H:%M')}" if son.any() else ""
-    return durum, f"{wt1.iloc[-1]:.0f}{ek}"
+    return durum, f"{wt1.iloc[-1]:.0f}"
 
 
 def kriter_stoch(df, p):
@@ -367,7 +363,7 @@ def main():
                                   help="Düşük hacimli hisseleri elemek için. 0 = filtre kapalı.")
             yakin_say = st.checkbox("🟡 'yakın' durumları da say", value=True)
             olusan_mumu_cikar = st.checkbox("Kapanmamış mumu hariç tut", value=True)
-            son_n = st.slider("Kesişim/değme son kaç mumda aransın?", 1, 5, 4)
+            son_n = st.slider("Kesişim/değme son kaç mumda aransın?", 1, 5, 2)
             macd_seviye = st.number_input("MACD DEMA seviyesi", value=0.0, step=0.1)
             macd_yakinlik = st.slider("MACD kesişime yakınlık", 0.1, 0.8, 0.3, 0.05)
             mfi_os = st.slider("MFI aşırı satış", 10, 40, 20)
