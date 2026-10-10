@@ -176,7 +176,11 @@ def kriter_wt(df, p):
     yaklasiyor = bool(wt1.iloc[-1] < wt2.iloc[-1] and wt1.iloc[-1] > wt1.iloc[-2]
                       and (wt2.iloc[-1] - wt1.iloc[-1]) <= p["wt_yakin"] and altta)
     durum = 2 if (kesti and altta) else 1 if yaklasiyor else 0
-    return durum, f"{wt1.iloc[-1]:.0f}"
+    # Kesisim hangi mumda olmus? (grafikle karsilastirmak icin saat gosterilir)
+    kes = (wt1.shift(1) <= wt2.shift(1)) & (wt1 > wt2)
+    son = kes.iloc[-p["son_n"]:]
+    ek = f" · kesiş {son[son].index[-1].strftime('%d.%m %H:%M')}" if son.any() else ""
+    return durum, f"{wt1.iloc[-1]:.0f}{ek}"
 
 
 def kriter_stoch(df, p):
