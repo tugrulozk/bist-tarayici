@@ -127,6 +127,27 @@ def nadaraya_watson(kapanis, h=8.0, carpan=3.0):
     return nw, nw - mae, nw + mae
 
 
+def nadaraya_tv(kapanis, h=8.0, carpan=3.0, n_max=500):
+    """TradingView'deki LuxAlgo 'repainting' moduna yaklasik benzetme (birebir kopya degil).
+    Her mum icin iki yonlu Gauss yumusatmasi; bant = yumusatma +/- (ortalama hata x carpan).
+    Son mumlarin degeri yeni mum geldikce degisebilir (repaint)."""
+    x = kapanis.to_numpy(dtype=float)[-n_max:]
+    n = len(x)
+    idx = np.arange(n)
+    w = np.exp(-((idx[:, None] - idx[None, :]) ** 2) / (2 * h * h))
+    y = (w @ x) / w.sum(axis=1)
+    sae = np.abs(x - y).sum() / max(n - 1, 1) * carpan
+    nw = pd.Series(np.nan, index=kapanis.index)
+    nw.iloc[-n:] = y
+    return nw, nw - sae, nw + sae
+
+
+def nw_bantlari(df, p):
+    if p.get("nw_tv"):
+        return nadaraya_tv(df["Close"], p["nw_h"], p["nw_carpan"])
+    return nadaraya_watson(df["Close"], p["nw_h"], p["nw_carpan"])
+
+
 def yukari_kesti(a, b, son_n):
     k = (a.shift(1) <= b.shift(1)) & (a > b)
     return bool(k.iloc[-son_n:].any())
@@ -190,7 +211,17 @@ def kriter_stoch(df, p):
 
 
 def kriter_nw(df, p):
-    nw, alt, ust = nadaraya_watson(df["Close"], p["nw_h"], p["nw_carpan"])
+    nw, alt, ust = nw_bantlari(df, p)
+    if p.get("nw_tv"):
+        # TradingView tarzi: kapanis alt bandin altina yeni inmisse = yesil ucgen
+        kap = df["Close"]
+        alt_alti = kap < alt
+        ilk = alt_alti & ~alt_alti.shift(1, fill_value=False)
+        ucgen = bool(ilk.iloc[-p["son_n"]:].any())
+        konum_tv = (kap.iloc[-1] - alt.iloc[-1]) / (ust.iloc[-1] - alt.iloc[-1]) * 100
+        yakin_tv = bool(alt_alti.iloc[-1]) or konum_tv <= 10
+        durum = 2 if ucgen else 1 if yakin_tv else 0
+        return durum, f"%{konum_tv:.0f}"
     n = p["son_n"] + 1
     degdi = bool((df["Low"].iloc[-n:] <= alt.iloc[-n:]).any())
     donus = bool(df["Close"].iloc[-1] > df["Close"].iloc[-2])
@@ -294,7 +325,7 @@ def analiz_et(df, sembol, mum_dakika, p, simdi=None):
     fiyat = float(df["Close"].iloc[-1])
     atr = float(atr_hesapla(df).iloc[-1])
     stop = fiyat - p["stop_atr"] * atr
-    nw_orta = float(nadaraya_watson(df["Close"], p["nw_h"], p["nw_carpan"])[0].iloc[-1])
+    nw_orta = float(nw_bantlari(df, p)[0].iloc[-1])
     hedef = nw_orta if nw_orta > fiyat else np.nan
     risk = fiyat - stop
     rg = (hedef - fiyat) / risk if (not np.isnan(hedef) and risk > 0) else np.nan
@@ -348,6 +379,12 @@ def main():
             help="🟢 son kapanmış mum yeşil, 📊 hacim son 20 mum ortalamasının üstünde, "
                  "🔒 son mum bir öncekinin dibini kırmamış. 0 = filtre kapalı (sadece tabloda gösterilir).",
         )
+        nw_tv = st.checkbox(
+            "TradingView tarzı Nadaraya (repaint eden)", value=False,
+            help="Açıksa Nadaraya, TradingView'deki LuxAlgo göstergesine yakın hesaplanır: fiyat alt "
+                 "bandın altına yeni indiyse (yeşil üçgen) son mumlarda aranır. Bu üçgen sonraki "
+                 "mumlarda kaybolabilir. Kapalıysa geçmişi değiştirmeyen tutucu sürüm kullanılır.",
+        )
         taban_haric = st.checkbox(
             "Tabana oturmuşları hariç tut", value=True,
             help="Günlük değişimi yaklaşık -%9,5 ve altında olan hisseler tabana oturmuş sayılır "
@@ -377,7 +414,7 @@ def main():
     p = dict(yakin_say=yakin_say, olusan_mumu_cikar=olusan_mumu_cikar, son_n=int(son_n),
              macd_seviye=float(macd_seviye), macd_yakinlik=float(macd_yakinlik),
              mfi_os=float(mfi_os), stoch_os=float(stoch_os), wt_yakin=float(wt_yakin),
-             nw_h=float(nw_h), nw_carpan=float(nw_carpan), stop_atr=float(stop_atr))
+             nw_h=float(nw_h), nw_carpan=float(nw_carpan), stop_atr=float(stop_atr), nw_tv=bool(nw_tv))
 
     semboller = liste_coz(metin)
     st.write(f"**{len(semboller)}** hisse taranacak.")
