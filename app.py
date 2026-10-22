@@ -162,6 +162,63 @@ def atr_hesapla(df, n=14):
     return tr.ewm(alpha=1 / n, adjust=False, min_periods=n).mean()
 
 
+def trend_kirilimi(df, p):
+    """Dusen trend cizgisi kirilimi.
+    Son ~200 mumdaki tepelerden (pivot) dusen cizgiler dener. Cizgi gecerli sayilir:
+    en az `trend_temas` temas (mum ucu ya da kapanis cizgiye %tol icinde) ve cizgiyi
+    kapanisla yukari kirmamis olmali (son `son_n` mum haric).
+    Durum: 2 = son mumlarda kapanisla yukari kirdi, 1 = cizginin hemen altinda (yakin), None = yok."""
+    n = len(df)
+    pencere = min(n, 200)
+    d = df.iloc[-pencere:]
+    hi = d["High"].to_numpy(dtype=float)
+    cl = d["Close"].to_numpy(dtype=float)
+    vol = d["Volume"].to_numpy(dtype=float)
+    k = 3
+    tol = p["trend_tol"] / 100.0
+    m = pencere - 1
+    sn = p["son_n"]
+    son_bar = m - sn  # kirilim bolgesinden onceki son mum
+    roll = d["High"].rolling(2 * k + 1, center=True).max().to_numpy()
+    piv = [i for i in range(k, pencere - k) if hi[i] == roll[i] and i <= son_bar]
+    en_iyi = None
+    for a in range(len(piv)):
+        for b in range(a + 1, len(piv)):
+            i, j = piv[a], piv[b]
+            if j - i < 6 or hi[j] >= hi[i]:
+                continue
+            egim = (hi[j] - hi[i]) / (j - i)
+            cizgi = hi[i] + egim * (np.arange(i, m + 1) - i)
+            if cizgi[-1] <= 0:
+                continue
+            on_uz = son_bar - i + 1
+            cizgi_on = cizgi[:on_uz]
+            # kirilimdan once kapanis cizgiyi (tolerans disinda) gecmemis olmali
+            if (cl[i:son_bar + 1] > cizgi_on * (1 + tol)).any():
+                continue
+            # temas: mum ucu cizgiye tolerans icinde ulasmis
+            poz = np.flatnonzero(hi[i:son_bar + 1] >= cizgi_on * (1 - tol))
+            temas = 1 + int(np.sum(np.diff(poz) >= 3)) if len(poz) else 0
+            if temas < p["trend_temas"]:
+                continue
+            cizgi_son = float(cizgi[-1])
+            son_kap = float(cl[m])
+            ustu = cl[son_bar + 1:] > cizgi[on_uz:]
+            if len(ustu) and bool(ustu[-1]):
+                durum = 2
+            elif son_kap < cizgi_son and (cizgi_son - son_kap) / cizgi_son * 100 <= p["trend_yakin"]:
+                durum = 1
+            else:
+                continue
+            anahtar = (durum, temas, j)
+            if en_iyi is None or anahtar > en_iyi[0]:
+                ort_hacim = vol[max(0, m - 20):m].mean() if m > 0 else np.nan
+                hacim_x = vol[m] / ort_hacim if ort_hacim and ort_hacim > 0 else np.nan
+                en_iyi = (anahtar, dict(durum=durum, temas=temas, cizgi=cizgi_son,
+                                        kirilim=(son_kap / cizgi_son - 1) * 100, hacim=hacim_x))
+    return None if en_iyi is None else en_iyi[1]
+
+
 def donus_teyidi(df):
     """Dusen hissede tepki basladi mi? 3 basit kontrol (son kapanmis mum):
     yesil mum, hacim son 20 mum ortalamasinin ustunde, onceki mumun dibi kirilmamis."""
@@ -330,6 +387,7 @@ def analiz_et(df, sembol, mum_dakika, p, simdi=None):
     risk = fiyat - stop
     rg = (hedef - fiyat) / risk if (not np.isnan(hedef) and risk > 0) else np.nan
     teyit_n, teyit_isaret = donus_teyidi(df)
+    tr = trend_kirilimi(df, p) if p["trend_ara"] else None
     satir = {
         "Hisse": sembol,
         "Fiyat": round(float(df["Close"].iloc[-1]), 2),
@@ -346,6 +404,11 @@ def analiz_et(df, sembol, mum_dakika, p, simdi=None):
     satir["Stop"] = round(stop, 2)
     satir["Hedef"] = round(hedef, 2) if not np.isnan(hedef) else np.nan
     satir["R/G"] = round(rg, 1) if not np.isnan(rg) else np.nan
+    satir["_trend_durum"] = tr["durum"] if tr else 0
+    satir["_temas"] = tr["temas"] if tr else 0
+    satir["_cizgi"] = round(tr["cizgi"], 2) if tr else np.nan
+    satir["_kirilim"] = round(tr["kirilim"], 2) if tr else np.nan
+    satir["_hacim"] = round(tr["hacim"], 1) if tr and not np.isnan(tr["hacim"]) else np.nan
     satir["Grafik"] = "https://www.tradingview.com/chart/?symbol=BIST%3A" + sembol
     satir["Son mum (TR)"] = df.index[-1].strftime("%d.%m %H:%M")
     return satir
@@ -379,11 +442,10 @@ def main():
             help="🟢 son kapanmış mum yeşil, 📊 hacim son 20 mum ortalamasının üstünde, "
                  "🔒 son mum bir öncekinin dibini kırmamış. 0 = filtre kapalı (sadece tabloda gösterilir).",
         )
-        nw_tv = st.checkbox(
-            "TradingView tarzı Nadaraya (repaint eden)", value=False,
-            help="Açıksa Nadaraya, TradingView'deki LuxAlgo göstergesine yakın hesaplanır: fiyat alt "
-                 "bandın altına yeni indiyse (yeşil üçgen) son mumlarda aranır. Bu üçgen sonraki "
-                 "mumlarda kaybolabilir. Kapalıysa geçmişi değiştirmeyen tutucu sürüm kullanılır.",
+        trend_ara = st.checkbox(
+            "Düşen trend kırılımını da ara", value=True,
+            help="Açıksa, diğer göstergelerden bağımsız olarak düşen trend çizgisini yukarı kıran "
+                 "(ya da kırmaya çok yaklaşan) hisseler ayrı bir tabloda gösterilir.",
         )
         taban_haric = st.checkbox(
             "Tabana oturmuşları hariç tut", value=True,
@@ -408,13 +470,19 @@ def main():
             wt_yakin = st.slider("Wave Trend kesişime yakınlık", 1.0, 10.0, 4.0, 0.5)
             nw_h = st.slider("Nadaraya bant genişliği (h)", 3.0, 15.0, 8.0, 0.5)
             nw_carpan = st.slider("Nadaraya bant çarpanı", 1.0, 5.0, 3.0, 0.5)
+            trend_temas = st.slider("Trend çizgisi en az kaç temas?", 2, 5, 3)
+            trend_tol = st.slider("Temas yakınlığı (%)", 0.1, 1.5, 0.5, 0.1,
+                                  help="Mum ucu ya da kapanış çizgiye bu kadar yaklaşırsa temas sayılır.")
+            trend_yakin = st.slider("Kırılıma yakınlık (%)", 0.5, 5.0, 1.5, 0.5,
+                                    help="Fiyat çizginin altında ve bu kadar yakınsa 🟡 'yakın' gösterilir.")
             stop_atr = st.slider("Örnek stop mesafesi (kaç ATR)", 0.5, 4.0, 1.5, 0.25,
                                  help="Stop = fiyat − bu sayı × ATR. Küçük değer dar stop, büyük değer geniş stop.")
 
     p = dict(yakin_say=yakin_say, olusan_mumu_cikar=olusan_mumu_cikar, son_n=int(son_n),
              macd_seviye=float(macd_seviye), macd_yakinlik=float(macd_yakinlik),
              mfi_os=float(mfi_os), stoch_os=float(stoch_os), wt_yakin=float(wt_yakin),
-             nw_h=float(nw_h), nw_carpan=float(nw_carpan), stop_atr=float(stop_atr), nw_tv=bool(nw_tv))
+             nw_h=float(nw_h), nw_carpan=float(nw_carpan), stop_atr=float(stop_atr), nw_tv=True, trend_ara=bool(trend_ara),
+             trend_temas=int(trend_temas), trend_tol=float(trend_tol), trend_yakin=float(trend_yakin))
 
     semboller = liste_coz(metin)
     st.write(f"**{len(semboller)}** hisse taranacak.")
@@ -455,23 +523,54 @@ def main():
                   & (tablo["Teyit"].str[0].astype(int) >= en_az_teyit)]
     sinyal = sinyal.sort_values(["Puan", "Günlük %"], ascending=[False, True])
 
+    gizli = [c for c in tablo.columns if c.startswith("_")]
     kolonlar = {"Grafik": st.column_config.LinkColumn("Grafik", display_text="Aç")}
 
     st.subheader(f"Aday hisseler ({len(sinyal)})")
     st.caption("✅ = kriter sağlandı   🟡 = kriter yakın   — = sağlanmadı. "
-               "Yanındaki sayı göstergenin değeridir (Nadaraya'da %0 alt bant, %100 üst bant).")
+               "Yanındaki sayı göstergenin değeridir (Nadaraya'da %0 alt bant, %100 üst bant; TradingView tarzı, repaint eder).")
     st.caption("Teyit: 🟢 son mum yeşil, 📊 hacim ortalamanın üstünde, 🔒 önceki mumun dibi kırılmamış. "
                "Stop = fiyat − ATR × çarpan. Hedef = Nadaraya orta çizgisi (fiyatın üstündeyse). "
                "R/G = potansiyel kazanç ÷ risk (2 ve üstü daha iyi). Bunlar örnek hesaplardır, karar sende.")
     if sinyal.empty:
         st.warning("Şu an şartları sağlayan hisse yok. 'En az kriter' sayısını ya da düşüş eşiğini gevşetmeyi dene.")
     else:
-        st.dataframe(sinyal, hide_index=True, column_config=kolonlar)
-        st.download_button("CSV olarak indir", sinyal.to_csv(index=False).encode("utf-8"),
+        st.dataframe(sinyal.drop(columns=gizli), hide_index=True, column_config=kolonlar)
+        st.download_button("CSV olarak indir", sinyal.drop(columns=gizli).to_csv(index=False).encode("utf-8"),
                            "tarama_sonucu.csv", "text/csv")
 
+    if trend_ara:
+        tr_tablo = tablo[(tablo["_trend_durum"] > 0) & (tablo["Tutar (mn TL)"] >= min_tutar)].copy()
+        tr_tablo = tr_tablo.sort_values(["_trend_durum", "_temas"], ascending=[False, False])
+        st.subheader(f"Düşen trend kırılımı ({len(tr_tablo)})")
+        st.caption("Diğer göstergelerden ve düşüş şartından bağımsızdır. 🚀 = son mumlarda kapanışla çizgiyi "
+                   "yukarı kırdı, 🟡 = çizginin hemen altında. Temas = çizgiye değen ayrı tepe sayısı. "
+                   "Hacim x = son mum hacminin son 20 mum ortalamasına oranı. Çizgiyi grafikte kendin "
+                   "çizip teyit et; yalancı kırılım olabilir.")
+        if tr_tablo.empty:
+            st.info("Şu an düşen trend kırılımı yakalayan hisse yok.")
+        else:
+            gosterim = pd.DataFrame({
+                "Hisse": tr_tablo["Hisse"],
+                "Fiyat": tr_tablo["Fiyat"],
+                "Günlük %": tr_tablo["Günlük %"],
+                "Tutar (mn TL)": tr_tablo["Tutar (mn TL)"],
+                "Trend": tr_tablo["_trend_durum"].map({2: "🚀 Kırılım", 1: "🟡 Yakın"}),
+                "Temas": tr_tablo["_temas"],
+                "Çizgi": tr_tablo["_cizgi"],
+                "Çizgiye göre %": tr_tablo["_kirilim"],
+                "Hacim x": tr_tablo["_hacim"],
+                "Teyit": tr_tablo["Teyit"],
+                "Stop": tr_tablo["Stop"],
+                "Puan": tr_tablo["Puan"],
+                "Grafik": tr_tablo["Grafik"],
+                "Son mum (TR)": tr_tablo["Son mum (TR)"],
+            })
+            st.dataframe(gosterim, hide_index=True, column_config=kolonlar)
+
     with st.expander(f"Taranan tüm hisseler ({len(tablo)})"):
-        st.dataframe(tablo.sort_values("Puan", ascending=False), hide_index=True, column_config=kolonlar)
+        st.dataframe(tablo.sort_values("Puan", ascending=False).drop(columns=gizli),
+                     hide_index=True, column_config=kolonlar)
     if verisiz:
         st.caption("Verisi alınamayan veya yetersiz olan hisseler: " + ", ".join(verisiz))
 
