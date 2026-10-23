@@ -179,7 +179,7 @@ def trend_kirilimi(df, p):
     k = 3
     tol = p["trend_tol"] / 100.0
     m = pencere - 1
-    sn = p["son_n"]
+    sn = 2  # kirilim "son 2 mum" icinde aranir (aktif mum dahil)
     son_bar = m - sn  # kirilim bolgesinden onceki son mum
     roll = d["High"].rolling(2 * k + 1, center=True).max().to_numpy()
     piv = [i for i in range(k, pencere - k) if hi[i] == roll[i] and i <= son_bar]
@@ -215,9 +215,10 @@ def trend_kirilimi(df, p):
                 continue
             cizgi_son = float(cizgi[-1])
             son_kap = float(cl[m])
-            if son_kap > cizgi_son * (1 + tol):
-                durum = 2
-            elif son_kap >= cizgi_son * (1 - p["trend_yakin"] / 100.0):
+            kirdi = cl[son_bar + 1:] > cizgi[on_uz:] * (1 + tol)
+            if kirdi.any() and son_kap > cizgi_son:
+                durum = 2  # son 2 mumdan biri cizgiyi kapanisla kirdi ve fiyat hala cizginin ustunde
+            elif son_kap <= cizgi_son * (1 + tol) and son_kap >= cizgi_son * (1 - p["trend_yakin"] / 100.0):
                 durum = 1
             else:
                 continue
@@ -422,7 +423,6 @@ def analiz_et(df, sembol, mum_dakika, p, simdi=None):
     satir["_kirilim"] = round(tr["kirilim"], 2) if tr else np.nan
     satir["_hacim"] = round(tr["hacim"], 1) if tr and not np.isnan(tr["hacim"]) else np.nan
     satir["Grafik"] = "https://www.tradingview.com/chart/?symbol=BIST%3A" + sembol
-    satir["Mum"] = "⏳ açık" if mum_acik else "✔ kapalı"
     if tr and tr["durum"] == 2:
         satir["Trend"] = f"🚀 Kırılım ({tr['temas']} temas, %{tr['kirilim']:+.1f})"
     elif tr:
@@ -465,6 +465,10 @@ def main():
             "Düşen trend kırılımını da ara", value=True,
             help="Açıksa, diğer göstergelerden bağımsız olarak düşen trend çizgisini yukarı kıran "
                  "(ya da kırmaya çok yaklaşan) hisseler ayrı bir tabloda gösterilir.",
+        )
+        sadece_trend = st.checkbox(
+            "Sadece trend kırılımı olanları göster", value=False,
+            help="Açıksa yalnızca 🚀 düşen trend kırılımı yakalayan hisseler listelenir.",
         )
         taban_haric = st.checkbox(
             "Tabana oturmuşları hariç tut", value=True,
@@ -539,11 +543,16 @@ def main():
         return
 
     tablo = pd.DataFrame(sonuclar)
-    sinyal = tablo[((tablo["Puan"] >= en_az) & dusus_maskesi(tablo, min_dusus, acilis_say, taban_haric)
-                    | (tablo["_trend_durum"] == 2))
-                  & (tablo["Tutar (mn TL)"] >= min_tutar)
-                  & (tablo["Teyit"].str[0].astype(int) >= en_az_teyit)]
-    sinyal = sinyal.sort_values(["Puan", "Günlük %"], ascending=[False, True])
+    if sadece_trend:
+        secim = tablo["_trend_durum"] == 2
+    else:
+        secim = ((tablo["Puan"] >= en_az) & dusus_maskesi(tablo, min_dusus, acilis_say, taban_haric)
+                 | (tablo["_trend_durum"] == 2))
+    sinyal = tablo[secim & (tablo["Tutar (mn TL)"] >= min_tutar)
+                   & (tablo["Teyit"].str[0].astype(int) >= en_az_teyit)]
+    sinyal = (sinyal.assign(_once=(sinyal["_trend_durum"] == 2))
+                    .sort_values(["_once", "Puan", "Günlük %"], ascending=[False, False, True])
+                    .drop(columns="_once"))
 
     gizli = [c for c in tablo.columns if c.startswith("_")]
     ana_gizli = gizli + ["Son mum (TR)"]
@@ -555,11 +564,8 @@ def main():
     st.caption("Teyit: 🟢 son mum yeşil, 📊 hacim ortalamanın üstünde, 🔒 önceki mumun dibi kırılmamış. "
                "Stop = fiyat − ATR × çarpan. Hedef = Nadaraya orta çizgisi (fiyatın üstündeyse). "
                "R/G = potansiyel kazanç ÷ risk (2 ve üstü daha iyi). Bunlar örnek hesaplardır, karar sende.")
-    st.caption("Mum: ⏳ açık = son saatlik mum henüz kapanmadı, sinyaller mum kapanana kadar değişebilir "
-               "(özellikle Trend, Nadaraya ve Teyit'teki hacim: yarım mumun hacmi düşük görünür). ✔ kapalı = mum tamamlandı.")
-    st.caption("Trend: 🚀 = son mumlarda düşen trend çizgisini kapanışla yukarı kırdı (diğer şartlar sağlanmasa "
-               "bile listeye girer), 🟡 = çizgiye çok yakın. Parantez içinde çizgiye değen tepe sayısı ve "
-               "kapanışın çizgiye göre yüzdesi var. Çizgiyi grafikte kendin çizip teyit et.")
+    st.caption("Trend: 🚀 = son 2 mumdan biri (aktif mum dahil) düşen trend çizgisini kapanışla yukarı kırdı, "
+               "🟡 = çizgiye çok yakın. Parantezde çizgiye değen tepe sayısı ve fiyatın çizgiye göre yüzdesi var.")
     if sinyal.empty:
         st.warning("Şu an şartları sağlayan hisse yok. 'En az kriter' sayısını ya da düşüş eşiğini gevşetmeyi dene.")
     else:
