@@ -136,8 +136,10 @@ def trend_kirilimi(df, p):
             if en_iyi is None or anahtar > en_iyi[0]:
                 ort_hacim = vol[max(0, m - 20):m].mean() if m > 0 else np.nan
                 hacim_x = vol[m] / ort_hacim if ort_hacim and ort_hacim > 0 else np.nan
+                dip = float(d["Low"].to_numpy(dtype=float)[i:m + 1].min())
                 en_iyi = (anahtar, dict(durum=durum, temas=temas, cizgi=cizgi_son,
-                                        kirilim=(son_kap / cizgi_son - 1) * 100, hacim=hacim_x))
+                                        kirilim=(son_kap / cizgi_son - 1) * 100, hacim=hacim_x,
+                                        tepe=float(hi[i]), dip=dip))
     return None if en_iyi is None else en_iyi[1]
 
 
@@ -182,6 +184,23 @@ def veri_cek(sembol):
     return None if df.empty else df
 
 
+STOP_ALTI = 0.5                 # stop: kirilan cizginin % kac altinda
+FIB_ORANLARI = (0.382, 0.5, 0.618)
+
+
+def stop_hedef(fiyat, cizgi, tepe, dip):
+    """Stop = kirilan cizginin biraz alti. Hedefler = ilk tepeden dibe dususun Fibonacci
+    duzeltme seviyeleri; fiyatin zaten gectigi seviyeler listeye alinmaz."""
+    stop = cizgi * (1 - STOP_ALTI / 100.0)
+    hedefler = []
+    if tepe > dip:
+        for r in FIB_ORANLARI:
+            seviye = dip + r * (tepe - dip)
+            if seviye > fiyat:
+                hedefler.append((r, seviye))
+    return dict(stop=stop, stop_uzak=(fiyat - stop) / fiyat * 100, hedefler=hedefler)
+
+
 def analiz(sembol, bugun):
     """(durum, sonuç) döner. durum: veri_yok / kisa / bugun_yok / yok / bulundu"""
     df = veri_cek(sembol)
@@ -204,12 +223,22 @@ def analiz(sembol, bugun):
         cizgi=float(tr["cizgi"]), temas=int(tr["temas"]), kirilim=float(tr["kirilim"]),
         hacim=None if np.isnan(tr["hacim"]) else float(tr["hacim"]),
         teyit=int(teyit_n), isaret=isaret,
+        **stop_hedef(float(df["Close"].iloc[-1]), float(tr["cizgi"]), tr["tepe"], tr["dip"]),
     )
 
 
 def sayi(x, n=2, isaretli=False):
     s = f"{x:+.{n}f}" if isaretli else f"{x:.{n}f}"
     return s.replace(".", ",")
+
+
+def stop_hedef_satirlari(r):
+    stop = f"Stop {sayi(r['stop'])} (-%{sayi(r['stop_uzak'], 1)})\n"
+    if r["hedefler"]:
+        parca = [f"{sayi(sv)} (+%{sayi((sv / r['fiyat'] - 1) * 100, 1)}, Fib {sayi(o * 100, 1)})"
+                 for o, sv in r["hedefler"]]
+        return stop + "Hedef " + " · ".join(parca) + "\n"
+    return stop + "Hedef: Fib seviyelerinin hepsi geçilmiş\n"
 
 
 def mesaj_parcalari(yeniler, simdi, baslik, ek_satir=""):
@@ -225,6 +254,7 @@ def mesaj_parcalari(yeniler, simdi, baslik, ek_satir=""):
             f"{r['sembol']}  {sayi(r['fiyat'])} TL  ({gun})\n"
             f"Çizgi {sayi(r['cizgi'])} · {r['temas']} temas · çizgi üstü %{sayi(r['kirilim'], 1, True)}{hac}\n"
             f"Teyit {r['teyit']}/3 {r['isaret']}\n"
+            f"{stop_hedef_satirlari(r)}"
             f"https://www.tradingview.com/chart/?symbol=BIST%3A{r['sembol']}\n"
         )
     alt = ("⚠️ Veri ~15 dk gecikmeli. Aktif mumda sinyal, mum kapanınca kaybolabilir. "
