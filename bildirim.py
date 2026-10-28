@@ -6,7 +6,7 @@ seans saatlerinde 15 dakikada bir çalıştırılır.
 Sabit kurallar:
 - Saatlik mum (15 dakikalık veriden tam saatlere birleştirilir), aktif mum dahil
 - Düşen trend çizgisi kırılımı (🚀): en az 3 temas, eğim %3, temas yakınlığı %0,5
-- Dönüş teyidi: 4 şart (yeşil mum, hacim, dip korunması, KAMA kesişimi); 🚀 = en az 3 ve hacim dahil, ⏳ = en az 2
+- Dönüş teyidi: 4 şart (yeşil mum, hacim, dip korunması, fiyat KAMA üstünde); 🚀 = en az 3 ve hacim dahil, ⏳ = en az 2
 - Aynı hisse aynı gün içinde yalnızca bir kez bildirilir
 
 Çalışma modları (MOD ortam değişkeni):
@@ -37,10 +37,11 @@ CHAT_ID = os.environ.get("TELEGRAM_CHAT_ID", "").strip()
 
 PERIYOT, ARALIK, MUM_DAKIKA = "60d", "15m", 60
 MIN_MUM = 270      # app.py ile aynı: bundan az mumu olan hisse atlanır (NW 50 + MAE 200 + 20)
-# Dort teyit: 🟢 yesil mum, 📊 hacim, 🔒 dip korunmus, 📈 KAMA'yi yukari kesti
+# Dort teyit: 🟢 yesil mum, 📊 hacim, 🔒 dip korunmus, 📈 fiyat KAMA'nin ustunde
 MIN_TEYIT = 3          # guclu sinyal (🚀): 4 teyitten en az 3'u VE hacim sartlarin icinde
 ERKEN_TEYIT = 2        # erken sinyal (⏳): 4 teyitten en az 2'si, hacim olmasa da olur
 KAMA_N, KAMA_HIZLI, KAMA_YAVAS = 21, 2, 30   # TradingView'deki KAMA ayari
+FIB_GERI = 40          # Fibonacci tepesi: dipten onceki en fazla bu kadar mum icindeki en yuksek nokta
 # app.py'deki varsayılan trend ayarları (kaydırıcılar varsayılan değerde)
 P = dict(trend_temas=3, trend_egim=3.0, trend_tol=0.5, trend_yakin=1.5)
 DURUM_DOSYASI = Path("durum") / "bildirilen.json"
@@ -139,10 +140,14 @@ def trend_kirilimi(df, p):
             if en_iyi is None or anahtar > en_iyi[0]:
                 ort_hacim = vol[max(0, m - 20):m].mean() if m > 0 else np.nan
                 hacim_x = vol[m] / ort_hacim if ort_hacim and ort_hacim > 0 else np.nan
-                dip = float(d["Low"].to_numpy(dtype=float)[i:m + 1].min())
+                lo = d["Low"].to_numpy(dtype=float)
+                dip_i = i + int(np.argmin(lo[i:m + 1]))
+                dip = float(lo[dip_i])
+                # Fibonacci icin SON dusus bacagi: dipten onceki FIB_GERI mum icindeki en yuksek nokta
+                tepe_fib = float(hi[max(i, dip_i - FIB_GERI):dip_i + 1].max())
                 en_iyi = (anahtar, dict(durum=durum, temas=temas, cizgi=cizgi_son,
                                         kirilim=(son_kap / cizgi_son - 1) * 100, hacim=hacim_x,
-                                        tepe=float(hi[i]), dip=dip))
+                                        tepe=tepe_fib, dip=dip))
     return None if en_iyi is None else en_iyi[1]
 
 
@@ -227,8 +232,9 @@ FIB_ORANLARI = (0.382, 0.5, 0.618)
 
 
 def stop_hedef(fiyat, cizgi, tepe, dip):
-    """Stop = kirilan cizginin biraz alti. Hedefler = ilk tepeden dibe dususun Fibonacci
-    duzeltme seviyeleri; fiyatin zaten gectigi seviyeler listeye alinmaz."""
+    """Stop = kirilan cizginin biraz alti. Hedefler = son dusus bacaginin (dipten onceki
+    FIB_GERI mum icindeki tepe -> dip) Fibonacci duzeltme seviyeleri; fiyatin zaten
+    gectigi seviyeler listeye alinmaz."""
     stop = cizgi * (1 - STOP_ALTI / 100.0)
     hedefler = []
     if tepe > dip:
@@ -253,7 +259,7 @@ def analiz(sembol, bugun):
         return "yok", None
     teyit_n, isaret = donus_teyidi(df)
     kama_kesti, kama_ustunde, kama_son = kama_kesisimi(df)
-    if kama_kesti:
+    if kama_ustunde:                 # fiyat su an KAMA'nin ustundeyse teyit sayilir
         teyit_n += 1
         isaret += "📈"
     hacim_var = "📊" in isaret
@@ -269,7 +275,7 @@ def analiz(sembol, bugun):
         kademe="guclu" if (teyit_n >= MIN_TEYIT and hacim_var) else "erken",
         eksik=eksik_sartlar(isaret),
         kama=None if np.isnan(kama_son) else kama_son,
-        kama_ustunde=bool(kama_ustunde and not kama_kesti),
+        kama_ustunde=bool(kama_ustunde), kama_yeni=bool(kama_kesti),
         **stop_hedef(float(df["Close"].iloc[-1]), float(tr["cizgi"]), tr["tepe"], tr["dip"]),
     )
 
@@ -280,14 +286,17 @@ def sayi(x, n=2, isaretli=False):
 
 
 def eksik_sartlar(isaret):
-    adlar = (("🟢", "yeşil mum"), ("📊", "hacim"), ("🔒", "dip korunması"), ("📈", "KAMA kesişimi"))
+    adlar = (("🟢", "yeşil mum"), ("📊", "hacim"), ("🔒", "dip korunması"), ("📈", "KAMA üstü"))
     return [ad for sim, ad in adlar if sim not in isaret]
 
 
 def kama_satiri(r):
     if r.get("kama") is None:
         return ""
-    ek = " · fiyat KAMA üstünde (kesişim eski)" if r.get("kama_ustunde") else ""
+    if r.get("kama_ustunde"):
+        ek = " · fiyat üstünde" + (" (yeni kesişim)" if r.get("kama_yeni") else "")
+    else:
+        ek = " · fiyat altında"
     return f"KAMA {sayi(r['kama'])}{ek}\n"
 
 
