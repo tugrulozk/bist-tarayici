@@ -7,6 +7,8 @@ Sabit kurallar:
 - Saatlik mum (15 dakikalık veriden tam saatlere birleştirilir), aktif mum dahil
 - Düşen trend çizgisi kırılımı (🚀): en az 3 temas, eğim %3, temas yakınlığı %0,5
 - Dönüş teyidi: 4 şart (yeşil mum, hacim, dip korunması, fiyat KAMA üstünde); 🚀 = en az 3 ve hacim dahil, ⏳ = en az 2
+- Fiyatın hâlâ altında kaldığı başka geçerli çizgi varsa mesaja uyarı satırı eklenir
+- Aynı mesajdaki hisseler en çok teyide göre sıralanır, ilki ⭐ ile işaretlenir
 - Aynı hisse aynı gün içinde yalnızca bir kez bildirilir
 
 Çalışma modları (MOD ortam değişkeni):
@@ -41,6 +43,7 @@ MIN_MUM = 270      # app.py ile aynı: bundan az mumu olan hisse atlanır (NW 50
 MIN_TEYIT = 3          # guclu sinyal (🚀): 4 teyitten en az 3'u VE hacim sartlarin icinde
 ERKEN_TEYIT = 2        # erken sinyal (⏳): 4 teyitten en az 2'si, hacim olmasa da olur
 KAMA_N, KAMA_HIZLI, KAMA_YAVAS = 21, 2, 30   # TradingView'deki KAMA ayari
+UST_CIZGI_YAKIN = 1.5   # fiyatin ustundeki gecerli cizgi en fazla bu % uzaktaysa mesaja uyari yazilir
 FIB_GERI = 40          # Fibonacci tepesi: dipten onceki en fazla bu kadar mum icindeki en yuksek nokta
 # app.py'deki varsayılan trend ayarları (kaydırıcılar varsayılan değerde)
 P = dict(trend_temas=3, trend_egim=3.0, trend_tol=0.5, trend_yakin=1.5)
@@ -98,6 +101,7 @@ def trend_kirilimi(df, p):
     roll = d["High"].rolling(2 * k + 1, center=True).max().to_numpy()
     piv = [i for i in range(k, pencere - k) if hi[i] == roll[i] and i <= son_bar]
     en_iyi = None
+    ustte = []   # fiyatin hala altinda kaldigi gecerli cizgilerin son degerleri (uyari icin)
     for a in range(len(piv)):
         for b in range(a + 1, len(piv)):
             i, j = piv[a], piv[b]
@@ -129,6 +133,8 @@ def trend_kirilimi(df, p):
                 continue
             cizgi_son = float(cizgi[-1])
             son_kap = float(cl[m])
+            if son_kap < cizgi_son:
+                ustte.append(cizgi_son)
             kirdi = cl[son_bar + 1:] > cizgi[on_uz:] * (1 + tol)
             if kirdi.any() and son_kap > cizgi_son:
                 durum = 2  # son 2 mumdan biri cizgiyi kapanisla kirdi ve fiyat hala cizginin ustunde
@@ -148,7 +154,12 @@ def trend_kirilimi(df, p):
                 en_iyi = (anahtar, dict(durum=durum, temas=temas, cizgi=cizgi_son,
                                         kirilim=(son_kap / cizgi_son - 1) * 100, hacim=hacim_x,
                                         tepe=tepe_fib, dip=dip))
-    return None if en_iyi is None else en_iyi[1]
+    if en_iyi is None:
+        return None
+    sonuc = en_iyi[1]
+    yakin = [c for c in ustte if (c / float(cl[m]) - 1) * 100 <= UST_CIZGI_YAKIN]
+    sonuc["ust_cizgi"] = min(yakin) if yakin else None
+    return sonuc
 
 
 def donus_teyidi(df):
@@ -276,6 +287,7 @@ def analiz(sembol, bugun):
         eksik=eksik_sartlar(isaret),
         kama=None if np.isnan(kama_son) else kama_son,
         kama_ustunde=bool(kama_ustunde), kama_yeni=bool(kama_kesti),
+        ust_cizgi=tr.get("ust_cizgi"),
         **stop_hedef(float(df["Close"].iloc[-1]), float(tr["cizgi"]), tr["tepe"], tr["dip"]),
     )
 
@@ -301,12 +313,19 @@ def kama_satiri(r):
 
 
 def stop_hedef_satirlari(r):
-    stop = f"Stop {sayi(r['stop'])} (-%{sayi(r['stop_uzak'], 1)})\n"
+    satir = f"Stop {sayi(r['stop'])} (-%{sayi(r['stop_uzak'], 1)})\n"
     if r["hedefler"]:
-        parca = [f"{sayi(sv)} (+%{sayi((sv / r['fiyat'] - 1) * 100, 1)}, Fib {sayi(o * 100, 1)})"
-                 for o, sv in r["hedefler"]]
-        return stop + "Hedef " + " · ".join(parca) + "\n"
-    return stop + "Hedef: Fib seviyelerinin hepsi geçilmiş\n"
+        satir += "Hedef " + " · ".join(sayi(sv) for _, sv in r["hedefler"]) + "\n"
+    else:
+        satir += "Hedef: fib seviyeleri geçilmiş\n"
+    if r.get("ust_cizgi"):
+        satir += f"⚠️ Üstte hâlâ geçerli çizgi var: {sayi(r['ust_cizgi'])}\n"
+    return satir
+
+
+def siralama_anahtari(r):
+    """En cok teyit once; sonra ustte cizgi uyarisi olmayan; sonra hacim, temas."""
+    return (-r["teyit"], r.get("ust_cizgi") is not None, -(r["hacim"] or 0.0), -r["temas"], r["sembol"])
 
 
 def mesaj_parcalari(yeniler, simdi, baslik, ek_satir=""):
@@ -315,11 +334,12 @@ def mesaj_parcalari(yeniler, simdi, baslik, ek_satir=""):
         ust.append(ek_satir)
     ust.append("")
     bloklar = []
-    for r in yeniler:
+    for sira, r in enumerate(yeniler):
+        yildiz = "⭐ " if (sira == 0 and len(yeniler) > 1) else ""
         gun = f"gün {sayi(r['gunluk'], 1, True)}%" if r["gunluk"] is not None else "gün ?"
         hac = f" · hacim {sayi(r['hacim'], 1)}x" if r["hacim"] is not None else ""
         bloklar.append(
-            f"{r['sembol']}  {sayi(r['fiyat'])} TL  ({gun})\n"
+            f"{yildiz}{r['sembol']}  {sayi(r['fiyat'])} TL  ({gun})\n"
             f"Çizgi {sayi(r['cizgi'])} · {r['temas']} temas · çizgi üstü %{sayi(r['kirilim'], 1, True)}{hac}\n"
             f"Teyit {r['teyit']}/4 {r['isaret']}"
             f"{'  · eksik: ' + ', '.join(r['eksik']) if r['eksik'] else ''}\n"
@@ -415,7 +435,7 @@ def main():
         print("Hisselerin yarısından fazlasının verisi alınamadı (Yahoo erişim sorunu olabilir).")
         sys.exit(1)
 
-    sonuclar.sort(key=lambda r: (-r["temas"], r["sembol"]))
+    sonuclar.sort(key=siralama_anahtari)
     ozet = (f"Taranan: {len(semboller)} · veri alınamayan: {sayac['veri_yok']} · "
             f"bugün işlem görmeyen: {sayac['bugun_yok']}")
 
