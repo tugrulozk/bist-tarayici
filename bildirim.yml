@@ -1,0 +1,43 @@
+name: BIST bildirim
+
+on:
+  schedule:
+    - cron: "7,22,37,52 7-14 * * 1-5"
+    - cron: "7 15 * * 1-5"
+    - cron: "40 15 * * 1-5"
+  workflow_dispatch:
+    inputs:
+      mod:
+        description: "Çalışma modu"
+        type: choice
+        default: bildirim
+        options:
+          - baglanti
+          - deneme
+          - bildirim
+          - rapor
+
+jobs:
+  tara:
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+      - name: Kütüphaneleri kur
+        run: pip install yfinance pandas numpy
+      - name: Önceki bildirim kaydını getir
+        uses: actions/cache@v4
+        with:
+          path: durum
+          key: bildirilen-${{ github.run_id }}
+          restore-keys: |
+            bildirilen-
+      - name: Tara ve bildir
+        env:
+          TELEGRAM_TOKEN: ${{ secrets.TELEGRAM_TOKEN }}
+          TELEGRAM_CHAT_ID: ${{ secrets.TELEGRAM_CHAT_ID }}
+          MOD: ${{ github.event.inputs.mod || (github.event.schedule == '40 15 * * 1-5' && 'rapor') || 'bildirim' }}
+        run: python bildirim.py
