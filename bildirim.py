@@ -18,6 +18,8 @@ Sabit kurallar:
 - bildirim : normal çalışma (seans saati kontrolü + tekrar bildirmeme)
 - deneme   : seans saati ve tekrar kontrolü yok, o an eşleşen herkesi bildirir
 - baglanti : sadece Telegram'a deneme mesajı yollar
+- rapor    : gün sonu raporu; bugün bildirilen sinyallerin sonradan 15 dakikalık mumlarla değerlendirmesi
+             (en yüksek / en düşük / kapanış, stopa mı hedefe mi önce değdi), akşam seans bittikten sonra çalışır
 """
 import datetime as dt
 import json
@@ -568,14 +570,15 @@ def bolum(tur, ad, liste, blok_fonksiyonu):
     return (tur, ad, bloklar)
 
 
-def mesaj_parcalari(bolumler, simdi, onek="", ek_satir=""):
+def mesaj_parcalari(bolumler, simdi, onek="", ek_satir="", baslik=None, alt=None):
     """Tüm başlıkları tek mesajda toplar; çok uzarsa parçalara böler.
     Dönüş: [(metin, [(tur, sembol), ...]), ...]  (her parçada hangi hisselerin gittiği bilinsin diye)."""
-    ust = f"{onek}📡 BIST tarayıcı · {simdi:%H:%M}"
+    ust = baslik if baslik is not None else f"{onek}📡 BIST tarayıcı · {simdi:%H:%M}"
     if ek_satir:
         ust += "\n" + ek_satir
-    alt = ("⚠️ Veri ~15 dk gecikmeli. Aktif mumda sinyal, mum kapanınca kaybolabilir. "
-           "Girmeden önce grafiği ve Midas'taki güncel fiyatı kontrol et.")
+    if alt is None:
+        alt = ("⚠️ Veri ~15 dk gecikmeli. Aktif mumda sinyal, mum kapanınca kaybolabilir. "
+               "Girmeden önce grafiği ve Midas'taki güncel fiyatı kontrol et.")
     parcalar, mevcut, anahtarlar = [], ust + "\n", []
     for tur, ad, bloklar in bolumler:
         mevcut += f"\n{ad} · {len(bloklar)} hisse\n\n"
@@ -598,6 +601,219 @@ def gonder(bolumler, simdi, onek="", ek_satir=""):
         else:
             hata = True
     return gitti, hata
+
+
+# ------------------------------------------------------- sinyal kaydı ve gün sonu raporu
+GECMIS_SINIR = 600   # geçmişte en fazla bu kadar değerlendirilmiş sinyal tutulur
+
+
+def kayit_yap(tur, r, simdi):
+    """Gönderilen bir sinyalin sonradan değerlendirilmesi için gereken bilgiler."""
+    if tur in ("g", "e"):
+        hedef = r["hedefler"][0][1] if r["hedefler"] else None   # ilk (en yakın) Fibonacci hedefi
+        ek = dict(ust_cizgi=r.get("ust_cizgi") is not None, teyit=r["teyit"])
+    else:
+        hedef = r["hedef"]
+        ek = dict(puan=r["puan"], teyit=r["teyit"])
+    return dict(tur=tur, sembol=r["sembol"], saat=f"{simdi:%H:%M}", fiyat=r["fiyat"],
+                stop=r["stop"], hedef=hedef, **ek)
+
+
+def kayit_dosyasi():
+    return DURUM_DOSYASI.parent / "sinyaller.json"
+
+
+def gecmis_dosyasi():
+    return DURUM_DOSYASI.parent / "gecmis.json"
+
+
+def kayit_oku(bugun_str):
+    try:
+        d = json.loads(kayit_dosyasi().read_text(encoding="utf-8"))
+        if d.get("tarih") == bugun_str:
+            return d.get("kayitlar", [])
+    except Exception:
+        pass
+    return []
+
+
+def kayit_ekle(bugun_str, yeni):
+    DURUM_DOSYASI.parent.mkdir(exist_ok=True)
+    kayit_dosyasi().write_text(
+        json.dumps({"tarih": bugun_str, "kayitlar": kayit_oku(bugun_str) + yeni}, ensure_ascii=False),
+        encoding="utf-8")
+
+
+def gecmis_oku():
+    try:
+        return json.loads(gecmis_dosyasi().read_text(encoding="utf-8"))
+    except Exception:
+        return []
+
+
+def gecmis_yaz(bugun_str, yeni):
+    """Bugünün değerlendirilmiş sinyallerini geçmişe ekler (aynı gün iki kez çalışırsa üstüne yazar)."""
+    liste = [k for k in gecmis_oku() if k.get("tarih") != bugun_str] + yeni
+    DURUM_DOSYASI.parent.mkdir(exist_ok=True)
+    gecmis_dosyasi().write_text(json.dumps(liste[-GECMIS_SINIR:], ensure_ascii=False), encoding="utf-8")
+
+
+def veri_cek_15dk(sembol):
+    """Gün sonu değerlendirmesi için ham 15 dakikalık mumlar (birleştirme yok)."""
+    df = None
+    for deneme in range(3):
+        try:
+            df = yf.Ticker(sembol + ".IS").history(period="5d", interval="15m", auto_adjust=True)
+        except Exception:
+            df = None
+        if df is not None and not df.empty:
+            break
+        time.sleep(1.5 * (deneme + 1))
+    if df is None or df.empty:
+        return None
+    df = df[["Open", "High", "Low", "Close", "Volume"]].dropna()
+    if df.empty:
+        return None
+    if df.index.tz is None:
+        df.index = df.index.tz_localize("UTC")
+    df.index = df.index.tz_convert("Europe/Istanbul")
+    return df
+
+
+def degerlendir(k, df15, tarih):
+    """Sinyalden SONRAKİ 15 dakikalık mumlara bakar (sinyal saatini bir sonraki 15 dk sınırına yuvarlar).
+    sonuc: hedef / stop / belirsiz (aynı mumda ikisi de) / yok (ikisine de değmedi) / bos (mum verisi yok).
+    en yüksek / en düşük / kapanış, sinyal fiyatına göre yüzdedir ve sinyalden sonra günün sonuna kadardır."""
+    h, m = (int(x) for x in k["saat"].split(":"))
+    dak = -(-(h * 60 + m) // 15) * 15
+    bas = pd.Timestamp(tarih.year, tarih.month, tarih.day, tz=TR) + pd.Timedelta(minutes=dak)
+    gunluk = np.array(df15.index.date) == tarih
+    yol = df15[(df15.index >= bas) & gunluk]
+    if yol.empty:
+        return dict(sonuc="bos")
+    sonuc, olay = "yok", None
+    for zaman, satir in yol.iterrows():
+        stop_deydi = bool(satir["Low"] <= k["stop"])
+        hedef_deydi = k["hedef"] is not None and bool(satir["High"] >= k["hedef"])
+        if stop_deydi and hedef_deydi:
+            sonuc, olay = "belirsiz", zaman
+            break
+        if stop_deydi:
+            sonuc, olay = "stop", zaman
+            break
+        if hedef_deydi:
+            sonuc, olay = "hedef", zaman
+            break
+    giris = k["fiyat"]
+    return dict(
+        sonuc=sonuc, olay=None if olay is None else f"{olay:%H:%M}",
+        yuk=(float(yol["High"].max()) / giris - 1) * 100,
+        dus=(float(yol["Low"].min()) / giris - 1) * 100,
+        kap=(float(yol["Close"].iloc[-1]) / giris - 1) * 100,
+    )
+
+
+def sonuc_metni(k, d):
+    hedef_ad = "ilk hedefe" if k["tur"] in ("g", "e") else "hedefe"
+    if d["sonuc"] == "hedef":
+        return f"🎯 {d['olay']} mumunda {hedef_ad} ({sayi(k['hedef'])}) değdi"
+    if d["sonuc"] == "stop":
+        return f"🛑 {d['olay']} mumunda stopa ({sayi(k['stop'])}) değdi"
+    if d["sonuc"] == "belirsiz":
+        return f"❓ {d['olay']} mumunda hem stop hem hedef var, sıra belli değil"
+    if k["hedef"] is None:
+        return "⏳ stopa değmedi (hedef tanımlı değildi)"
+    return "⏳ stopa da hedefe de değmedi"
+
+
+def rapor_blogu(k, d):
+    baslik = f"{k['sembol']}  {k['saat']} · {sayi(k['fiyat'])} TL"
+    if d["sonuc"] == "bos":
+        return baslik + "\n" + "Sinyalden sonra mum verisi alınamadı\n"
+    return (baslik + "\n"
+            f"en yüksek %{sayi(d['yuk'], 1, True)} · en düşük %{sayi(d['dus'], 1, True)} · "
+            f"kapanış %{sayi(d['kap'], 1, True)}\n"
+            f"{sonuc_metni(k, d)}\n")
+
+
+def ozet_satiri(etiket, grup):
+    """Değerlendirilmiş (mum verisi olan) sinyallerin kısa özeti."""
+    grup = [k for k in grup if k.get("sonuc") != "bos"]
+    if not grup:
+        return None
+    n = len(grup)
+    say = lambda ad: sum(1 for k in grup if k["sonuc"] == ad)
+    ort = lambda alan: sum(k[alan] for k in grup) / n
+    return (f"{etiket} {n} sinyal · 🎯 {say('hedef')} · 🛑 {say('stop')} · ❓ {say('belirsiz')} · "
+            f"⏳ {say('yok')}\n   ort. en yüksek %{sayi(ort('yuk'), 1, True)} · "
+            f"ort. en düşük %{sayi(ort('dus'), 1, True)} · ort. kapanış %{sayi(ort('kap'), 1, True)}")
+
+
+def genel_toplam(gecmis):
+    gunler = {k["tarih"] for k in gecmis}
+    satirlar = [f"📈 Genel toplam ({len(gunler)} işlem günü)"]
+    for tur, simge in (("g", "🚀"), ("e", "⏳"), ("a", "🔻")):
+        satir = ozet_satiri(simge, [k for k in gecmis if k["tur"] == tur])
+        if satir:
+            satirlar.append(satir)
+    trend = [k for k in gecmis if k["tur"] in ("g", "e") and "ust_cizgi" in k]
+    for ad, secim in (("⚠️ üstte çizgi uyarılı 🚀⏳", True), ("üstte çizgi uyarısız 🚀⏳", False)):
+        satir = ozet_satiri(ad, [k for k in trend if k["ust_cizgi"] == secim])
+        if satir:
+            satirlar.append(satir)
+    if sum(1 for k in gecmis if k.get("sonuc") != "bos") < 30:
+        satirlar.append("Örnek sayısı az; kesin yorum için erken.")
+    return "\n".join(satirlar)
+
+
+def rapor_calistir(simdi, bugun):
+    kayitlar = kayit_oku(str(bugun))
+    if not kayitlar:
+        print("Bugün bildirilmiş sinyal kaydı yok, rapor gönderilmedi.")
+        return
+    semboller = sorted({k["sembol"] for k in kayitlar})
+    with ThreadPoolExecutor(max_workers=4) as havuz:
+        veriler = dict(zip(semboller, havuz.map(veri_cek_15dk, semboller)))
+    sonuclar = []
+    for k in sorted(kayitlar, key=lambda x: x["saat"]):
+        df = veriler.get(k["sembol"])
+        d = degerlendir(k, df, bugun) if df is not None else dict(sonuc="bos")
+        sonuclar.append((k, d))
+
+    gecmise = []
+    for k, d in sonuclar:
+        kayit = dict(tarih=str(bugun), tur=k["tur"], sembol=k["sembol"], saat=k["saat"],
+                     sonuc=d["sonuc"], teyit=k.get("teyit"))
+        for alan in ("ust_cizgi", "puan"):
+            if alan in k:
+                kayit[alan] = k[alan]
+        for alan in ("yuk", "dus", "kap"):
+            if alan in d:
+                kayit[alan] = round(d[alan], 2)
+        gecmise.append(kayit)
+    gecmis_yaz(str(bugun), gecmise)
+
+    adlar = (("g", "🚀 Düşen trend kırılımı"), ("e", "⏳ Erken sinyal"), ("a", "🔻 Aşırı satış tepkisi"))
+    bolumler = []
+    for tur, ad in adlar:
+        bloklar = [(k["sembol"], rapor_blogu(k, d)) for k, d in sonuclar if k["tur"] == tur]
+        if bloklar:
+            bolumler.append((tur, ad, bloklar))
+    degerli = [d for _, d in sonuclar if d["sonuc"] != "bos"]
+    say = lambda ad: sum(1 for d in degerli if d["sonuc"] == ad)
+    ozet = (f"Bugün {len(sonuclar)} sinyal: 🎯 {say('hedef')} hedefe · 🛑 {say('stop')} stopa · "
+            f"❓ {say('belirsiz')} belirsiz · ⏳ {say('yok')} hiçbirine değmedi")
+    alt = (genel_toplam(gecmis_oku()) + "\n\n"
+           "ℹ️ Değerlendirme, sinyalden sonraki ilk 15 dk sınırından günün sonuna kadarki 15 dakikalık "
+           "mumlarla yapıldı. Sinyal fiyatı gecikmeli veriden geldiği için gerçek girişin biraz farklı "
+           "olabilir. Aynı mumda hem stop hem hedef varsa sıra bilinemez (❓).")
+    ok = True
+    for metin, _ in mesaj_parcalari(bolumler, simdi, ek_satir=ozet, alt=alt,
+                                    baslik=f"📊 Gün sonu raporu · {bugun:%d.%m.%Y}"):
+        ok = telegram_gonder(metin) and ok
+    if not ok:
+        print("Rapor mesajı gönderilemedi.")
+        sys.exit(1)
 
 
 def telegram_gonder(metin):
@@ -656,6 +872,10 @@ def main():
         ok = telegram_gonder("✅ BIST tarayıcı botu bağlandı. Bildirimler bu sohbete gelecek.")
         print("Bağlantı mesajı gönderildi." if ok else "Bağlantı mesajı GÖNDERİLEMEDİ.")
         sys.exit(0 if ok else 1)
+
+    if mod == "rapor":
+        rapor_calistir(simdi, bugun)
+        return
 
     if mod == "bildirim" and not seans_icinde(simdi):
         print(f"Seans dışı ({simdi:%d.%m.%Y %H:%M}), tarama yapılmadı.")
@@ -721,6 +941,11 @@ def main():
     e_gitti |= {s for t, s in gitti if t == "e"}
     a_gitti |= {s for t, s in gitti if t == "a"}
     durum_yaz(str(bugun), g_gitti, e_gitti, a_gitti)
+    yeni_kayitlar = [kayit_yap(tur, r, simdi)
+                     for tur, liste in (("g", yeni_g), ("e", yeni_e), ("a", yeni_a))
+                     for r in liste if (tur, r["sembol"]) in gitti]
+    if yeni_kayitlar:
+        kayit_ekle(str(bugun), yeni_kayitlar)
     if hata:
         print("Bazı mesajlar gönderilemedi; o hisseler kayda eklenmedi, sonraki taramada tekrar denenecek.")
         sys.exit(1)
