@@ -4,6 +4,7 @@ on:
   schedule:
     - cron: "7,22,37,52 7-14 * * 1-5"
     - cron: "7 15 * * 1-5"
+    - cron: "40 15 * * 1-5"
   workflow_dispatch:
     inputs:
       mod:
@@ -14,6 +15,7 @@ on:
           - baglanti
           - deneme
           - bildirim
+          - rapor
 
 jobs:
   tara:
@@ -37,5 +39,5 @@ jobs:
         env:
           TELEGRAM_TOKEN: ${{ secrets.TELEGRAM_TOKEN }}
           TELEGRAM_CHAT_ID: ${{ secrets.TELEGRAM_CHAT_ID }}
-          MOD: ${{ github.event.inputs.mod || 'bildirim' }}
+          MOD: ${{ github.event.inputs.mod || (github.event.schedule == '40 15 * * 1-5' && 'rapor') || 'bildirim' }}
         run: python bildirim.py
