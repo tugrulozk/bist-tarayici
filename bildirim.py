@@ -41,7 +41,7 @@ PERIYOT, ARALIK, MUM_DAKIKA = "60d", "15m", 60
 MIN_MUM = 270      # app.py ile aynı: bundan az mumu olan hisse atlanır (NW 50 + MAE 200 + 20)
 # Dort teyit: 🟢 yesil mum, 📊 hacim, 🔒 dip korunmus, 📈 fiyat KAMA'nin ustunde
 MIN_TEYIT = 3          # guclu sinyal (🚀): 4 teyitten en az 3'u VE hacim sartlarin icinde
-ERKEN_TEYIT = 2        # erken sinyal (⏳): 4 teyitten en az 2'si, hacim olmasa da olur
+ERKEN_TEYIT = 3        # erken sinyal (⏳): hacim disindaki uc teyidin (🟢🔒📈) hepsi sart, sadece hacim eksik
 KAMA_N, KAMA_HIZLI, KAMA_YAVAS = 21, 2, 30   # TradingView'deki KAMA ayari
 UST_CIZGI_YAKIN = 1.5   # fiyatin ustundeki gecerli cizgi en fazla bu % uzaktaysa mesaja uyari yazilir
 FIB_GERI = 40          # Fibonacci tepesi: dipten onceki en fazla bu kadar mum icindeki en yuksek nokta
