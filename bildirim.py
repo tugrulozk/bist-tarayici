@@ -1,4 +1,4 @@
-"""BIST düşen trend kırılımı bildirimi (Telegram).
+"""BIST düşen trend kırılımı + aşırı satış tepkisi bildirimi (Telegram).
 
 app.py'den bağımsız çalışır, app.py'ye dokunmaz. GitHub Actions tarafından
 seans saatlerinde 15 dakikada bir çalıştırılır.
@@ -9,7 +9,10 @@ Sabit kurallar:
 - Dönüş teyidi: 4 şart (yeşil mum, hacim, dip korunması, fiyat KAMA üstünde); 🚀 = en az 3 ve hacim dahil, ⏳ = en az 2
 - Fiyatın hâlâ altında kaldığı başka geçerli çizgi varsa mesaja uyarı satırı eklenir
 - Aynı mesajdaki hisseler en çok teyide göre sıralanır, ilki ⭐ ile işaretlenir
-- Aynı hisse aynı gün içinde yalnızca bir kez bildirilir
+- Aşırı satış tepkisi (🔻): app.py'deki beş göstergeli tarama, ekran görüntüsündeki ayarlarla
+  (en az 3 kriter, günlük en az %6 düşüş, en az 2 dönüş teyidi, tabana oturmuşlar hariç)
+- Tüm sinyaller tek mesajda, ayrı başlıklar altında gelir; hiçbir grupta yeni hisse yoksa mesaj gelmez
+- Aynı hisse aynı gün içinde, her grup için yalnızca bir kez bildirilir
 
 Çalışma modları (MOD ortam değişkeni):
 - bildirim : normal çalışma (seans saati kontrolü + tekrar bildirmeme)
@@ -48,6 +51,16 @@ FIB_GERI = 40          # Fibonacci tepesi: dipten onceki en fazla bu kadar mum i
 # app.py'deki varsayılan trend ayarları (kaydırıcılar varsayılan değerde)
 P = dict(trend_temas=3, trend_egim=3.0, trend_tol=0.5, trend_yakin=1.5)
 DURUM_DOSYASI = Path("durum") / "bildirilen.json"
+
+# ---- Aşırı satış tarama ayarları (app.py'deki ekran görüntüsüyle aynı değerler) ----
+ASIRI_EN_AZ_KRITER = 3   # 5 göstergeden en az kaç puan (✅ = 1, 🟡 yakın = 1)
+ASIRI_MIN_DUSUS = 6.0    # gün içinde en az % kaç düşmüş (önceki kapanışa ya da bugünkü açılışa göre)
+ASIRI_EN_AZ_TEYIT = 2    # 3 dönüş teyidinden (🟢 🔒 📊) en az kaçı
+TABAN_ESIGI = -9.5       # günlük değişim bunun altındaysa tabana oturmuş sayılır, hariç tutulur
+STOP_ATR = 1.5           # örnek stop: fiyat - 1,5 x ATR
+# app.py'deki "Gelişmiş ayarlar" varsayılanları
+PA = dict(yakin_say=True, son_n=2, macd_seviye=0.0, macd_yakinlik=0.3, mfi_os=20.0,
+          stoch_os=20.0, wt_yakin=4.0, nw_h=8.0, nw_carpan=3.0)
 
 SEMBOL_KALIBI = re.compile(r"^(?=.*[A-Z])[A-Z0-9]{3,6}$")
 YOK_SAY = {"USD", "TRY", "EUR", "TTM", "EPS", "FKO", "POINT", "SEMBOL", "FIYAT", "HACIM", "PYS",
@@ -207,6 +220,181 @@ def kama_kesisimi(df, sn=2):
     return kesti, ustunde, float(k[-1])
 
 
+# ------------------------------------------------- aşırı satış göstergeleri (app.py'den birebir)
+def ema(s, n):
+    return s.ewm(span=n, adjust=False).mean()
+
+
+def dema(s, n):
+    e = ema(s, n)
+    return 2 * e - ema(e, n)
+
+
+def rsi_hesapla(kapanis, periyot=14):
+    fark = kapanis.diff()
+    kazanc = fark.clip(lower=0)
+    kayip = -fark.clip(upper=0)
+    ort_k = kazanc.ewm(alpha=1 / periyot, adjust=False, min_periods=periyot).mean()
+    ort_z = kayip.ewm(alpha=1 / periyot, adjust=False, min_periods=periyot).mean()
+    rs = ort_k / ort_z.replace(0, np.nan)
+    rsi = 100 - 100 / (1 + rs)
+    rsi = rsi.where(ort_z != 0, 100.0)
+    return rsi.where(ort_z.notna())
+
+
+def mfi_hesapla(df, n=14):
+    tp = (df["High"] + df["Low"] + df["Close"]) / 3
+    akis = tp * df["Volume"]
+    poz = akis.where(tp > tp.shift(1), 0.0).rolling(n).sum()
+    neg = akis.where(tp < tp.shift(1), 0.0).rolling(n).sum()
+    oran = poz / neg.replace(0, np.nan)
+    mfi = 100 - 100 / (1 + oran)
+    return mfi.where(neg != 0, 100.0)
+
+
+def wave_trend(df, n1=10, n2=21):
+    ap = (df["High"] + df["Low"] + df["Close"]) / 3
+    esa = ema(ap, n1)
+    d = ema((ap - esa).abs(), n1)
+    ci = (ap - esa) / (0.015 * d.replace(0, np.nan))
+    wt1 = ema(ci, n2)
+    wt2 = wt1.rolling(4).mean()
+    return wt1, wt2
+
+
+def stoch_rsi(kapanis, rsi_n=14, stoch_n=14, k_n=3, d_n=3):
+    rsi = rsi_hesapla(kapanis, rsi_n)
+    alt = rsi.rolling(stoch_n).min()
+    ust = rsi.rolling(stoch_n).max()
+    st_ = (rsi - alt) / (ust - alt).replace(0, np.nan) * 100
+    k = st_.rolling(k_n).mean()
+    d = k.rolling(d_n).mean()
+    return k, d
+
+
+def nadaraya_tv(kapanis, h=8.0, carpan=3.0, n_max=500):
+    """TradingView'deki LuxAlgo 'repainting' moduna yaklasik benzetme (app.py ile ayni)."""
+    x = kapanis.to_numpy(dtype=float)[-n_max:]
+    n = len(x)
+    idx = np.arange(n)
+    w = np.exp(-((idx[:, None] - idx[None, :]) ** 2) / (2 * h * h))
+    y = (w @ x) / w.sum(axis=1)
+    sae = np.abs(x - y).sum() / max(n - 1, 1) * carpan
+    nw = pd.Series(np.nan, index=kapanis.index)
+    nw.iloc[-n:] = y
+    return nw, nw - sae, nw + sae
+
+
+def yukari_kesti(a, b, son_n):
+    k = (a.shift(1) <= b.shift(1)) & (a > b)
+    return bool(k.iloc[-son_n:].any())
+
+
+def atr_hesapla(df, n=14):
+    onceki = df["Close"].shift(1)
+    tr = pd.concat([df["High"] - df["Low"],
+                    (df["High"] - onceki).abs(),
+                    (df["Low"] - onceki).abs()], axis=1).max(axis=1)
+    return tr.ewm(alpha=1 / n, adjust=False, min_periods=n).mean()
+
+
+def bugunku_mumlar(df):
+    gunler = np.array(df.index.date)
+    return df[gunler == gunler[-1]]
+
+
+def acilistan_dusus(df):
+    """Bugunku seansin acilis fiyatindan son kapanisa degisim (%)."""
+    return (df["Close"].iloc[-1] / bugunku_mumlar(df)["Open"].iloc[0] - 1) * 100
+
+
+def kriter_macd(df, p):
+    macd = dema(df["Close"], 12) - dema(df["Close"], 26)
+    sinyal = ema(macd, 9)
+    hist = macd - sinyal
+    altinda = bool(macd.iloc[-1] < p["macd_seviye"])
+    kesti = yukari_kesti(macd, sinyal, p["son_n"])
+    h1, h0 = hist.iloc[-1], hist.iloc[-2]
+    yakin = bool(h1 < 0 and h1 > h0 and abs(h1) <= p["macd_yakinlik"] * hist.abs().iloc[-50:].max())
+    return 2 if (altinda and kesti) else 1 if (altinda and yakin) else 0
+
+
+def kriter_mfi(df, p):
+    v = mfi_hesapla(df).iloc[-1]
+    return 2 if v <= p["mfi_os"] else 1 if v <= p["mfi_os"] + 8 else 0
+
+
+def kriter_wt(df, p):
+    wt1, wt2 = wave_trend(df)
+    kesti = yukari_kesti(wt1, wt2, p["son_n"])
+    altta = bool(wt1.iloc[-1] < 0)
+    yaklasiyor = bool(wt1.iloc[-1] < wt2.iloc[-1] and wt1.iloc[-1] > wt1.iloc[-2]
+                      and (wt2.iloc[-1] - wt1.iloc[-1]) <= p["wt_yakin"] and altta)
+    return 2 if (kesti and altta) else 1 if yaklasiyor else 0
+
+
+def kriter_stoch(df, p):
+    k, d = stoch_rsi(df["Close"])
+    kesti = yukari_kesti(k, d, p["son_n"])
+    asiri = bool(k.iloc[-(p["son_n"] + 1):].min() <= p["stoch_os"])
+    yakin_asiri = bool(k.iloc[-1] <= p["stoch_os"] + 10)
+    return 2 if (asiri and kesti) else 1 if (asiri or (yakin_asiri and kesti)) else 0
+
+
+def kriter_nw(df, p):
+    """TradingView tarzi (repaint): kapanis alt bandin altina yeni inmisse = yesil ucgen."""
+    nw, alt, ust = nadaraya_tv(df["Close"], p["nw_h"], p["nw_carpan"])
+    kap = df["Close"]
+    alt_alti = kap < alt
+    ilk = alt_alti & ~alt_alti.shift(1, fill_value=False)
+    ucgen = bool(ilk.iloc[-p["son_n"]:].any())
+    konum = (kap.iloc[-1] - alt.iloc[-1]) / (ust.iloc[-1] - alt.iloc[-1]) * 100
+    yakin = bool(alt_alti.iloc[-1]) or konum <= 10
+    return 2 if ucgen else 1 if yakin else 0
+
+
+ASIRI_KRITERLER = (("MACD", kriter_macd), ("MFI", kriter_mfi), ("Wave Trend", kriter_wt),
+                   ("Stoch RSI", kriter_stoch), ("Nadaraya", kriter_nw))
+ISARET = {2: "✅", 1: "🟡", 0: "—"}
+
+
+def asiri_satis(df, sembol):
+    """Aşırı satış tepkisi: app.py'deki seçim kuralının aynısı.
+    (puan >= ASIRI_EN_AZ_KRITER) ve (günlük ya da açılıştan düşüş >= ASIRI_MIN_DUSUS) ve
+    (tabana oturmamış) ve (dönüş teyidi >= ASIRI_EN_AZ_TEYIT). Bulursa sonuç sözlüğü, yoksa None.
+    Ucuz kontroller önce yapılır; beş gösterge yalnızca düşüş ve teyit şartı geçen hisselere hesaplanır."""
+    degisim = gunluk_degisim(df)
+    acilis = float(acilistan_dusus(df))
+    dusus = ((not np.isnan(degisim)) and degisim <= -ASIRI_MIN_DUSUS) or acilis <= -ASIRI_MIN_DUSUS
+    if not dusus:
+        return None
+    if (not np.isnan(degisim)) and degisim <= TABAN_ESIGI:
+        return None
+    teyit_n, teyit_isaret = donus_teyidi(df)
+    if teyit_n < ASIRI_EN_AZ_TEYIT:
+        return None
+    durumlar = [f(df, PA) for _, f in ASIRI_KRITERLER]
+    tam = sum(1 for d in durumlar if d == 2)
+    yakin = sum(1 for d in durumlar if d == 1)
+    puan = tam + (yakin if PA["yakin_say"] else 0)
+    if puan < ASIRI_EN_AZ_KRITER:
+        return None
+    fiyat = float(df["Close"].iloc[-1])
+    atr = float(atr_hesapla(df).iloc[-1])
+    stop = fiyat - STOP_ATR * atr
+    nw_orta = float(nadaraya_tv(df["Close"], PA["nw_h"], PA["nw_carpan"])[0].iloc[-1])
+    hedef = nw_orta if nw_orta > fiyat else None
+    risk = fiyat - stop
+    rg = (hedef - fiyat) / risk if (hedef is not None and risk > 0) else None
+    return dict(
+        sembol=sembol, fiyat=fiyat,
+        gunluk=None if np.isnan(degisim) else float(degisim), acilis=acilis,
+        puan=int(puan), durumlar=durumlar, teyit=int(teyit_n), isaret=teyit_isaret,
+        stop=stop, stop_uzak=(fiyat - stop) / fiyat * 100,
+        hedef=hedef, hedef_uzak=None if hedef is None else (hedef / fiyat - 1) * 100, rg=rg,
+    )
+
+
 # ------------------------------------------------------------------------ yardımcı
 def hisse_listesi():
     icerik = (Path(__file__).parent / "hisseler.txt").read_text(encoding="utf-8")
@@ -256,18 +444,11 @@ def stop_hedef(fiyat, cizgi, tepe, dip):
     return dict(stop=stop, stop_uzak=(fiyat - stop) / fiyat * 100, hedefler=hedefler)
 
 
-def analiz(sembol, bugun):
-    """(durum, sonuç) döner. durum: veri_yok / kisa / bugun_yok / yok / bulundu"""
-    df = veri_cek(sembol)
-    if df is None:
-        return "veri_yok", None
-    if len(df) < MIN_MUM:
-        return "kisa", None
-    if df.index[-1].date() != bugun:
-        return "bugun_yok", None   # tatil günü ya da bugün hiç işlem görmemiş hisse
+def trend_sinyali(df, sembol):
+    """Düşen trend kırılımı sinyali (🚀 / ⏳). Yoksa None."""
     tr = trend_kirilimi(df, P)
     if not tr or tr["durum"] != 2:
-        return "yok", None
+        return None
     teyit_n, isaret = donus_teyidi(df)
     kama_kesti, kama_ustunde, kama_son = kama_kesisimi(df)
     if kama_ustunde:                 # fiyat su an KAMA'nin ustundeyse teyit sayilir
@@ -275,9 +456,9 @@ def analiz(sembol, bugun):
         isaret += "📈"
     hacim_var = "📊" in isaret
     if teyit_n < ERKEN_TEYIT:
-        return "yok", None
+        return None
     degisim = gunluk_degisim(df)
-    return "bulundu", dict(
+    return dict(
         sembol=sembol, fiyat=float(df["Close"].iloc[-1]),
         gunluk=None if np.isnan(degisim) else float(degisim),
         cizgi=float(tr["cizgi"]), temas=int(tr["temas"]), kirilim=float(tr["kirilim"]),
@@ -290,6 +471,25 @@ def analiz(sembol, bugun):
         ust_cizgi=tr.get("ust_cizgi"),
         **stop_hedef(float(df["Close"].iloc[-1]), float(tr["cizgi"]), tr["tepe"], tr["dip"]),
     )
+
+
+def analiz(sembol, bugun):
+    """(durum, trend_sonucu, asiri_sonucu) döner.
+    durum: veri_yok / kisa / bugun_yok / yok / bulundu (iki taramadan en az biri sinyal verdi)"""
+    df = veri_cek(sembol)
+    if df is None:
+        return "veri_yok", None, None
+    if len(df) < MIN_MUM:
+        return "kisa", None, None
+    if df.index[-1].date() != bugun:
+        return "bugun_yok", None, None   # tatil günü ya da bugün hiç işlem görmemiş hisse
+    tr_r = trend_sinyali(df, sembol)
+    try:
+        as_r = asiri_satis(df, sembol)
+    except Exception as e:               # tek hissenin hesap hatası taramanın tamamını durdurmasın
+        print(f"Aşırı satış hesabı hata verdi: {sembol} ({type(e).__name__}: {e})")
+        as_r = None
+    return ("bulundu" if (tr_r or as_r) else "yok"), tr_r, as_r
 
 
 def sayi(x, n=2, isaretli=False):
@@ -328,35 +528,76 @@ def siralama_anahtari(r):
     return (-r["teyit"], r.get("ust_cizgi") is not None, -(r["hacim"] or 0.0), -r["temas"], r["sembol"])
 
 
-def mesaj_parcalari(yeniler, simdi, baslik, ek_satir=""):
-    ust = [f"{baslik} · {simdi:%H:%M}", f"Yeni: {len(yeniler)} hisse"]
-    if ek_satir:
-        ust.append(ek_satir)
-    ust.append("")
+def blok_trend(r, yildiz):
+    gun = f"gün {sayi(r['gunluk'], 1, True)}%" if r["gunluk"] is not None else "gün ?"
+    hac = f" · hacim {sayi(r['hacim'], 1)}x" if r["hacim"] is not None else ""
+    return (
+        f"{yildiz}{r['sembol']}  {sayi(r['fiyat'])} TL  ({gun})\n"
+        f"Çizgi {sayi(r['cizgi'])} · {r['temas']} temas · çizgi üstü %{sayi(r['kirilim'], 1, True)}{hac}\n"
+        f"Teyit {r['teyit']}/4 {r['isaret']}"
+        f"{'  · eksik: ' + ', '.join(r['eksik']) if r['eksik'] else ''}\n"
+        f"{kama_satiri(r)}"
+        f"{stop_hedef_satirlari(r)}"
+        f"https://www.tradingview.com/chart/?symbol=BIST%3A{r['sembol']}\n"
+    )
+
+
+def blok_asiri(r, yildiz):
+    gun = f"gün {sayi(r['gunluk'], 1, True)}%" if r["gunluk"] is not None else "gün ?"
+    kriterler = " · ".join(f"{ad} {ISARET[d]}" for (ad, _), d in zip(ASIRI_KRITERLER, r["durumlar"]))
+    if r["hedef"] is not None:
+        hedef = f"Hedef {sayi(r['hedef'])} (+%{sayi(r['hedef_uzak'], 1)})"
+        hedef += f" · R/G {sayi(r['rg'], 1)}" if r["rg"] is not None else ""
+    else:
+        hedef = "Hedef yok (fiyat Nadaraya orta çizgisinin üstünde)"
+    return (
+        f"{yildiz}{r['sembol']}  {sayi(r['fiyat'])} TL  ({gun} · açılıştan {sayi(r['acilis'], 1, True)}%)\n"
+        f"Puan {r['puan']}/5 · {kriterler}\n"
+        f"Teyit {r['teyit']}/3 {r['isaret']}\n"
+        f"Stop {sayi(r['stop'])} (-%{sayi(r['stop_uzak'], 1)}) · {hedef}\n"
+        f"https://www.tradingview.com/chart/?symbol=BIST%3A{r['sembol']}\n"
+    )
+
+
+def bolum(tur, ad, liste, blok_fonksiyonu):
+    """Bir başlık altındaki hisseleri (sembol, metin) çiftleri olarak hazırlar; ilki ⭐ (birden çoksa)."""
     bloklar = []
-    for sira, r in enumerate(yeniler):
-        yildiz = "⭐ " if (sira == 0 and len(yeniler) > 1) else ""
-        gun = f"gün {sayi(r['gunluk'], 1, True)}%" if r["gunluk"] is not None else "gün ?"
-        hac = f" · hacim {sayi(r['hacim'], 1)}x" if r["hacim"] is not None else ""
-        bloklar.append(
-            f"{yildiz}{r['sembol']}  {sayi(r['fiyat'])} TL  ({gun})\n"
-            f"Çizgi {sayi(r['cizgi'])} · {r['temas']} temas · çizgi üstü %{sayi(r['kirilim'], 1, True)}{hac}\n"
-            f"Teyit {r['teyit']}/4 {r['isaret']}"
-            f"{'  · eksik: ' + ', '.join(r['eksik']) if r['eksik'] else ''}\n"
-            f"{kama_satiri(r)}"
-            f"{stop_hedef_satirlari(r)}"
-            f"https://www.tradingview.com/chart/?symbol=BIST%3A{r['sembol']}\n"
-        )
+    for sira, r in enumerate(liste):
+        yildiz = "⭐ " if (sira == 0 and len(liste) > 1) else ""
+        bloklar.append((r["sembol"], blok_fonksiyonu(r, yildiz)))
+    return (tur, ad, bloklar)
+
+
+def mesaj_parcalari(bolumler, simdi, onek="", ek_satir=""):
+    """Tüm başlıkları tek mesajda toplar; çok uzarsa parçalara böler.
+    Dönüş: [(metin, [(tur, sembol), ...]), ...]  (her parçada hangi hisselerin gittiği bilinsin diye)."""
+    ust = f"{onek}📡 BIST tarayıcı · {simdi:%H:%M}"
+    if ek_satir:
+        ust += "\n" + ek_satir
     alt = ("⚠️ Veri ~15 dk gecikmeli. Aktif mumda sinyal, mum kapanınca kaybolabilir. "
            "Girmeden önce grafiği ve Midas'taki güncel fiyatı kontrol et.")
-    parcalar, mevcut = [], "\n".join(ust) + "\n"
-    for b in bloklar:
-        if len(mevcut) + len(b) > 3500:
-            parcalar.append(mevcut.rstrip())
-            mevcut = ""
-        mevcut += b + "\n"
-    parcalar.append((mevcut + alt).strip())
+    parcalar, mevcut, anahtarlar = [], ust + "\n", []
+    for tur, ad, bloklar in bolumler:
+        mevcut += f"\n{ad} · {len(bloklar)} hisse\n\n"
+        for sembol, metin in bloklar:
+            if len(mevcut) + len(metin) > 3500:
+                parcalar.append((mevcut.rstrip(), anahtarlar))
+                mevcut, anahtarlar = f"{ad} (devam)\n\n", []
+            mevcut += metin + "\n"
+            anahtarlar.append((tur, sembol))
+    parcalar.append(((mevcut + alt).strip(), anahtarlar))
     return parcalar
+
+
+def gonder(bolumler, simdi, onek="", ek_satir=""):
+    """Mesajı yollar. Dönüş: (başarıyla giden (tur, sembol) kümesi, hata_var_mı)."""
+    gitti, hata = set(), False
+    for metin, anahtarlar in mesaj_parcalari(bolumler, simdi, onek, ek_satir):
+        if telegram_gonder(metin):
+            gitti |= set(anahtarlar)
+        else:
+            hata = True
+    return gitti, hata
 
 
 def telegram_gonder(metin):
@@ -378,21 +619,21 @@ def telegram_gonder(metin):
 
 
 def durum_oku(bugun_str):
-    """(guclu_bildirilen, erken_bildirilen) kume cifti doner."""
+    """(guclu_bildirilen, erken_bildirilen, asiri_bildirilen) küme üçlüsü döner."""
     try:
         d = json.loads(DURUM_DOSYASI.read_text(encoding="utf-8"))
         if d.get("tarih") == bugun_str:
-            return set(d.get("hisseler", [])), set(d.get("erkenler", []))
+            return set(d.get("hisseler", [])), set(d.get("erkenler", [])), set(d.get("asirilar", []))
     except Exception:
         pass
-    return set(), set()
+    return set(), set(), set()
 
 
-def durum_yaz(bugun_str, guclu, erken):
+def durum_yaz(bugun_str, guclu, erken, asiri):
     DURUM_DOSYASI.parent.mkdir(exist_ok=True)
     DURUM_DOSYASI.write_text(
-        json.dumps({"tarih": bugun_str, "hisseler": sorted(guclu), "erkenler": sorted(erken)},
-                   ensure_ascii=False),
+        json.dumps({"tarih": bugun_str, "hisseler": sorted(guclu), "erkenler": sorted(erken),
+                    "asirilar": sorted(asiri)}, ensure_ascii=False),
         encoding="utf-8")
 
 
@@ -423,65 +664,63 @@ def main():
     semboller = hisse_listesi()
     print(f"{len(semboller)} hisse taranacak ({simdi:%d.%m.%Y %H:%M}, mod: {mod}).")
     sayac = {"veri_yok": 0, "kisa": 0, "bugun_yok": 0, "yok": 0, "bulundu": 0}
-    sonuclar = []
+    trend_liste, asiri_liste = [], []
     with ThreadPoolExecutor(max_workers=6) as havuz:
-        for durum, r in havuz.map(lambda s: analiz(s, bugun), semboller):
+        for durum, tr_r, as_r in havuz.map(lambda s: analiz(s, bugun), semboller):
             sayac[durum] += 1
-            if r:
-                sonuclar.append(r)
+            if tr_r:
+                trend_liste.append(tr_r)
+            if as_r:
+                asiri_liste.append(as_r)
     print("Sayım:", sayac)
 
     if sayac["veri_yok"] > 0.5 * len(semboller):
         print("Hisselerin yarısından fazlasının verisi alınamadı (Yahoo erişim sorunu olabilir).")
         sys.exit(1)
 
-    sonuclar.sort(key=siralama_anahtari)
+    trend_liste.sort(key=siralama_anahtari)
+    # aşırı satış sırası: önce puan (çoktan aza), sonra daha çok düşen
+    asiri_liste.sort(key=lambda r: (-r["puan"], -r["teyit"], r["gunluk"] if r["gunluk"] is not None else 0.0, r["sembol"]))
     ozet = (f"Taranan: {len(semboller)} · veri alınamayan: {sayac['veri_yok']} · "
             f"bugün işlem görmeyen: {sayac['bugun_yok']}")
 
-    gucluler = [r for r in sonuclar if r["kademe"] == "guclu"]
-    erkenler = [r for r in sonuclar if r["kademe"] == "erken"]
-    BASLIK_G, BASLIK_E = "🚀 Düşen trend kırılımı", "⏳ Erken sinyal"
+    gucluler = [r for r in trend_liste if r["kademe"] == "guclu"]
+    erkenler = [r for r in trend_liste if r["kademe"] == "erken"]
+    BASLIK_G, BASLIK_E, BASLIK_A = "🚀 Düşen trend kırılımı", "⏳ Erken sinyal", "🔻 Aşırı satış tepkisi"
+
+    def bolumleri_kur(g, e, a):
+        sonuc = []
+        if g:
+            sonuc.append(bolum("g", BASLIK_G, g, blok_trend))
+        if e:
+            sonuc.append(bolum("e", BASLIK_E, e, blok_trend))
+        if a:
+            sonuc.append(bolum("a", BASLIK_A, a, blok_asiri))
+        return sonuc
 
     if mod == "deneme":
-        if not sonuclar:
+        if not (trend_liste or asiri_liste):
             telegram_gonder(f"🧪 DENEME ({simdi:%H:%M}): şu an şartları sağlayan hisse yok.\n{ozet}")
             return
-        if gucluler:
-            for parca in mesaj_parcalari(gucluler, simdi, "🧪 DENEME · " + BASLIK_G, ozet):
-                telegram_gonder(parca)
-        if erkenler:
-            for parca in mesaj_parcalari(erkenler, simdi, "🧪 DENEME · " + BASLIK_E, "" if gucluler else ozet):
-                telegram_gonder(parca)
+        gonder(bolumleri_kur(gucluler, erkenler, asiri_liste), simdi, "🧪 DENEME · ", ozet)
         return
 
-    g_gitti, e_gitti = durum_oku(str(bugun))
+    g_gitti, e_gitti, a_gitti = durum_oku(str(bugun))
     yeni_g = [r for r in gucluler if r["sembol"] not in g_gitti]
     # erken sinyal: ne erken ne guclu olarak bugun bildirilmis olmali
     yeni_e = [r for r in erkenler if r["sembol"] not in e_gitti and r["sembol"] not in g_gitti]
+    yeni_a = [r for r in asiri_liste if r["sembol"] not in a_gitti]
     print("Güçlü:", [r["sembol"] for r in gucluler], "| Yeni:", [r["sembol"] for r in yeni_g])
     print("Erken:", [r["sembol"] for r in erkenler], "| Yeni:", [r["sembol"] for r in yeni_e])
-    if not yeni_g and not yeni_e:
+    print("Aşırı satış:", [r["sembol"] for r in asiri_liste], "| Yeni:", [r["sembol"] for r in yeni_a])
+    if not (yeni_g or yeni_e or yeni_a):
         return
 
-    hata = False
-    if yeni_g:
-        ok = True
-        for parca in mesaj_parcalari(yeni_g, simdi, BASLIK_G):
-            ok = telegram_gonder(parca) and ok
-        if ok:
-            g_gitti = g_gitti | {r["sembol"] for r in yeni_g}
-        else:
-            hata = True
-    if yeni_e:
-        ok = True
-        for parca in mesaj_parcalari(yeni_e, simdi, BASLIK_E):
-            ok = telegram_gonder(parca) and ok
-        if ok:
-            e_gitti = e_gitti | {r["sembol"] for r in yeni_e}
-        else:
-            hata = True
-    durum_yaz(str(bugun), g_gitti, e_gitti)
+    gitti, hata = gonder(bolumleri_kur(yeni_g, yeni_e, yeni_a), simdi)
+    g_gitti |= {s for t, s in gitti if t == "g"}
+    e_gitti |= {s for t, s in gitti if t == "e"}
+    a_gitti |= {s for t, s in gitti if t == "a"}
+    durum_yaz(str(bugun), g_gitti, e_gitti, a_gitti)
     if hata:
         print("Bazı mesajlar gönderilemedi; o hisseler kayda eklenmedi, sonraki taramada tekrar denenecek.")
         sys.exit(1)
