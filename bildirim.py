@@ -60,6 +60,9 @@ ASIRI_MIN_DUSUS = 6.0    # gün içinde en az % kaç düşmüş (önceki kapanı
 ASIRI_EN_AZ_TEYIT = 2    # 3 dönüş teyidinden (🟢 🔒 📊) en az kaçı
 TABAN_ESIGI = -9.5       # günlük değişim bunun altındaysa tabana oturmuş sayılır, hariç tutulur
 STOP_ATR = 1.5           # örnek stop: fiyat - 1,5 x ATR
+# ---- Giriş sınırı ve 4 saatlik direnç (mesajdaki ek bilgiler)
+GIRIS_MIN_RG = 1.5   # "en fazla bu fiyata kadar gir" sınırı için istenen en düşük risk/getiri (kazanç ≥ risk x bu)
+DIRENC_PERIYOT = "6mo"  # 4 saatlik düşen çizgi direnci için saatlik mum geçmişi (yalnızca sinyal veren hisselere çekilir)
 # app.py'deki "Gelişmiş ayarlar" varsayılanları
 PA = dict(yakin_say=True, son_n=2, macd_seviye=0.0, macd_yakinlik=0.3, mfi_os=20.0,
           stoch_os=20.0, wt_yakin=4.0, nw_h=8.0, nw_carpan=3.0)
@@ -94,7 +97,7 @@ def gunluk_degisim(df):
     return (df["Close"].iloc[-1] / onceki["Close"].iloc[-1] - 1) * 100
 
 
-def trend_kirilimi(df, p):
+def trend_kirilimi(df, p, ust_liste=None):
     """Dusen trend cizgisi kirilimi.
     Son ~200 mumdaki tepelerden (pivot) dusen cizgiler dener. Cizgi gecerli sayilir:
     - en az `trend_temas` AYRI tepe cizgiye degmis (mum ucu cizgiye %tol icinde),
@@ -169,6 +172,8 @@ def trend_kirilimi(df, p):
                 en_iyi = (anahtar, dict(durum=durum, temas=temas, cizgi=cizgi_son,
                                         kirilim=(son_kap / cizgi_son - 1) * 100, hacim=hacim_x,
                                         tepe=tepe_fib, dip=dip))
+    if ust_liste is not None:        # 4 saatlik direnç için: fiyatın altında kalan geçerli çizgilerin son değerleri
+        ust_liste.extend(ustte)
     if en_iyi is None:
         return None
     sonuc = en_iyi[1]
@@ -475,6 +480,102 @@ def trend_sinyali(df, sembol):
     )
 
 
+def veri_cek_uzun(sembol):
+    """4 saatlik düşen çizgi için ~6 aylık saatlik mum. Alınamazsa None."""
+    df = None
+    for deneme in range(2):
+        try:
+            df = yf.Ticker(sembol + ".IS").history(period=DIRENC_PERIYOT, interval="1h", auto_adjust=True)
+        except Exception:
+            df = None
+        if df is not None and not df.empty:
+            break
+        time.sleep(1.0 * (deneme + 1))
+    if df is None or df.empty:
+        return None
+    df = df[["Open", "High", "Low", "Close", "Volume"]].dropna()
+    if df.empty:
+        return None
+    if df.index.tz is None:
+        df.index = df.index.tz_localize("UTC")
+    df.index = df.index.tz_convert("Europe/Istanbul")
+    return df
+
+
+def dort_saatlik(df):
+    """Saatlik mumlardan 4 saatlik mumlar üretir (seans: 10-14 ve 14-18)."""
+    bas = df.index.normalize() + pd.to_timedelta(np.where(df.index.hour >= 14, 14, 10), unit="h")
+    g = df.groupby(bas)
+    return pd.DataFrame({"Open": g["Open"].first(), "High": g["High"].max(), "Low": g["Low"].min(),
+                         "Close": g["Close"].last(), "Volume": g["Volume"].sum()})
+
+
+def direnc_4s(df, fiyat):
+    """Fiyatın üstündeki en yakın GEÇERLİ düşen trend çizgisi (4 saatlik grafikte, saatlik grafikteki
+    çizgi bulma kuralının aynısıyla); yoksa None. Henüz kırılmamış, fiyatın üstünde kalan çizgiler aranır."""
+    d4 = dort_saatlik(df)
+    if len(d4) < 40:
+        return None
+    ust = []
+    trend_kirilimi(d4, P, ust_liste=ust)
+    ustunde = [c for c in ust if c > fiyat]
+    return min(ustunde) if ustunde else None
+
+
+def ilk_hedef(r):
+    if "hedefler" in r:
+        return r["hedefler"][0][1] if r["hedefler"] else None
+    return r.get("hedef")
+
+
+def etkin_hedef(fiyat, hedef, direnc):
+    """Fiyatın üstündeki hedef ve direncin yakın olanı. Dönüş: (hedef, dirence_gore_mi)."""
+    adaylar = [(h, ad) for h, ad in ((hedef, "hedef"), (direnc, "direnc")) if h is not None and h > fiyat]
+    if not adaylar:
+        return None, False
+    h, ad = min(adaylar)
+    return h, ad == "direnc"
+
+
+def hedef_bilgisi(r):
+    return etkin_hedef(r["fiyat"], ilk_hedef(r), r.get("direnc"))
+
+
+def rg_hesapla(fiyat, stop, hedef):
+    if hedef is None or hedef <= fiyat or fiyat <= stop:
+        return None
+    return (hedef - fiyat) / (fiyat - stop)
+
+
+def giris_satiri(fiyat, stop, hedef, dirence=False):
+    """'En fazla bu fiyata kadar gir' sınırı: risk/getiri GIRIS_MIN_RG'nin altına düşmesin.
+    Hedef olarak ilk hedef ya da (daha yakınsa) 4 saatlik direnç alınır."""
+    rg = rg_hesapla(fiyat, stop, hedef)
+    if rg is None:
+        return ""
+    sinir = (hedef + GIRIS_MIN_RG * stop) / (1 + GIRIS_MIN_RG)
+    ek = " · hedef olarak 4s direnç alındı" if dirence else ""
+    if rg < GIRIS_MIN_RG:
+        return (f"⚠️ R/G şu an {sayi(rg, 1)} ({sayi(GIRIS_MIN_RG, 1)} altında) · "
+                f"giriş sınırı {sayi(sinir)} geçilmiş{ek}\n")
+    return (f"Giriş sınırı {sayi(sinir)} (R/G ≥ {sayi(GIRIS_MIN_RG, 1)} için) · "
+            f"şu an R/G {sayi(rg, 1)}{ek}\n")
+
+
+def risk_getiri_satiri(r):
+    hedef, dirence = hedef_bilgisi(r)
+    return giris_satiri(r["fiyat"], r["stop"], hedef, dirence)
+
+
+def direnc_satiri(r):
+    if "direnc" not in r:
+        return ""
+    if r["direnc"] is None:
+        return "4s düşen çizgi direnci: geçerli çizgi yok\n"
+    uzak = (r["direnc"] / r["fiyat"] - 1) * 100
+    return f"4s düşen çizgi direnci {sayi(r['direnc'])} (+%{sayi(uzak, 1)})\n"
+
+
 def analiz(sembol, bugun):
     """(durum, trend_sonucu, asiri_sonucu) döner.
     durum: veri_yok / kisa / bugun_yok / yok / bulundu (iki taramadan en az biri sinyal verdi)"""
@@ -491,6 +592,15 @@ def analiz(sembol, bugun):
     except Exception as e:               # tek hissenin hesap hatası taramanın tamamını durdurmasın
         print(f"Aşırı satış hesabı hata verdi: {sembol} ({type(e).__name__}: {e})")
         as_r = None
+    if tr_r or as_r:
+        try:
+            uzun = veri_cek_uzun(sembol)
+            direnc = direnc_4s(uzun if uzun is not None else df, float(df["Close"].iloc[-1]))
+            for r in (tr_r, as_r):
+                if r:
+                    r["direnc"] = direnc
+        except Exception as e:
+            print(f"4 saatlik direnç hesabı hata verdi: {sembol} ({type(e).__name__}: {e})")
     return ("bulundu" if (tr_r or as_r) else "yok"), tr_r, as_r
 
 
@@ -540,6 +650,8 @@ def blok_trend(r, yildiz):
         f"{'  · eksik: ' + ', '.join(r['eksik']) if r['eksik'] else ''}\n"
         f"{kama_satiri(r)}"
         f"{stop_hedef_satirlari(r)}"
+        f"{risk_getiri_satiri(r)}"
+        f"{direnc_satiri(r)}"
         f"https://www.tradingview.com/chart/?symbol=BIST%3A{r['sembol']}\n"
     )
 
@@ -549,7 +661,6 @@ def blok_asiri(r, yildiz):
     kriterler = " · ".join(f"{ad} {ISARET[d]}" for (ad, _), d in zip(ASIRI_KRITERLER, r["durumlar"]))
     if r["hedef"] is not None:
         hedef = f"Hedef {sayi(r['hedef'])} (+%{sayi(r['hedef_uzak'], 1)})"
-        hedef += f" · R/G {sayi(r['rg'], 1)}" if r["rg"] is not None else ""
     else:
         hedef = "Hedef yok (fiyat Nadaraya orta çizgisinin üstünde)"
     return (
@@ -557,6 +668,8 @@ def blok_asiri(r, yildiz):
         f"Puan {r['puan']}/5 · {kriterler}\n"
         f"Teyit {r['teyit']}/3 {r['isaret']}\n"
         f"Stop {sayi(r['stop'])} (-%{sayi(r['stop_uzak'], 1)}) · {hedef}\n"
+        f"{risk_getiri_satiri(r)}"
+        f"{direnc_satiri(r)}"
         f"https://www.tradingview.com/chart/?symbol=BIST%3A{r['sembol']}\n"
     )
 
@@ -609,12 +722,14 @@ GECMIS_SINIR = 600   # geçmişte en fazla bu kadar değerlendirilmiş sinyal tu
 
 def kayit_yap(tur, r, simdi):
     """Gönderilen bir sinyalin sonradan değerlendirilmesi için gereken bilgiler."""
+    hedef, _ = hedef_bilgisi(r)      # mesajdaki hedef: ilk hedef ya da daha yakınsa 4s direnç
     if tur in ("g", "e"):
-        hedef = r["hedefler"][0][1] if r["hedefler"] else None   # ilk (en yakın) Fibonacci hedefi
         ek = dict(ust_cizgi=r.get("ust_cizgi") is not None, teyit=r["teyit"])
     else:
-        hedef = r["hedef"]
         ek = dict(puan=r["puan"], teyit=r["teyit"])
+    rg = rg_hesapla(r["fiyat"], r["stop"], hedef)
+    if rg is not None:
+        ek["rg_ok"] = bool(rg >= GIRIS_MIN_RG)
     return dict(tur=tur, sembol=r["sembol"], saat=f"{simdi:%H:%M}", fiyat=r["fiyat"],
                 stop=r["stop"], hedef=hedef, **ek)
 
@@ -761,6 +876,11 @@ def genel_toplam(gecmis):
         satir = ozet_satiri(ad, [k for k in trend if k["ust_cizgi"] == secim])
         if satir:
             satirlar.append(satir)
+    rg_var = [k for k in gecmis if "rg_ok" in k]
+    for ad, secim in ((f"R/G ≥ {sayi(GIRIS_MIN_RG, 1)} olanlar", True), (f"⚠️ R/G < {sayi(GIRIS_MIN_RG, 1)} olanlar", False)):
+        satir = ozet_satiri(ad, [k for k in rg_var if k["rg_ok"] == secim])
+        if satir:
+            satirlar.append(satir)
     if sum(1 for k in gecmis if k.get("sonuc") != "bos") < 30:
         satirlar.append("Örnek sayısı az; kesin yorum için erken.")
     return "\n".join(satirlar)
@@ -784,7 +904,7 @@ def rapor_calistir(simdi, bugun):
     for k, d in sonuclar:
         kayit = dict(tarih=str(bugun), tur=k["tur"], sembol=k["sembol"], saat=k["saat"],
                      sonuc=d["sonuc"], teyit=k.get("teyit"))
-        for alan in ("ust_cizgi", "puan"):
+        for alan in ("ust_cizgi", "puan", "rg_ok"):
             if alan in k:
                 kayit[alan] = k[alan]
         for alan in ("yuk", "dus", "kap"):
