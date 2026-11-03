@@ -2,9 +2,9 @@ name: BIST bildirim
 
 on:
   schedule:
-    - cron: "7,22,37,52 7-14 * * 1-5"
-    - cron: "7 15 * * 1-5"
-    - cron: "40 15 * * 1-5"
+    - cron: "50 6 * * 1-5"    # TR 09:50 sabah dongusu (14:00'e kadar, her 5 dk tarar)
+    - cron: "55 10 * * 1-5"   # TR 13:55 ogleden sonra dongusu (18:10'a kadar)
+    - cron: "40 15 * * 1-5"   # TR 18:40 gun sonu raporu
   workflow_dispatch:
     inputs:
       mod:
@@ -16,11 +16,17 @@ on:
           - deneme
           - bildirim
           - rapor
+          - dongu
+
+# Zamanlanmis calismalar birbirini beklesin (ust uste binmesin); elle baslatilanlar beklemesin
+concurrency:
+  group: ${{ github.event_name == 'schedule' && 'bist-tarama' || format('bist-elle-{0}', github.run_id) }}
+  cancel-in-progress: false
 
 jobs:
   tara:
     runs-on: ubuntu-latest
-    timeout-minutes: 20
+    timeout-minutes: 300
     steps:
       - uses: actions/checkout@v4
       - uses: actions/setup-python@v5
@@ -39,5 +45,7 @@ jobs:
         env:
           TELEGRAM_TOKEN: ${{ secrets.TELEGRAM_TOKEN }}
           TELEGRAM_CHAT_ID: ${{ secrets.TELEGRAM_CHAT_ID }}
-          MOD: ${{ github.event.inputs.mod || (github.event.schedule == '40 15 * * 1-5' && 'rapor') || 'bildirim' }}
+          MOD: ${{ github.event.inputs.mod || (github.event.schedule == '40 15 * * 1-5' && 'rapor') || 'dongu' }}
+          DONGU_ARA: "5"
+          DONGU_BITIS: ${{ (github.event.schedule == '50 6 * * 1-5' && '14:00') || '18:10' }}
         run: python bildirim.py
