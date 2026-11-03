@@ -8,7 +8,7 @@ Sabit kurallar:
 - Düşen trend çizgisi kırılımı (🚀): en az 3 temas, eğim %3, temas yakınlığı %0,5
 - Kırılım: kapanmış mum çizginin en az %0,2 üstünde kapanmış ya da aktif mum %0,5 üstünde, ve fiyat hâlâ çizgi üstünde
 - Dönüş teyidi: 6 şart (yeşil mum, hacim, dip korunması, fiyat KAMA üstünde, MACD ve Wave Trend yukarı kesişimi son 5 mumda);
-  🚀 = en az 4/6 ve hacim dahil, 🔸 = en az 4/6 ama hacim yok
+  🚀 = en az 4/6 ve hacim dahil, 🔸 = hacim yok ama diğer 5 teyidin hepsi var (5/6)
 - Fiyatın hâlâ altında kaldığı başka geçerli çizgi varsa mesaja uyarı satırı eklenir
 - Aynı mesajdaki hisseler en çok teyide göre sıralanır, ilki ⭐ ile işaretlenir
 - Aşırı satış tepkisi (🔻): app.py'deki beş göstergeli tarama, ekran görüntüsündeki ayarlarla
@@ -49,7 +49,8 @@ MIN_MUM = 270      # app.py ile aynı: bundan az mumu olan hisse atlanır (NW 50
 # Alti teyit: 🟢 yesil mum, 📊 hacim, 🔒 dip korunmus, 📈 fiyat KAMA'nin ustunde,
 #             🔵 MACD (mavi cizgi kirmiziyi yukari kesti), 🌊 Wave Trend (yesil cizgi kirmiziyi yukari kesti)
 TEYIT_TOPLAM = 6
-MIN_TEYIT = 4          # 🚀 ve 🔸 icin 6 teyitten en az 4'u; 🚀'de hacim sartlarin icinde olmak zorunda, 🔸'de hacim yok
+MIN_TEYIT = 4          # 🚀 icin 6 teyitten en az 4'u VE hacim sartlarin icinde
+MIN_TEYIT_HACIMSIZ = 5  # 🔸 (hacimsiz kirilim) icin: hacim disindaki 5 teyidin hepsi sart
 TEYIT_SON_N = 5        # MACD ve Wave Trend kesisimi icin bakilan son mum sayisi (bolge sarti yok)
 KIRILIM_KAPANMIS = 0.2  # KAPANMIS mum cizginin en az % kac ustunde kapanmali
 KIRILIM_AKTIF = 0.5     # AKTIF (son, kapanmamis) mum cizginin en az % kac ustunde olmali
@@ -495,6 +496,8 @@ def guclu_kirilim(df, sembol, tr):
     if teyit_n < MIN_TEYIT:
         return None
     kademe = "guclu" if "📊" in isaret else "hacimsiz"
+    if kademe == "hacimsiz" and teyit_n < MIN_TEYIT_HACIMSIZ:
+        return None
     degisim = gunluk_degisim(df)
     return dict(
         sembol=sembol, fiyat=float(df["Close"].iloc[-1]),
@@ -997,7 +1000,7 @@ def genel_toplam(gecmis):
             satirlar.append(satir)
     # teyit sayisina gore (yalnizca 6'li sistemdeki 🚀 ve 🔸 kayitlari)
     for tur, simge in (("g", "🚀"), ("h", "🔸")):
-        for n in range(MIN_TEYIT, TEYIT_TOPLAM + 1):
+        for n in range(MIN_TEYIT_HACIMSIZ if tur == "h" else MIN_TEYIT, TEYIT_TOPLAM + 1):
             grup = [k for k in gecmis if k["tur"] == tur and k.get("tmax") == TEYIT_TOPLAM and k.get("teyit") == n]
             satir = ozet_satiri(f"{simge} {n}/{TEYIT_TOPLAM} teyitli", grup)
             if satir:
