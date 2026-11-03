@@ -18,6 +18,7 @@ Sabit kurallar:
 
 Çalışma modları (MOD ortam değişkeni):
 - bildirim : normal çalışma (seans saati kontrolü + tekrar bildirmeme)
+- dongu    : tek çalışma içinde DONGU_BITIS'e kadar her DONGU_ARA dakikada bir "bildirim" taraması
 - deneme   : seans saati ve tekrar kontrolü yok, o an eşleşen herkesi bildirir
 - baglanti : sadece Telegram'a deneme mesajı yollar
 - rapor    : gün sonu raporu; bugün bildirilen sinyallerin sonradan 15 dakikalık mumlarla değerlendirmesi
@@ -67,6 +68,9 @@ ERKEN_GOSTER = True     # ⏳ kırılım adayı: çizgiye yakın, henüz kırıl
 ERKEN_SON_N = 5         # adaylıkta MFI / Wave Trend sinyali için bakılan son mum sayısı
 ERKEN_MFI_SEVIYE = 20.0 # MFI bu seviyeyi aşağıdan yukarı kesmiş olmalı (aşırı satımdan çıkış)
 ERKEN_YAKIN = 1.0       # fiyat çizginin en fazla bu % altında olmalı
+LIKIDITE_MIN = 0.0      # gunluk islem tutari (TL) bunun altindaki hisselerin trend sinyalleri (🚀🔸⏳) gosterilmez; 0 = filtre kapali
+LIKIDITE_GUN = 20       # islem tutari: son bu kadar tam gunun medyani (bugun haric)
+LIKIDITE = {}           # sembol -> medyan gunluk islem tutari (TL); analiz() doldurur
 DIRENC_GOSTER = False   # 4 saatlik düşen çizgi direnci: kapalı (hedef olarak yalnızca ilk Fibonacci hedefi)
 
 # ---- Aşırı satış tarama ayarları (app.py'deki ekran görüntüsüyle aynı değerler) ----
@@ -468,6 +472,13 @@ def stop_hedef(fiyat, cizgi, tepe, dip):
     return dict(stop=stop, stop_uzak=(fiyat - stop) / fiyat * 100, hedefler=hedefler)
 
 
+def gunluk_islem_tutari(df, bugun):
+    """Son LIKIDITE_GUN tam gunun medyan gunluk islem tutari (fiyat x hacim, TL). Veri azsa nan."""
+    tutar = (df["Close"] * df["Volume"]).groupby(df.index.date).sum()
+    tutar = tutar[np.array([g != bugun for g in tutar.index])].iloc[-LIKIDITE_GUN:]
+    return float(tutar.median()) if len(tutar) >= 5 else float("nan")
+
+
 def trend_sinyali(df, sembol):
     """Düşen trend sinyali: 🚀 güçlü kırılım ya da ⏳ kırılım adayı. Yoksa None."""
     tr = trend_kirilimi(df, P)
@@ -680,7 +691,10 @@ def analiz(sembol, bugun):
         return "kisa", None, None
     if df.index[-1].date() != bugun:
         return "bugun_yok", None, None   # tatil günü ya da bugün hiç işlem görmemiş hisse
+    LIKIDITE[sembol] = gunluk_islem_tutari(df, bugun)
     tr_r = trend_sinyali(df, sembol)
+    if tr_r and LIKIDITE_MIN > 0 and LIKIDITE[sembol] < LIKIDITE_MIN:   # nan ise filtre uygulanmaz
+        tr_r = None
     try:
         as_r = asiri_satis(df, sembol) if ASIRI_GOSTER else None
     except Exception as e:               # tek hissenin hesap hatası taramanın tamamını durdurmasın
@@ -749,6 +763,38 @@ def blok_trend(r, yildiz):
         f"{direnc_satiri(r)}"
         f"https://www.tradingview.com/chart/?symbol=BIST%3A{r['sembol']}\n"
     )
+
+
+def tl_kisa(x):
+    return f"{x / 1e6:.1f}".replace(".", ",") + " mn"
+
+
+def likidite_ozeti(sinyaller):
+    """Deneme modunda: 582 hissenin gunluk islem tutari dagilimi (esigi veriden secmek icin)."""
+    v = {s: x for s, x in LIKIDITE.items() if x == x}
+    if not v:
+        return "💧 Likidite verisi hesaplanamadı."
+    sirali = sorted(v.values())
+    yuzde = lambda q: sirali[min(len(sirali) - 1, int(q * len(sirali)))]
+    satirlar = [f"💧 Günlük işlem tutarı dağılımı (son {LIKIDITE_GUN} günün medyanı, TL) · {len(v)} hisse",
+                "Yüzdelikler: " + " · ".join(f"%{int(q * 100)}: {tl_kisa(yuzde(q))}" for q in (0.1, 0.25, 0.5, 0.75, 0.9)),
+                ""]
+    kenar = [0, 1e6, 2.5e6, 5e6, 10e6, 25e6, 50e6, float("inf")]
+    for alt, ust in zip(kenar[:-1], kenar[1:]):
+        grup = sorted((x, s) for s, x in v.items() if alt <= x < ust)
+        if not grup:
+            continue
+        ad = f"{tl_kisa(alt)} - {tl_kisa(ust)}" if ust != float("inf") else f"{tl_kisa(alt)} üstü"
+        if alt == 0:
+            ad = f"{tl_kisa(ust)} altı"
+        orta = len(grup) // 2
+        ornek = ", ".join(s for _, s in grup[max(0, orta - 1):orta + 2])
+        satirlar.append(f"{ad}: {len(grup)} hisse (örn. {ornek})")
+    if sinyaller:
+        satirlar += ["", "Şu an sinyal verenler: " + " · ".join(
+            f"{r['sembol']} {tl_kisa(v[r['sembol']]) if r['sembol'] in v else '?'}" for r in sinyaller)]
+    satirlar += ["", "Eşik seçmek için: \"şu banttan altı bana sığ\" demeniz yeter (LIKIDITE_MIN)."]
+    return "\n".join(satirlar)
 
 
 def mum_oncesi(geri):
@@ -1116,8 +1162,8 @@ def seans_icinde(simdi):
     return simdi.weekday() < 5 and 10 * 60 <= dakika <= 18 * 60 + 10
 
 
-def main():
-    mod = (os.environ.get("MOD") or "bildirim").strip()
+def main(mod=None):
+    mod = (mod or os.environ.get("MOD") or "bildirim").strip()
     simdi = dt.datetime.now(TR)
     bugun = simdi.date()
     DURUM_DOSYASI.parent.mkdir(exist_ok=True)
@@ -1182,6 +1228,7 @@ def main():
         return sonuc
 
     if mod == "deneme":
+        telegram_gonder(likidite_ozeti(trend_liste))
         if not (trend_liste or asiri_liste):
             telegram_gonder(f"🧪 DENEME ({simdi:%H:%M}): şu an şartları sağlayan hisse yok.\n{ozet}")
             return
@@ -1219,5 +1266,38 @@ def main():
         sys.exit(1)
 
 
+def dongu_calistir():
+    """MOD=dongu: tek bir GitHub çalışması içinde, DONGU_BITIS (TR saati, "SS:DD") olana kadar
+    her DONGU_ARA dakikada bir normal taramayı çalıştırır. GitHub zamanlayıcısının geç kalması
+    ya da çalışma atlaması sorununu aşmak için; durum dosyaları aynı çalışma içinde diskte durur."""
+    if not TOKEN or not CHAT_ID:
+        print("TELEGRAM_TOKEN / TELEGRAM_CHAT_ID tanımlı değil (GitHub Secrets).")
+        sys.exit(1)
+    ara = max(1, int(os.environ.get("DONGU_ARA") or 5))
+    sa, dk = (int(x) for x in (os.environ.get("DONGU_BITIS") or "18:10").split(":"))
+    print(f"Döngü başladı: her {ara} dakikada bir tarama, bitiş {sa:02d}:{dk:02d} (TR).")
+    while True:
+        simdi = dt.datetime.now(TR)
+        bitis = simdi.replace(hour=sa, minute=dk, second=0, microsecond=0)
+        if simdi > bitis:
+            break
+        if seans_icinde(simdi):
+            try:
+                main("bildirim")
+            except SystemExit as e:        # tek taramanın hatası döngüyü durdurmasın
+                print(f"Tarama hata koduyla bitti ({e.code}); döngü devam ediyor.")
+            except Exception as e:
+                print(f"Tarama beklenmedik hata verdi ({type(e).__name__}: {e}); döngü devam ediyor.")
+        simdi = dt.datetime.now(TR)
+        sonraki = simdi.replace(second=0, microsecond=0) + dt.timedelta(minutes=ara - simdi.minute % ara)
+        if sonraki > bitis:
+            break
+        time.sleep(max(0.0, (sonraki - dt.datetime.now(TR)).total_seconds()))
+    print("Döngü bitti.")
+
+
 if __name__ == "__main__":
-    main()
+    if (os.environ.get("MOD") or "").strip() == "dongu":
+        dongu_calistir()
+    else:
+        main()
