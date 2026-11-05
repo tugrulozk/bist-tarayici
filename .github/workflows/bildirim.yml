@@ -3,6 +3,8 @@ name: BIST bildirim
 on:
   schedule:
     - cron: "50 6 * * 1-5"    # TR 09:50 sabah dongusu (14:00'e kadar, her 5 dk tarar)
+    - cron: "20 7 * * 1-5"    # TR 10:20 yedek (09:50 gec kalir/atlanirsa; sira bekler, ust uste binmez)
+    - cron: "50 7 * * 1-5"    # TR 10:50 yedek
     - cron: "55 10 * * 1-5"   # TR 13:55 ogleden sonra dongusu (18:10'a kadar)
     - cron: "40 15 * * 1-5"   # TR 18:40 gun sonu raporu
   workflow_dispatch:
@@ -26,7 +28,7 @@ concurrency:
 jobs:
   tara:
     runs-on: ubuntu-latest
-    timeout-minutes: 300
+    timeout-minutes: 330
     steps:
       - uses: actions/checkout@v4
       - uses: actions/setup-python@v5
@@ -41,11 +43,19 @@ jobs:
           key: bildirilen-${{ github.run_id }}
           restore-keys: |
             bildirilen-
+      - name: Döngü bitiş saatini belirle
+        run: |
+          case "${{ github.event.schedule }}" in
+            "50 6 * * 1-5"|"20 7 * * 1-5"|"50 7 * * 1-5") BIT="14:00" ;;
+            "55 10 * * 1-5") BIT="18:10" ;;
+            *) BIT=$(python3 -c "import datetime as d, zoneinfo; tz=zoneinfo.ZoneInfo('Europe/Istanbul'); n=d.datetime.now(tz); s=min(n+d.timedelta(minutes=290), n.replace(hour=18,minute=10,second=0,microsecond=0)); print(s.strftime('%H:%M'))") ;;
+          esac
+          echo "DONGU_BITIS=$BIT" >> "$GITHUB_ENV"
+          echo "Döngü bitiş saati: $BIT"
       - name: Tara ve bildir
         env:
           TELEGRAM_TOKEN: ${{ secrets.TELEGRAM_TOKEN }}
           TELEGRAM_CHAT_ID: ${{ secrets.TELEGRAM_CHAT_ID }}
           MOD: ${{ github.event.inputs.mod || (github.event.schedule == '40 15 * * 1-5' && 'rapor') || 'dongu' }}
           DONGU_ARA: "5"
-          DONGU_BITIS: ${{ (github.event.schedule == '50 6 * * 1-5' && '14:00') || '18:10' }}
         run: python bildirim.py
