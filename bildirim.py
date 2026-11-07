@@ -80,6 +80,10 @@ RETEST_DOSYASI = Path("durum") / "retest.json"
 GUNLUK_GOSTER = True    # 📅 günlük grafikte düşen çizgi bilgisi (🚀/🔸 mesajlarına bir satır): kırıldı / şu kadar yukarıda / yok
 GUNLUK_ONBELLEK_SN = 1800   # aynı hissenin günlük sonucu bu kadar saniye saklanır (her 5 dakikada yeniden çekmemek için)
 GUNLUK_ONBELLEK = {}    # sembol -> (zaman, sonuç)
+SIKISMA_GOSTER = True   # 🗜 kırılım öncesi mum boyu sıkışması: mesaja bilgi satırı (eleme yapmaz)
+SIKISMA_KISA = 5        # kırılım mumundan önceki bu kadar mumun ortalama boyu (yüksek-düşük)
+SIKISMA_UZUN = 50       # ...bu kadar mumun ortalama boyuyla kıyaslanır (kısa dönem dahil)
+SIKISMA_ESIK = 0.70     # oran bunun altındaysa "sıkışma var"
 RETEST_IZLE = {}        # sembol -> kaydedilen çizgi bilgisi; main() doldurur, analiz() bakar
 RETEST_SONUC = {}       # sembol -> None / "bozuldu" / dict(cizgi, fiyat, dip); analiz() doldurur
 
@@ -511,6 +515,19 @@ def trend_sinyali(df, sembol):
     return None
 
 
+def sikisma_orani(df, geri):
+    """Kırılım mumundan hemen önceki SIKISMA_KISA mumun ortalama boyu / önceki SIKISMA_UZUN mumun ortalama boyu.
+    geri: kırılım mumu kaç mum önce (0 = aktif mum). Veri yetmezse ya da boy 0 ise None."""
+    son = len(df) - 1 - int(geri or 0)          # kırılım mumunun sırası
+    uzun = (df["High"] - df["Low"]).iloc[max(0, son - SIKISMA_UZUN):son]
+    if len(uzun) < SIKISMA_UZUN // 2:
+        return None
+    kisa = uzun.iloc[-SIKISMA_KISA:]
+    if uzun.mean() <= 0:
+        return None
+    return float(kisa.mean() / uzun.mean())
+
+
 def guclu_kirilim(df, sembol, tr):
     """Kırılım olmuş. Hacim + en az MIN_TEYIT teyit varsa 🚀 (guclu); hacimsiz ama 5/6 varsa 🔸 (hacimsiz);
     teyit yetmiyorsa kademe "elenen" (bildirilmez, gün sonu raporunda ayrıca ölçülür)."""
@@ -542,6 +559,7 @@ def guclu_kirilim(df, sembol, tr):
         kama=None if np.isnan(kama_son) else kama_son,
         kama_ustunde=bool(kama_ustunde), kama_yeni=bool(kama_kesti),
         ust_cizgi=tr.get("ust_cizgi"), son_mum=df.index[-1],
+        sikisma=sikisma_orani(df, tr.get("kirilim_geri")) if SIKISMA_GOSTER else None,
         nokta_i=tr.get("nokta_i"), nokta_j=tr.get("nokta_j"),
         kirilim_geri=tr.get("kirilim_geri"), kirilim_zaman=tr.get("kirilim_zaman"),
         **stop_hedef(float(df["Close"].iloc[-1]), float(tr["cizgi"]), tr["tepe"], tr["dip"]),
@@ -828,6 +846,15 @@ def gunluk_satiri(r):
     return "📅 Günlük: geçerli düşen çizgi yok\n"
 
 
+def sikisma_satiri(r):
+    o = r.get("sikisma")
+    if o is None:
+        return ""
+    if o < SIKISMA_ESIK:
+        return f"🗜 Sıkışma: var · kırılım öncesi mum boyu normalin %{o * 100:.0f} düzeyinde\n"
+    return f"🗜 Sıkışma: yok · mum boyu normalin %{o * 100:.0f} düzeyinde\n"
+
+
 def stop_hedef_satirlari(r):
     satir = f"Stop {sayi(r['stop'])} (-%{sayi(r['stop_uzak'], 1)})\n"
     if r["hedefler"]:
@@ -870,6 +897,7 @@ def blok_trend(r, yildiz):
         f"{'  · eksik: ' + ', '.join(r['eksik']) if r['eksik'] else ''}\n"
         f"{kama_satiri(r)}"
         f"{gunluk_satiri(r)}"
+        f"{sikisma_satiri(r)}"
         f"{stop_hedef_satirlari(r)}"
         f"{risk_getiri_satiri(r)}"
         f"{direnc_satiri(r)}"
@@ -994,7 +1022,7 @@ def kayit_yap(tur, r, simdi):
     """Gönderilen bir sinyalin sonradan değerlendirilmesi için gereken bilgiler."""
     hedef, _ = hedef_bilgisi(r)      # mesajdaki hedef: ilk hedef ya da daha yakınsa 4s direnç
     if tur in ("g", "h", "x", "e"):
-        ek = dict(ust_cizgi=r.get("ust_cizgi") is not None, teyit=r["teyit"])
+        ek = dict(ust_cizgi=r.get("ust_cizgi") is not None, teyit=r["teyit"], sikisma=r.get("sikisma"))
         if tur in ("g", "h", "x"):
             ek["tmax"] = TEYIT_TOPLAM      # teyit kaç üzerinden (eski 4'lü kayıtlarla karışmasın)
         if tur == "x":
