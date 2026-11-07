@@ -77,6 +77,9 @@ RETEST_GOSTER = True    # 🔁 retest: bildirilen kırılımdan sonraki saatlik 
 RETEST_YAKIN = 0.3      # retest: mumun dibi çizginin en fazla bu % üstüne kadar inmiş (ya da altına iğne atmış) olmalı
 RETEST_STOP = 0.5       # retest: kapanış çizginin bu % altına inerse kırılım bozuldu sayılır, izleme biter
 RETEST_DOSYASI = Path("durum") / "retest.json"
+GUNLUK_GOSTER = True    # 📅 günlük grafikte düşen çizgi bilgisi (🚀/🔸 mesajlarına bir satır): kırıldı / şu kadar yukarıda / yok
+GUNLUK_ONBELLEK_SN = 1800   # aynı hissenin günlük sonucu bu kadar saniye saklanır (her 5 dakikada yeniden çekmemek için)
+GUNLUK_ONBELLEK = {}    # sembol -> (zaman, sonuç)
 RETEST_IZLE = {}        # sembol -> kaydedilen çizgi bilgisi; main() doldurur, analiz() bakar
 RETEST_SONUC = {}       # sembol -> None / "bozuldu" / dict(cizgi, fiyat, dip); analiz() doldurur
 
@@ -629,6 +632,52 @@ def veri_cek_uzun(sembol):
     return df
 
 
+def veri_cek_gunluk(sembol):
+    """Günlük düşen çizgi için ~1 yıllık günlük mum. Alınamazsa None."""
+    df = None
+    for deneme in range(2):
+        try:
+            df = yf.Ticker(sembol + ".IS").history(period="1y", interval="1d", auto_adjust=True)
+        except Exception:
+            df = None
+        if df is not None and not df.empty:
+            break
+        time.sleep(1.0 * (deneme + 1))
+    if df is None or df.empty:
+        return None
+    df = df[["Open", "High", "Low", "Close", "Volume"]].dropna()
+    return None if df.empty else df
+
+
+def gunluk_durum(df, fiyat):
+    """Günlük grafikte (saatlikle aynı çizgi kuralı) düşen trend çizgisi durumu:
+    kirildi (yuzde = çizgi üstü %, geri = kaç gün önce, 0 = bugün), yakin (çizgiye yapışık),
+    altinda (yuzde = çizgi fiyatın kaç % yukarısında), yok. Veri azsa None."""
+    if df is None or len(df) < 60:
+        return None
+    ust = []
+    tr = trend_kirilimi(df, P, ust_liste=ust)
+    if tr and tr["durum"] == 2:
+        return dict(tur="kirildi", yuzde=float(tr["kirilim"]), geri=int(tr.get("kirilim_geri") or 0))
+    ustunde = [c for c in ust if c > fiyat]
+    if ustunde:
+        return dict(tur="altinda", yuzde=(min(ustunde) / fiyat - 1) * 100)
+    if tr and tr["durum"] == 1:
+        return dict(tur="yakin", yuzde=float(tr["kirilim"]))
+    return dict(tur="yok")
+
+
+def gunluk_bilgi(sembol, fiyat):
+    """gunluk_durum + kısa süreli önbellek (döngü modunda aynı hisse her taramada yeniden çekilmesin)."""
+    simdi = time.time()
+    eski = GUNLUK_ONBELLEK.get(sembol)
+    if eski and simdi - eski[0] < GUNLUK_ONBELLEK_SN:
+        return eski[1]
+    sonuc = gunluk_durum(veri_cek_gunluk(sembol), fiyat)
+    GUNLUK_ONBELLEK[sembol] = (simdi, sonuc)
+    return sonuc
+
+
 def dort_saatlik(df):
     """Saatlik mumlardan 4 saatlik mumlar üretir (seans: 10-14 ve 14-18)."""
     bas = df.index.normalize() + pd.to_timedelta(np.where(df.index.hour >= 14, 14, 10), unit="h")
@@ -722,6 +771,11 @@ def analiz(sembol, bugun):
     tr_r = trend_sinyali(df, sembol)
     if tr_r and LIKIDITE_MIN > 0 and LIKIDITE[sembol] < LIKIDITE_MIN:   # nan ise filtre uygulanmaz
         tr_r = None
+    if GUNLUK_GOSTER and tr_r and tr_r.get("kademe") in ("guclu", "hacimsiz"):
+        try:
+            tr_r["gunluk_cizgi"] = gunluk_bilgi(sembol, float(df["Close"].iloc[-1]))
+        except Exception as e:
+            print(f"Günlük çizgi hesabı hata verdi: {sembol} ({type(e).__name__}: {e})")
     try:
         as_r = asiri_satis(df, sembol) if ASIRI_GOSTER else None
     except Exception as e:               # tek hissenin hesap hatası taramanın tamamını durdurmasın
@@ -758,6 +812,20 @@ def kama_satiri(r):
     else:
         ek = " · fiyat altında"
     return f"KAMA {sayi(r['kama'])}{ek}\n"
+
+
+def gunluk_satiri(r):
+    g = r.get("gunluk_cizgi")
+    if not g:
+        return ""
+    if g["tur"] == "kirildi":
+        zaman = "bugün" if g["geri"] == 0 else f"{g['geri']} gün önce"
+        return f"📅 Günlük: düşen çizgi kırıldı ({zaman}, çizgi üstü %{sayi(g['yuzde'], 1, True)})\n"
+    if g["tur"] == "altinda":
+        return f"📅 Günlük: düşen çizgi %{sayi(g['yuzde'], 1)} yukarıda\n"
+    if g["tur"] == "yakin":
+        return f"📅 Günlük: düşen çizgiye yapışık (%{sayi(g['yuzde'], 1, True)})\n"
+    return "📅 Günlük: geçerli düşen çizgi yok\n"
 
 
 def stop_hedef_satirlari(r):
@@ -801,6 +869,7 @@ def blok_trend(r, yildiz):
         f"Teyit {r['teyit']}/{TEYIT_TOPLAM} {r['isaret']}"
         f"{'  · eksik: ' + ', '.join(r['eksik']) if r['eksik'] else ''}\n"
         f"{kama_satiri(r)}"
+        f"{gunluk_satiri(r)}"
         f"{stop_hedef_satirlari(r)}"
         f"{risk_getiri_satiri(r)}"
         f"{direnc_satiri(r)}"
