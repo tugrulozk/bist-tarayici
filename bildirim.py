@@ -786,7 +786,6 @@ def blok_trend(r, yildiz):
     return (
         f"{yildiz}{r['sembol']}  {sayi(r['fiyat'])} TL  ({gun})\n"
         f"Çizgi {sayi(r['cizgi'])} · {r['temas']} temas · çizgi üstü %{sayi(r['kirilim'], 1, True)}{hac}\n"
-        f"{cizgi_nokta_satiri(r)}"
         f"{kirilim_mum_satiri(r)}"
         f"Teyit {r['teyit']}/{TEYIT_TOPLAM} {r['isaret']}"
         f"{'  · eksik: ' + ', '.join(r['eksik']) if r['eksik'] else ''}\n"
@@ -839,7 +838,6 @@ def blok_aday(r, yildiz):
     return (
         f"{yildiz}{r['sembol']}  {sayi(r['fiyat'])} TL  ({gun})\n"
         f"Düşen çizgi {sayi(r['cizgi'])} (fiyat %{sayi(-r['kirilim'], 1)} altında) · {r['temas']} temas\n"
-        f"{cizgi_nokta_satiri(r)}"
         f"MFI yukarı kesti ({mum_oncesi(r['mfi_geri'])}) · Wave Trend al ({mum_oncesi(r['wt_geri'])})\n"
         f"🔔 Midas alarmı: {sayi(r['cizgi'])} üstü\n"
         f"{stop_hedef_satirlari(r)}"
