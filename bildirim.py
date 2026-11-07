@@ -73,6 +73,12 @@ LIKIDITE_MIN = 0.0      # gunluk islem tutari (TL) bunun altindaki hisselerin tr
 LIKIDITE_GUN = 20       # islem tutari: son bu kadar tam gunun medyani (bugun haric)
 LIKIDITE = {}           # sembol -> medyan gunluk islem tutari (TL); analiz() doldurur
 DIRENC_GOSTER = False   # 4 saatlik düşen çizgi direnci: kapalı (hedef olarak yalnızca ilk Fibonacci hedefi)
+RETEST_GOSTER = True    # 🔁 retest: bildirilen kırılımdan sonraki saatlik mumlarda fiyat çizgiye geri dönüp üstünde tutunursa kısa bildirim
+RETEST_YAKIN = 0.3      # retest: mumun dibi çizginin en fazla bu % üstüne kadar inmiş (ya da altına iğne atmış) olmalı
+RETEST_STOP = 0.5       # retest: kapanış çizginin bu % altına inerse kırılım bozuldu sayılır, izleme biter
+RETEST_DOSYASI = Path("durum") / "retest.json"
+RETEST_IZLE = {}        # sembol -> kaydedilen çizgi bilgisi; main() doldurur, analiz() bakar
+RETEST_SONUC = {}       # sembol -> None / "bozuldu" / dict(cizgi, fiyat, dip); analiz() doldurur
 
 # ---- Aşırı satış tarama ayarları (app.py'deki ekran görüntüsüyle aynı değerler) ----
 ASIRI_EN_AZ_KRITER = 3   # 5 göstergeden en az kaç puan (✅ = 1, 🟡 yakın = 1)
@@ -532,7 +538,7 @@ def guclu_kirilim(df, sembol, tr):
         eksik=eksik_sartlar(isaret),
         kama=None if np.isnan(kama_son) else kama_son,
         kama_ustunde=bool(kama_ustunde), kama_yeni=bool(kama_kesti),
-        ust_cizgi=tr.get("ust_cizgi"),
+        ust_cizgi=tr.get("ust_cizgi"), son_mum=df.index[-1],
         nokta_i=tr.get("nokta_i"), nokta_j=tr.get("nokta_j"),
         kirilim_geri=tr.get("kirilim_geri"), kirilim_zaman=tr.get("kirilim_zaman"),
         **stop_hedef(float(df["Close"].iloc[-1]), float(tr["cizgi"]), tr["tepe"], tr["dip"]),
@@ -708,6 +714,11 @@ def analiz(sembol, bugun):
     if df.index[-1].date() != bugun:
         return "bugun_yok", None, None   # tatil günü ya da bugün hiç işlem görmemiş hisse
     LIKIDITE[sembol] = gunluk_islem_tutari(df, bugun)
+    if sembol in RETEST_IZLE:            # bu hissenin bugün bildirilmiş kırılımı var: retest oldu mu
+        try:
+            RETEST_SONUC[sembol] = retest_kontrol(df, RETEST_IZLE[sembol])
+        except Exception as e:
+            print(f"Retest kontrolü hata verdi: {sembol} ({type(e).__name__}: {e})")
     tr_r = trend_sinyali(df, sembol)
     if tr_r and LIKIDITE_MIN > 0 and LIKIDITE[sembol] < LIKIDITE_MIN:   # nan ise filtre uygulanmaz
         tr_r = None
@@ -1200,6 +1211,87 @@ def durum_yaz(bugun_str, guclu, hacimsiz, erken, asiri, elenen=()):
         encoding="utf-8")
 
 
+# ------------------------------------------------------- retest (kırılım sonrası çizgiye geri dönüş)
+def retest_oku(bugun_str):
+    """(izle, bitti): bugün bildirilen kırılımların çizgi bilgileri ve izlemesi bitenler."""
+    try:
+        d = json.loads(RETEST_DOSYASI.read_text(encoding="utf-8"))
+        if d.get("tarih") == bugun_str:
+            return d.get("izle", {}), set(d.get("bitti", []))
+    except Exception:
+        pass
+    return {}, set()
+
+
+def retest_yaz(bugun_str, izle, bitti):
+    DURUM_DOSYASI.parent.mkdir(exist_ok=True)
+    RETEST_DOSYASI.write_text(
+        json.dumps({"tarih": bugun_str, "izle": izle, "bitti": sorted(bitti)}, ensure_ascii=False),
+        encoding="utf-8")
+
+
+def retest_kaydet(bugun_str, liste):
+    """Bildirimi giden 🚀/🔸 kırılımların çizgisini (iki tepe noktası) ve bildirim mumunu kaydeder."""
+    izle, bitti = retest_oku(bugun_str)
+    for r in liste:
+        a, b, m = r.get("nokta_i"), r.get("nokta_j"), r.get("son_mum")
+        if not a or not b or m is None:
+            continue
+        izle.setdefault(r["sembol"], dict(i=[a[0].isoformat(), float(a[1])],
+                                          j=[b[0].isoformat(), float(b[1])], mum=m.isoformat()))
+    retest_yaz(bugun_str, izle, bitti)
+
+
+def retest_kontrol(df, k):
+    """Kaydedilen çizgi bugünün saatlik mumlarına uzatılır. Bildirim mumundan SONRAKİ mumlarda:
+    kapanış çizginin RETEST_STOP altına indiyse "bozuldu"; son iki mumdan birinin dibi çizgiye
+    RETEST_YAKIN içinde inmiş ve kapanış çizgi üstündeyse retest sözlüğü; yoksa None."""
+    try:
+        ts_i, ts_j, ts_m = pd.Timestamp(k["i"][0]), pd.Timestamp(k["j"][0]), pd.Timestamp(k["mum"])
+        pi, pj = float(k["i"][1]), float(k["j"][1])
+        pos_i, pos_j = df.index.get_loc(ts_i), df.index.get_loc(ts_j)
+    except (KeyError, ValueError, TypeError):
+        return None                      # çizginin tepe mumları veride yoksa güvenli tarafta kal
+    if pos_j <= pos_i:
+        return None
+    egim = (pj - pi) / (pos_j - pos_i)
+    cl = df["Close"].to_numpy(dtype=float)
+    lo = df["Low"].to_numpy(dtype=float)
+    sonraki = [p for p in range(len(df)) if df.index[p] > ts_m]
+    retest = None
+    for p in sonraki:
+        cizgi = pi + egim * (p - pos_i)
+        if cl[p] < cizgi * (1 - RETEST_STOP / 100.0):
+            return "bozuldu"
+        if p >= len(df) - 2 and lo[p] <= cizgi * (1 + RETEST_YAKIN / 100.0) and cl[p] > cizgi:
+            retest = dict(cizgi=float(cizgi), fiyat=float(cl[p]), dip=float(lo[p]))
+    return retest
+
+
+def retest_isle(simdi, bugun):
+    """Taramadan sonra: bozulanları izlemeden çıkarır, retest olanlara tek mesajla haber verir."""
+    if not RETEST_IZLE:
+        return
+    izle, bitti = retest_oku(str(bugun))
+    bloklar, gidecek = [], []
+    for s in sorted(RETEST_IZLE):
+        sonuc = RETEST_SONUC.get(s)
+        if sonuc == "bozuldu":
+            bitti.add(s)
+        elif isinstance(sonuc, dict):
+            bloklar.append(f"{s}  {sayi(sonuc['fiyat'])} TL · çizgi {sayi(sonuc['cizgi'])} · dip {sayi(sonuc['dip'])}\n"
+                           f"https://www.tradingview.com/chart/?symbol=BIST%3A{s}\n")
+            gidecek.append(s)
+    print("Retest:", gidecek, "| Bozulan:", sorted(s for s in RETEST_IZLE if RETEST_SONUC.get(s) == "bozuldu"))
+    if bloklar:
+        metin = f"🔁 Retest ({simdi:%H:%M}) · kırılım sonrası çizgiye dönüp üstünde tutundu\n\n" + "\n".join(bloklar)
+        if telegram_gonder(metin):
+            bitti |= set(gidecek)
+        else:
+            print("Retest mesajı gönderilemedi; sonraki taramada tekrar denenecek.")
+    retest_yaz(str(bugun), izle, bitti)
+
+
 def seans_icinde(simdi):
     dakika = simdi.hour * 60 + simdi.minute
     return simdi.weekday() < 5 and 10 * 60 <= dakika <= 18 * 60 + 10
@@ -1228,6 +1320,11 @@ def main(mod=None):
         print(f"Seans dışı ({simdi:%d.%m.%Y %H:%M}), tarama yapılmadı.")
         return
 
+    RETEST_IZLE.clear()
+    RETEST_SONUC.clear()
+    if mod == "bildirim" and RETEST_GOSTER:
+        izle_, bitti_ = retest_oku(str(bugun))
+        RETEST_IZLE.update({s: k for s, k in izle_.items() if s not in bitti_})
     semboller = hisse_listesi()
     print(f"{len(semboller)} hisse taranacak ({simdi:%d.%m.%Y %H:%M}, mod: {mod}).")
     sayac = {"veri_yok": 0, "kisa": 0, "bugun_yok": 0, "yok": 0, "bulundu": 0}
@@ -1245,6 +1342,8 @@ def main(mod=None):
         print("Hisselerin yarısından fazlasının verisi alınamadı (Yahoo erişim sorunu olabilir).")
         sys.exit(1)
 
+    if mod == "bildirim" and RETEST_GOSTER:
+        retest_isle(simdi, bugun)
     trend_liste.sort(key=siralama_anahtari)
     elenenler = [r for r in trend_liste if r["kademe"] == "elenen"]     # sadece rapor icin kaydedilir
     trend_liste = [r for r in trend_liste if r["kademe"] != "elenen"]
@@ -1310,6 +1409,9 @@ def main(mod=None):
     a_gitti |= {s for t, s in gitti if t == "a"}
     x_gitti |= {r["sembol"] for r in yeni_x}
     durum_yaz(str(bugun), g_gitti, h_gitti, e_gitti, a_gitti, x_gitti)
+    if RETEST_GOSTER:
+        retest_kaydet(str(bugun), [r for tur, liste in (("g", yeni_g), ("h", yeni_h))
+                                   for r in liste if (tur, r["sembol"]) in gitti])
     yeni_kayitlar = [kayit_yap(tur, r, simdi)
                      for tur, liste in (("g", yeni_g), ("h", yeni_h), ("e", yeni_e), ("a", yeni_a))
                      for r in liste if (tur, r["sembol"]) in gitti]
