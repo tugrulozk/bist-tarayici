@@ -69,11 +69,11 @@ ERKEN_GOSTER = False    # ⏳ kırılım adayı: çizgiye yakın, henüz kırıl
 ERKEN_SON_N = 5         # adaylıkta MFI / Wave Trend sinyali için bakılan son mum sayısı
 ERKEN_MFI_SEVIYE = 20.0 # MFI bu seviyeyi aşağıdan yukarı kesmiş olmalı (aşırı satımdan çıkış)
 ERKEN_YAKIN = 1.0       # fiyat çizginin en fazla bu % altında olmalı
-LIKIDITE_MIN = 0.0      # gunluk islem tutari (TL) bunun altindaki hisselerin trend sinyalleri (🚀🔸⏳) gosterilmez; 0 = filtre kapali
+LIKIDITE_MIN = 5000000.0      # gunluk islem tutari (TL) bunun altindaki hisselerin trend sinyalleri (🚀🔸⏳) gosterilmez; 0 = filtre kapali
 LIKIDITE_GUN = 20       # islem tutari: son bu kadar tam gunun medyani (bugun haric)
 LIKIDITE = {}           # sembol -> medyan gunluk islem tutari (TL); analiz() doldurur
 DIRENC_GOSTER = False   # 4 saatlik düşen çizgi direnci: kapalı (hedef olarak yalnızca ilk Fibonacci hedefi)
-RETEST_GOSTER = True    # 🔁 retest: bildirilen kırılımdan sonraki saatlik mumlarda fiyat çizgiye geri dönüp üstünde tutunursa kısa bildirim
+RETEST_GOSTER = False   # 🔁 retest: bildirilen kırılımdan sonraki saatlik mumlarda fiyat çizgiye geri dönüp üstünde tutunursa kısa bildirim
 RETEST_YAKIN = 0.3      # retest: mumun dibi çizginin en fazla bu % üstüne kadar inmiş (ya da altına iğne atmış) olmalı
 RETEST_STOP = 0.5       # retest: kapanış çizginin bu % altına inerse kırılım bozuldu sayılır, izleme biter
 RETEST_DOSYASI = Path("durum") / "retest.json"
