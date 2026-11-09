@@ -72,6 +72,10 @@ ERKEN_YAKIN = 1.0       # fiyat çizginin en fazla bu % altında olmalı
 LIKIDITE_MIN = 5000000.0      # gunluk islem tutari (TL) bunun altindaki hisselerin trend sinyalleri (🚀🔸⏳) gosterilmez; 0 = filtre kapali
 LIKIDITE_GUN = 20       # islem tutari: son bu kadar tam gunun medyani (bugun haric)
 LIKIDITE = {}           # sembol -> medyan gunluk islem tutari (TL); analiz() doldurur
+DONUK_GUN = 10         # donuk tahta olcumu: son bu kadar tam gun (bugun haric)
+DONUK_MAX = 1.0         # donuk saat orani bunun ustundeyse trend sinyali gosterilmez; 1.0 = filtre kapali (deneme modunda dagilima bakip secilir)
+DONUK = {}              # sembol -> donuk saat orani (0-1); analiz() doldurur
+IZLE_HISSE = ("ZEDUR", "BIGCH", "HTTBT")   # deneme mesajinda rakamlari ayrica yazilir
 DIRENC_GOSTER = False   # 4 saatlik düşen çizgi direnci: kapalı (hedef olarak yalnızca ilk Fibonacci hedefi)
 RETEST_GOSTER = False   # 🔁 retest: bildirilen kırılımdan sonraki saatlik mumlarda fiyat çizgiye geri dönüp üstünde tutunursa kısa bildirim
 RETEST_YAKIN = 0.3      # retest: mumun dibi çizginin en fazla bu % üstüne kadar inmiş (ya da altına iğne atmış) olmalı
@@ -503,6 +507,21 @@ def gunluk_islem_tutari(df, bugun):
     return float(tutar.median()) if len(tutar) >= 5 else float("nan")
 
 
+def donuk_orani(df, bugun):
+    """Seans saatlerinde (10:00-17:00 arasi 8 saatlik mum) hic hareket olmayan saatlerin orani.
+    Mum hic yoksa (o saatte islem yok) ya da High == Low ise o saat 'donuk' sayilir.
+    Son DONUK_GUN tam gun uzerinden; 5 gunden az veri varsa nan."""
+    gunler = sorted({g for g in df.index.date if g != bugun})[-DONUK_GUN:]
+    if len(gunler) < 5:
+        return float("nan")
+    seans = df[(df.index.hour >= 10) & (df.index.hour <= 17)]
+    donuk = 0
+    for g in gunler:
+        gd = seans[np.array([x == g for x in seans.index.date])]
+        donuk += 8 - min(8, int((gd["High"] > gd["Low"]).sum()))
+    return donuk / (8.0 * len(gunler))
+
+
 def trend_sinyali(df, sembol):
     """Düşen trend sinyali: 🚀 güçlü kırılım ya da ⏳ kırılım adayı. Yoksa None."""
     tr = trend_kirilimi(df, P)
@@ -781,6 +800,7 @@ def analiz(sembol, bugun):
     if df.index[-1].date() != bugun:
         return "bugun_yok", None, None   # tatil günü ya da bugün hiç işlem görmemiş hisse
     LIKIDITE[sembol] = gunluk_islem_tutari(df, bugun)
+    DONUK[sembol] = donuk_orani(df, bugun)
     if sembol in RETEST_IZLE:            # bu hissenin bugün bildirilmiş kırılımı var: retest oldu mu
         try:
             RETEST_SONUC[sembol] = retest_kontrol(df, RETEST_IZLE[sembol])
@@ -788,6 +808,8 @@ def analiz(sembol, bugun):
             print(f"Retest kontrolü hata verdi: {sembol} ({type(e).__name__}: {e})")
     tr_r = trend_sinyali(df, sembol)
     if tr_r and LIKIDITE_MIN > 0 and LIKIDITE[sembol] < LIKIDITE_MIN:   # nan ise filtre uygulanmaz
+        tr_r = None
+    if tr_r and DONUK_MAX < 1.0 and DONUK[sembol] > DONUK_MAX:           # nan ise filtre uygulanmaz
         tr_r = None
     if GUNLUK_GOSTER and tr_r and tr_r.get("kademe") in ("guclu", "hacimsiz"):
         try:
@@ -934,6 +956,33 @@ def likidite_ozeti(sinyaller):
         satirlar += ["", "Şu an sinyal verenler: " + " · ".join(
             f"{r['sembol']} {tl_kisa(v[r['sembol']]) if r['sembol'] in v else '?'}" for r in sinyaller)]
     satirlar += ["", "Eşik seçmek için: \"şu banttan altı bana sığ\" demeniz yeter (LIKIDITE_MIN)."]
+    return "\n".join(satirlar)
+
+
+def donuk_ozeti(sinyaller):
+    """Deneme modunda: donuk saat orani dagilimi (DONUK_MAX esigini veriden secmek icin)."""
+    d = {s: x for s, x in DONUK.items() if x == x}
+    if not d:
+        return "🧊 Donuk saat verisi hesaplanamadı."
+    yz = lambda x: f"%{round(x * 100)}"
+    satirlar = [f"🧊 Donuk saat oranı (seans saatlerinin hareketsiz kalan payı, son {DONUK_GUN} gün) · {len(d)} hisse", ""]
+    kenar = [0, 0.05, 0.10, 0.20, 0.30, 0.50, 1.01]
+    for alt, ust in zip(kenar[:-1], kenar[1:]):
+        grup = sorted((x, s) for s, x in d.items() if alt <= x < ust)
+        if not grup:
+            continue
+        ad = f"{yz(alt)} - {yz(min(ust, 1.0))}" if ust <= 1.0 else f"{yz(alt)} üstü"
+        orta = len(grup) // 2
+        ornek = ", ".join(s for _, s in grup[max(0, orta - 1):orta + 2])
+        satirlar.append(f"{ad}: {len(grup)} hisse (örn. {ornek})")
+    en_donuk = sorted(((x, s) for s, x in d.items()), reverse=True)[:15]
+    satirlar += ["", "En donuk 15: " + " · ".join(f"{s} {yz(x)}" for x, s in en_donuk)]
+    izle = [f"{s} {yz(d[s])}" if s in d else f"{s} yok" for s in IZLE_HISSE]
+    satirlar.append("İzlenenler: " + " · ".join(izle))
+    if sinyaller:
+        satirlar += ["", "Şu an sinyal verenler: " + " · ".join(
+            f"{r['sembol']} {yz(d[r['sembol']]) if r['sembol'] in d else '?'}" for r in sinyaller)]
+    satirlar += ["", "Eşik seçmek için: \"şu orandan üstü donuk\" demeniz yeter (DONUK_MAX)."]
     return "\n".join(satirlar)
 
 
@@ -1470,6 +1519,7 @@ def main(mod=None):
 
     if mod == "deneme":
         telegram_gonder(likidite_ozeti(trend_liste))
+        telegram_gonder(donuk_ozeti(trend_liste))
         if not (trend_liste or asiri_liste):
             telegram_gonder(f"🧪 DENEME ({simdi:%H:%M}): şu an şartları sağlayan hisse yok.\n{ozet}")
             return
