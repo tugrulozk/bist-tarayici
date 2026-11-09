@@ -75,7 +75,8 @@ LIKIDITE = {}           # sembol -> medyan gunluk islem tutari (TL); analiz() do
 DONUK_GUN = 10         # donuk tahta olcumu: son bu kadar tam gun (bugun haric)
 DONUK_MAX = 1.0         # donuk saat orani bunun ustundeyse trend sinyali gosterilmez; 1.0 = filtre kapali (deneme modunda dagilima bakip secilir)
 DONUK = {}              # sembol -> donuk saat orani (0-1); analiz() doldurur
-IZLE_HISSE = ("ZEDUR", "BIGCH", "HTTBT")   # deneme mesajinda rakamlari ayrica yazilir
+HAREKET_TIK = 2         # bir saatlik mumun yuksek-dusuk farki en fazla bu kadar fiyat adimiysa (veya mum hic yoksa) o saat "hareketsiz" sayilir
+IZLE_HISSE = ("GLRYH", "ZEDUR", "BIGCH", "HTTBT")   # deneme mesajinda rakamlari ayrica yazilir
 DIRENC_GOSTER = False   # 4 saatlik düşen çizgi direnci: kapalı (hedef olarak yalnızca ilk Fibonacci hedefi)
 RETEST_GOSTER = False   # 🔁 retest: bildirilen kırılımdan sonraki saatlik mumlarda fiyat çizgiye geri dönüp üstünde tutunursa kısa bildirim
 RETEST_YAKIN = 0.3      # retest: mumun dibi çizginin en fazla bu % üstüne kadar inmiş (ya da altına iğne atmış) olmalı
@@ -507,18 +508,28 @@ def gunluk_islem_tutari(df, bugun):
     return float(tutar.median()) if len(tutar) >= 5 else float("nan")
 
 
+def fiyat_adimi(fiyat):
+    """BIST pay piyasasi fiyat adimi (TL), fiyata gore."""
+    for ust, adim in ((20, 0.01), (50, 0.02), (100, 0.05), (250, 0.10), (500, 0.25), (1000, 0.50), (2500, 1.00)):
+        if fiyat < ust:
+            return adim
+    return 2.50
+
+
 def donuk_orani(df, bugun):
-    """Seans saatlerinde (10:00-17:00 arasi 8 saatlik mum) hic hareket olmayan saatlerin orani.
-    Mum hic yoksa (o saatte islem yok) ya da High == Low ise o saat 'donuk' sayilir.
+    """Seans saatlerinde (10:00-17:00 arasi 8 saatlik mum) fiyatin neredeyse kipirdamadigi saatlerin orani.
+    Mum hic yoksa ya da mumun yuksek-dusuk farki en fazla HAREKET_TIK fiyat adimiysa o saat 'hareketsiz' sayilir.
     Son DONUK_GUN tam gun uzerinden; 5 gunden az veri varsa nan."""
     gunler = sorted({g for g in df.index.date if g != bugun})[-DONUK_GUN:]
     if len(gunler) < 5:
         return float("nan")
     seans = df[(df.index.hour >= 10) & (df.index.hour <= 17)]
+    adim = np.array([fiyat_adimi(x) for x in seans["Close"]])
+    hareketli = ((seans["High"] - seans["Low"]).values >= (HAREKET_TIK + 0.5) * adim)
+    gun_dizi = np.array([x for x in seans.index.date])
     donuk = 0
     for g in gunler:
-        gd = seans[np.array([x == g for x in seans.index.date])]
-        donuk += 8 - min(8, int((gd["High"] > gd["Low"]).sum()))
+        donuk += 8 - min(8, int(hareketli[gun_dizi == g].sum()))
     return donuk / (8.0 * len(gunler))
 
 
@@ -965,8 +976,8 @@ def donuk_ozeti(sinyaller):
     if not d:
         return "🧊 Donuk saat verisi hesaplanamadı."
     yz = lambda x: f"%{round(x * 100)}"
-    satirlar = [f"🧊 Donuk saat oranı (seans saatlerinin hareketsiz kalan payı, son {DONUK_GUN} gün) · {len(d)} hisse", ""]
-    kenar = [0, 0.05, 0.10, 0.20, 0.30, 0.50, 1.01]
+    satirlar = [f"🧊 Hareketsiz saat oranı (fiyatı en fazla {HAREKET_TIK} adım oynayan ya da hiç işlem görmeyen seans saatlerinin payı, son {DONUK_GUN} gün) · {len(d)} hisse", ""]
+    kenar = [0, 0.10, 0.20, 0.30, 0.50, 0.70, 1.01]
     for alt, ust in zip(kenar[:-1], kenar[1:]):
         grup = sorted((x, s) for s, x in d.items() if alt <= x < ust)
         if not grup:
