@@ -73,7 +73,7 @@ LIKIDITE_MIN = 5000000.0      # gunluk islem tutari (TL) bunun altindaki hissele
 LIKIDITE_GUN = 20       # islem tutari: son bu kadar tam gunun medyani (bugun haric)
 LIKIDITE = {}           # sembol -> medyan gunluk islem tutari (TL); analiz() doldurur
 DONUK_GUN = 10         # donuk tahta olcumu: son bu kadar tam gun (bugun haric)
-DONUK_MAX = 1.0         # donuk saat orani bunun ustundeyse trend sinyali gosterilmez; 1.0 = filtre kapali (deneme modunda dagilima bakip secilir)
+DONUK_MAX = 0.30        # donuk saat orani bunun ustundeyse trend sinyali gosterilmez; 1.0 = filtre kapali (deneme modunda dagilima bakip secilir)
 DONUK = {}              # sembol -> donuk saat orani (0-1); analiz() doldurur
 HAREKET_TIK = 2         # bir saatlik mumun yuksek-dusuk farki en fazla bu kadar fiyat adimiysa (veya mum hic yoksa) o saat "hareketsiz" sayilir
 IZLE_HISSE = ("GLRYH", "ZEDUR", "BIGCH", "HTTBT")   # deneme mesajinda rakamlari ayrica yazilir
