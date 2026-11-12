@@ -1275,6 +1275,31 @@ def genel_toplam(gecmis):
     return "\n".join(satirlar)
 
 
+def kapanis_ozeti(sonuclar):
+    """Gün sonu raporunun üst özetine eklenen kapanış satırları (hedef tanımsız sinyalleri de kapanışa göre sayar)."""
+    liste = [(k, d) for k, d in sonuclar if d["sonuc"] != "bos" and k["tur"] != "x"]
+    if not liste:
+        return ""
+
+    def ort(v):
+        return sum(v) / len(v)
+
+    def medyan(v):
+        v = sorted(v)
+        m = len(v) // 2
+        return v[m] if len(v) % 2 else (v[m - 1] + v[m]) / 2
+
+    kap = [d["kap"] for _, d in liste]
+    satirlar = [f"📉 Kapanışta artıda: {sum(1 for x in kap if x > 0)}/{len(kap)} · ort. kapanış %{sayi(ort(kap), 1, True)} · "
+                f"medyan %{sayi(medyan(kap), 1, True)}"]
+    for sonuc, ad in (("yok", "⏳ Hedefe/stopa değmeyenlerde"), ("stop", "🛑 Stopa değenlerde")):
+        v = [d["kap"] for _, d in liste if d["sonuc"] == sonuc]
+        if v:
+            satirlar.append(f"{ad} ({len(v)}): artıda kapanan {sum(1 for x in v if x > 0)}/{len(v)} · "
+                            f"ort. kapanış %{sayi(ort(v), 1, True)}")
+    return "\n".join(satirlar)
+
+
 def rapor_calistir(simdi, bugun):
     kayitlar = kayit_oku(str(bugun))
     if not kayitlar:
@@ -1316,6 +1341,9 @@ def rapor_calistir(simdi, bugun):
     ozet = (f"Bugün {sum(1 for k, _ in sonuclar if k['tur'] != 'x')} sinyal "
             f"(+ {sum(1 for k, _ in sonuclar if k['tur'] == 'x')} elenen kırılım): 🎯 {say('hedef')} hedefe · 🛑 {say('stop')} stopa · "
             f"❓ {say('belirsiz')} belirsiz · ⏳ {say('yok')} hiçbirine değmedi")
+    kap_oz = kapanis_ozeti(sonuclar)
+    if kap_oz:
+        ozet += "\n" + kap_oz
     alt = (genel_toplam(gecmis_oku()) + "\n\n"
            "ℹ️ Değerlendirme, sinyalden sonraki ilk 15 dk sınırından günün sonuna kadarki 15 dakikalık "
            "mumlarla yapıldı. Sinyal fiyatı gecikmeli veriden geldiği için gerçek girişin biraz farklı "
