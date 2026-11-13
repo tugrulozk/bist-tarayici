@@ -1,0 +1,22 @@
+name: Seviye Deneme
+
+on:
+  workflow_dispatch:
+    inputs:
+      hisseler:
+        description: "Hisse kodları (boşlukla ayır)"
+        default: "ASELS BIMAS INVES TRALT"
+
+jobs:
+  seviye:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+      - run: pip install yfinance pandas numpy
+      - name: Seviyeleri yazdir
+        env:
+          HISSELER: ${{ inputs.hisseler }}
+        run: python destek_bot.py seviye $HISSELER
