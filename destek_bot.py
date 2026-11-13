@@ -8,7 +8,7 @@ Kullanım (şimdilik sadece seviye yazdırma):
 Kurallar (kullanıcıyla netleşenler):
 - Günlük grafikte dip ve tepelerin fitil uçları aday seviyedir.
 - Birbirine yakın adaylar (en alttakinin %2 üstüne kadar) tek bölgede birleşir.
-- En az 2 temas gerekir.
+- En az 2 temas gerekir ve bunların en az 2'si dip olmalı (BIMAS'ta kullanıcının seçtikleriyle gürültü bu kuralla ayrıldı).
 - Sadece fiyatın altında kalan (ya da fiyatı içine alan) bölgeler destek sayılır.
 """
 import sys
@@ -21,8 +21,9 @@ import yfinance as yf
 PIVOT_N = 4          # bir dip/tepe sayılması için solunda ve sağında bakılan mum sayısı
 BOLGE_TOL = 0.02     # bölge genişliği: en alttaki adayın en fazla %2 üstüne kadar birleştirilir
 EN_AZ_TEMAS = 2      # bir bölgenin destek sayılması için en az temas
+EN_AZ_DIP = 2        # bunların en az kaçı dip (fitil dibi) olmalı; tepeler bölgeyi güçlendirir ama tek başına yetmez
 GUN_SAYISI = 250     # son kaç günlük mum incelenir
-MAX_UZAKLIK = 20.0   # yazdırırken fiyattan en fazla %20 uzaktaki seviyeler gösterilir
+MAX_UZAKLIK = 30.0   # yazdırırken fiyattan en fazla %30 uzaktaki seviyeler gösterilir
 
 
 def veri_cek_gunluk(sembol):
@@ -96,7 +97,7 @@ def yatay_destekler(df, fiyat=None):
     son_sira = len(df) - 1
     sonuc = []
     for b in bolgelere_ayir(pivotlar(df)):
-        if len(b) < EN_AZ_TEMAS:
+        if len(b) < EN_AZ_TEMAS or sum(1 for x in b if x[2] == "dip") < EN_AZ_DIP:
             continue
         fiyatlar = [x[0] for x in b]
         alt, ust = min(fiyatlar), max(fiyatlar)
