@@ -9,6 +9,7 @@ Kurallar (kullanıcıyla netleşenler):
 - Günlük grafikte dip ve tepelerin fitil uçları aday seviyedir.
 - Birbirine yakın adaylar (en alttakinin %2 üstüne kadar) tek bölgede birleşir.
 - En az 2 temas gerekir ve bunların en az 2'si dip olmalı (BIMAS'ta kullanıcının seçtikleriyle gürültü bu kuralla ayrıldı).
+- Birbirine %4'ten yakın iki seviyeden zayıf olan elenir.
 - Sadece fiyatın altında kalan (ya da fiyatı içine alan) bölgeler destek sayılır.
 """
 import sys
@@ -22,6 +23,7 @@ PIVOT_N = 4          # bir dip/tepe sayılması için solunda ve sağında bakı
 BOLGE_TOL = 0.02     # bölge genişliği: en alttaki adayın en fazla %2 üstüne kadar birleştirilir
 EN_AZ_TEMAS = 2      # bir bölgenin destek sayılması için en az temas
 EN_AZ_DIP = 2        # bunların en az kaçı dip (fitil dibi) olmalı; tepeler bölgeyi güçlendirir ama tek başına yetmez
+MIN_ARALIK = 0.04    # iki seviye arası bundan yakınsa zayıf olan elenir (kullanıcının seviyeleri hep %4,8'den uzak)
 GUN_SAYISI = 250     # son kaç günlük mum incelenir
 MAX_UZAKLIK = 30.0   # yazdırırken fiyattan en fazla %30 uzaktaki seviyeler gösterilir
 
@@ -108,7 +110,30 @@ def yatay_destekler(df, fiyat=None):
             seviye=float(np.median(fiyatlar)), alt=alt, ust=ust, temas=len(b),
             dip=sum(1 for x in b if x[2] == "dip"), tepe=sum(1 for x in b if x[2] == "tepe"),
             son_temas_gun=son_sira - max(x[1] for x in b), mesafe=mesafe))
-    return sorted(sonuc, key=lambda r: r["mesafe"])
+    # birbirine çok yakın seviyelerden zayıf olanı ele (güçlü = temas, sonra dip sayısı fazla olan)
+    kalan = []
+    for r in sorted(sonuc, key=lambda r: (r["temas"], r["dip"]), reverse=True):
+        if any(abs(r["seviye"] / k["seviye"] - 1) < MIN_ARALIK for k in kalan):
+            continue
+        kalan.append(r)
+    return sorted(kalan, key=lambda r: r["mesafe"])
+
+
+def ayrinti_yazdir(sembol, merkez):
+    """Hata ayıklama: merkez fiyatın %6 çevresindeki tüm dip/tepe noktalarını tarihleriyle yazdırır."""
+    df = veri_cek_gunluk(sembol)
+    if df is None:
+        print(f"{sembol}: veri alınamadı")
+        return
+    df = df.tail(GUN_SAYISI)
+    print(f"\n=== {sembol}: {merkez} çevresindeki dip/tepe noktaları (±%6) ===")
+    bulundu = False
+    for fiyat, sira, tur in pivotlar(df):
+        if abs(fiyat / merkez - 1) <= 0.06:
+            print(f"  {df.index[sira].strftime('%Y-%m-%d')}  {tur:5s}  {fiyat:.2f}")
+            bulundu = True
+    if not bulundu:
+        print("  bu çevrede hiç dip/tepe noktası yok")
 
 
 def seviye_yazdir(sembol):
@@ -130,6 +155,11 @@ def seviye_yazdir(sembol):
 if __name__ == "__main__":
     if len(sys.argv) >= 3 and sys.argv[1] == "seviye":
         for s in sys.argv[2:]:
-            seviye_yazdir(s.strip().upper())
+            s = s.strip().upper()
+            if ":" in s:                      # örn. GUBRF:263.5  -> o fiyatın çevresindeki noktalar
+                kod, fiyat_metni = s.split(":", 1)
+                ayrinti_yazdir(kod, float(fiyat_metni.replace(",", ".")))
+            else:
+                seviye_yazdir(s)
     else:
         print("Kullanım: python destek_bot.py seviye ASELS BIMAS")
