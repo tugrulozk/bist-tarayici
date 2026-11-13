@@ -22,6 +22,7 @@ PIVOT_N = 4          # bir dip/tepe sayılması için solunda ve sağında bakı
 BOLGE_TOL = 0.02     # bölge genişliği: en alttaki adayın en fazla %2 üstüne kadar birleştirilir
 EN_AZ_TEMAS = 2      # bir bölgenin destek sayılması için en az temas
 GUN_SAYISI = 250     # son kaç günlük mum incelenir
+MAX_UZAKLIK = 20.0   # yazdırırken fiyattan en fazla %20 uzaktaki seviyeler gösterilir
 
 
 def veri_cek_gunluk(sembol):
@@ -29,7 +30,7 @@ def veri_cek_gunluk(sembol):
     df = None
     for deneme in range(3):
         try:
-            df = yf.Ticker(sembol + ".IS").history(period="1y", interval="1d", auto_adjust=True)
+            df = yf.Ticker(sembol + ".IS").history(period="1y", interval="1d", auto_adjust=False)
         except Exception:
             df = None
         if df is not None and not df.empty:
@@ -39,6 +40,18 @@ def veri_cek_gunluk(sembol):
         return None
     df = df[["Open", "High", "Low", "Close", "Volume"]].dropna()
     return None if df.empty else df
+
+
+def guncel_fiyat(sembol, df):
+    """Gün içi (15 dk) verinin son kapanışı; alınamazsa günlük verinin son kapanışı.
+    (Günlük verinin son mumu Yahoo'da bazen güncellenmiyor.)"""
+    try:
+        g = yf.Ticker(sembol + ".IS").history(period="5d", interval="15m", auto_adjust=False)
+        if g is not None and not g.empty:
+            return float(g["Close"].dropna().iloc[-1])
+    except Exception:
+        pass
+    return float(df["Close"].iloc[-1])
 
 
 def pivotlar(df, n=PIVOT_N):
@@ -102,9 +115,9 @@ def seviye_yazdir(sembol):
     if df is None:
         print(f"{sembol}: veri alınamadı")
         return
-    fiyat = float(df["Close"].iloc[-1])
-    print(f"\n=== {sembol}  son fiyat {fiyat:.2f}  ({len(df)} günlük mum) ===")
-    liste = yatay_destekler(df, fiyat)
+    fiyat = guncel_fiyat(sembol, df)
+    print(f"\n=== {sembol}  güncel fiyat {fiyat:.2f}  (günlük verinin son kapanışı {df['Close'].iloc[-1]:.2f}, {len(df)} mum) ===")
+    liste = [r for r in yatay_destekler(df, fiyat) if r["mesafe"] <= MAX_UZAKLIK]
     if not liste:
         print("  yatay destek bölgesi bulunamadı")
     for r in liste:
