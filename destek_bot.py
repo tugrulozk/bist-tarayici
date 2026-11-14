@@ -326,14 +326,29 @@ def _yf_gecmis(sembol, donem, aralik):
     return None
 
 
-def _4saat_ham(sembol):
-    """4 saatlik mumlar. Son ~2 ay 5 dakikalık veriden (TradingView'a uygun 09:40/13:40/17:40 mumları),
-    daha eskisi saatlik veriden (10:00/14:00 yaklaşık mumlar). Alınamazsa None.
-    Dönüş tablosunun .attrs['bes_dk_mum'] değeri 5 dakikalıktan üretilen mum sayısıdır."""
-    saatlik = _yf_gecmis(sembol, "730d", "1h")
-    bes_dk = _yf_gecmis(sembol, "60d", "5m")
-    eski = saatlikten_4saatlige(saatlik) if saatlik is not None else None
-    yeni = bes_dakikadan_4saatlige(bes_dk) if bes_dk is not None else None
+def _yf_saatlik(sembol):
+    """~700 günlük saatlik veri. 'period=730d' bazı hisselerde Yahoo'nun 730 gün sınırına takıldığı için
+    başlangıç tarihi açıkça verilir."""
+    for gun in (700, 365):
+        baslangic = (pd.Timestamp.now() - pd.Timedelta(days=gun)).strftime("%Y-%m-%d")
+        for deneme in range(2):
+            try:
+                x = yf.Ticker(sembol + ".IS").history(start=baslangic, interval="1h", auto_adjust=False)
+            except Exception:
+                x = None
+            if x is not None and not x.empty:
+                return x
+            time.sleep(1.5)
+    return None
+
+
+def ham_veriler(sembol):
+    """(saatlik veri, 5 dakikalık veri) - biri alınamazsa None olur."""
+    return _yf_saatlik(sembol), _yf_gecmis(sembol, "60d", "5m")
+
+
+def _birlestir(eski, yeni):
+    """Eski (saatlikten) ve yeni (5 dakikalıktan) mum tablolarını birleştirir; attrs['bes_dk_mum'] = yeni mum sayısı."""
     if yeni is not None and eski is not None:
         sinir = yeni.index[0].normalize()
         sonuc = pd.concat([eski[eski.index < sinir], yeni])
@@ -343,6 +358,70 @@ def _4saat_ham(sembol):
     if sonuc is not None:
         sonuc.attrs["bes_dk_mum"] = len(yeni) if yeni is not None else 0
     return sonuc
+
+
+def _4saat_ham(sembol, ham=None):
+    """4 saatlik mumlar. Son ~2 ay 5 dakikalık veriden (TradingView'a uygun 09:40/13:40/17:40 mumları),
+    daha eskisi saatlik veriden (10:00/14:00 yaklaşık mumlar). Alınamazsa None."""
+    saatlik, bes_dk = ham if ham is not None else ham_veriler(sembol)
+    eski = saatlikten_4saatlige(saatlik) if saatlik is not None else None
+    yeni = bes_dakikadan_4saatlige(bes_dk) if bes_dk is not None else None
+    return _birlestir(eski, yeni)
+
+
+def saatlikten_3mum(h):
+    """Saatlik mumlardan TradingView benzeri günde 3 mum (09:40, 13:40, 17:40) tahmini. Saatlik veri 13:40 ve
+    17:40'ı ayıramadığı için o kapanışlar ilgili saatlik mumun içinde 2/3 oranında ara değerle (açılış + 2/3*(kapanış-açılış))
+    tahmin edilir. Günün son mumunun kapanışı daha sonra resmi günlük kapanışla düzeltilir.
+    Amaç: Nadaraya-Watson gibi mum SAYISINA duyarlı göstergelerde eski dönemi de günde 3 mumla temsil etmek."""
+    h = h.dropna(subset=["Close"]).copy()
+    if h.empty:
+        return None
+    idx = h.index
+    if getattr(idx, "tz", None) is not None:
+        idx = idx.tz_convert("Europe/Istanbul")
+    h["gun"] = idx.tz_localize(None).normalize()
+    h["saat"] = idx.hour
+    satirlar = []
+    for gun, g in h.groupby("gun"):
+        g = g.set_index("saat")
+        g = g[~g.index.duplicated(keep="last")]
+        def al(saatler):
+            return g[g.index.isin(saatler)]
+        a, b, c = al([10, 11, 12, 13]), al([14, 15, 16, 17]), al([17, 18])
+        if a.empty:
+            continue
+        def ara_deger(saat, onceki):
+            if saat in g.index:
+                return float(g.loc[saat, "Open"] + (2 / 3) * (g.loc[saat, "Close"] - g.loc[saat, "Open"]))
+            return onceki
+        kapanis_a = ara_deger(13, float(a["Close"].iloc[-1]))
+        satirlar.append((gun + pd.Timedelta(hours=9, minutes=40), float(a["Open"].iloc[0]), float(a["High"].max()),
+                         float(a["Low"].min()), kapanis_a, float(a["Volume"].sum())))
+        if b.empty:
+            continue
+        kapanis_b = ara_deger(17, float(b["Close"].iloc[-1]))
+        satirlar.append((gun + pd.Timedelta(hours=13, minutes=40), kapanis_a, float(b["High"].max()),
+                         float(b["Low"].min()), kapanis_b, float(b["Volume"].sum())))
+        if c.empty:
+            continue
+        satirlar.append((gun + pd.Timedelta(hours=17, minutes=40), kapanis_b, float(c["High"].max()),
+                         float(c["Low"].min()), float(c["Close"].iloc[-1]), float(c["Volume"].sum()) / 3))
+    if not satirlar:
+        return None
+    d = pd.DataFrame(satirlar, columns=["bar", "Open", "High", "Low", "Close", "Volume"]).set_index("bar")
+    d["High"] = d[["High", "Open", "Close"]].max(axis=1)
+    d["Low"] = d[["Low", "Open", "Close"]].min(axis=1)
+    return d.sort_index()
+
+
+def nw_serisi(ham, gunluk=None):
+    """Nadaraya-Watson için mum tablosu: eski dönem saatlikten günde 3 mum, son ~2 ay 5 dakikalıktan; kapanışlar resmi
+    günlük kapanışla düzeltilir. Alınamazsa None."""
+    saatlik, bes_dk = ham
+    eski = saatlikten_3mum(saatlik) if saatlik is not None else None
+    yeni = bes_dakikadan_4saatlige(bes_dk) if bes_dk is not None else None
+    return gun_kapanisi_duzelt(_birlestir(eski, yeni), gunluk)
 
 
 def gun_kapanisi_duzelt(df4, gunluk):
@@ -372,9 +451,9 @@ def gun_kapanisi_duzelt(df4, gunluk):
     return d
 
 
-def veri_cek_4saat(sembol, gunluk=None):
+def veri_cek_4saat(sembol, gunluk=None, ham=None):
     """4 saatlik mumlar (ayrıntı için _4saat_ham). gunluk verilirse her günün son mumunun kapanışı resmi kapanışa çekilir."""
-    return gun_kapanisi_duzelt(_4saat_ham(sembol), gunluk)
+    return gun_kapanisi_duzelt(_4saat_ham(sembol, ham), gunluk)
 
 
 def nw_zarf(kapanis, h=NW_BANT, carpan=NW_CARPAN, adet=NW_MUM):
@@ -603,7 +682,8 @@ def seviye_yazdir(sembol):
             print("  (not: geçmiş veri kısa, EMA200 TradingView'dakinden küçük farklı çıkabilir)")
     else:
         print(f"  EMA{EMA_UZUNLUK} hesaplanamadı (en az ~220 günlük veri gerekir)")
-    df4 = veri_cek_4saat(sembol, df)
+    ham = ham_veriler(sembol)
+    df4 = veri_cek_4saat(sembol, df, ham)
     if df4 is None or len(df4) < 100:
         print("  -- 4 saatlik veri alınamadı --")
         return
@@ -627,14 +707,18 @@ def seviye_yazdir(sembol):
             durum = f"fiyat bölgenin %{abs(b['alt'] / fiyat - 1) * 100:.1f} altında" if fiyat < b["alt"] else "fiyat bölgenin içinde/üstünde"
         ad = "BOĞA (mavi)" if b["tur"] == "boga" else "ayı (kırmızı)"
         print(f"  {ad}  bölge {b['alt']:.2f}-{b['ust']:.2f}  mum {b['mum'].strftime('%Y-%m-%d %H:%M')}  {durum}")
-    nb = nw_bilgi(df4, fiyat)
+    dfn = nw_serisi(ham, df)
+    if dfn is None or len(dfn) < 100:
+        dfn = df4
+    nb = nw_bilgi(dfn, fiyat)
     print(f"  -- Nadaraya-Watson (4 saatlik, Bandwidth {NW_BANT:g}, Mult {NW_CARPAN:g}, kapanış, repainting AÇIK) --")
     if nb is None:
         print("  hesaplanamadı (veri yetersiz)")
     else:
-        print(f"  son mumda alt bant {nb['alt']:.2f}  üst bant {nb['ust']:.2f}  fiyat alt bandın %{nb['mesafe']:.1f} üstünde  DURUM: {nb['durum']}")
+        print(f"  son mumda alt bant {nb['alt']:.2f}  üst bant {nb['ust']:.2f}  fiyat alt bandın %{nb['mesafe']:.1f} üstünde  DURUM: {nb['durum']}  "
+              f"({len(nb['zarf']['k'])} mum kullanıldı)")
         z = nb["zarf"]
-        tarihler = df4.index[::-1]
+        tarihler = dfn.index[::-1]
         isaretler = sorted(z["sinyaller"], key=lambda x: -x[0])[-14:]
         print("  son işaretler (eskiden yeniye): " + ", ".join(f"{t} {tarihler[i]:%m-%d %H:%M}" for i, t in isaretler))
 
