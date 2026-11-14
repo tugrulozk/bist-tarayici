@@ -151,7 +151,7 @@ def yukselen_trendler(df, fiyat=None):
             cizgi = alt[i] + egim * (np.arange(i, son + 1) - i)
             if (kap[i:] < cizgi * (1 - TREND_KIRILIM)).any():      # kapanışla kırılmış
                 continue
-            if (alt[i:] < cizgi * 0.97).any():                     # fitil çok derin delmiş
+            if (alt[i:] < cizgi * 0.85).any():                     # fitil aşırı derin delmiş (kırılma kararı kapanışa göre)
                 continue
             yakin = np.flatnonzero(np.abs(alt[i:] / cizgi - 1) <= TREND_TOL) + i
             temaslar = []
