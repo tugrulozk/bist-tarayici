@@ -41,6 +41,11 @@ SMC_IC_BOYUT = 5         # LuxAlgo SMC iç yapı pivot uzunluğu (sabit 5)
 SMC_SWING_BOYUT = 50     # LuxAlgo SMC swing pivot uzunluğu (kullanıcının ayarı 50)
 SMC_ATR_UZUNLUK = 200    # Order Block Filter = ATR(200)
 SMC_OB_SAYISI = 5        # gösterilen iç order block sayısı (kullanıcının ayarı 5, boğa+ayı toplam)
+NW_BANT = 8.0            # Nadaraya-Watson Bandwidth (kullanıcının ayarı 8)
+NW_CARPAN = 3.0          # Mult (kullanıcının ayarı 3)
+NW_MUM = 500             # gösterge en fazla son 500 muma bakar
+NW_YAKIN = 1.5           # fiyat alt bandın en fazla bu kadar % üstündeyse "yaklaşıyor"
+NW_SINYAL_MUM = 3        # ▲ işareti son bu kadar mum içindeyse "sinyal" (son mumda işaret oluşmaz, bir sonraki mumu bekler)
 GUN_SAYISI = 250     # son kaç günlük mum incelenir
 MAX_UZAKLIK = 30.0   # yazdırırken fiyattan en fazla %30 uzaktaki seviyeler gösterilir
 
@@ -321,7 +326,7 @@ def _yf_gecmis(sembol, donem, aralik):
     return None
 
 
-def veri_cek_4saat(sembol):
+def _4saat_ham(sembol):
     """4 saatlik mumlar. Son ~2 ay 5 dakikalık veriden (TradingView'a uygun 09:40/13:40/17:40 mumları),
     daha eskisi saatlik veriden (10:00/14:00 yaklaşık mumlar). Alınamazsa None.
     Dönüş tablosunun .attrs['bes_dk_mum'] değeri 5 dakikalıktan üretilen mum sayısıdır."""
@@ -338,6 +343,90 @@ def veri_cek_4saat(sembol):
     if sonuc is not None:
         sonuc.attrs["bes_dk_mum"] = len(yeni) if yeni is not None else 0
     return sonuc
+
+
+def gun_kapanisi_duzelt(df4, gunluk):
+    """Her günün son 4 saatlik mumunun kapanışını resmi günlük kapanışla değiştirir
+    (Yahoo'nun saatlik/5 dk verisinde kapanış seansı fiyatı eksik). Seans devam eden günün son mumuna dokunmaz."""
+    if df4 is None or gunluk is None or len(gunluk) == 0:
+        return df4
+    d = df4.copy()
+    d.attrs = dict(df4.attrs)
+    gi = gunluk.index
+    if getattr(gi, "tz", None) is not None:
+        gi = gi.tz_localize(None)
+    gk = pd.Series(gunluk["Close"].to_numpy(dtype=float), index=gi.normalize())
+    simdi = pd.Timestamp.now(tz="Europe/Istanbul")
+    bugun = simdi.tz_localize(None).normalize()
+    kapanis_sonrasi = simdi.hour * 60 + simdi.minute >= 18 * 60 + 15
+    gunler = d.index.normalize()
+    son_mum = ~pd.Series(gunler).duplicated(keep="last").to_numpy()
+    kap_sut, yuk_sut, dus_sut = d.columns.get_loc("Close"), d.columns.get_loc("High"), d.columns.get_loc("Low")
+    for pos in np.flatnonzero(son_mum):
+        gun = gunler[pos]
+        if gun in gk.index and (gun < bugun or kapanis_sonrasi):
+            c = float(gk[gun])
+            d.iloc[pos, kap_sut] = c
+            d.iloc[pos, yuk_sut] = max(float(d.iloc[pos, yuk_sut]), c)
+            d.iloc[pos, dus_sut] = min(float(d.iloc[pos, dus_sut]), c)
+    return d
+
+
+def veri_cek_4saat(sembol, gunluk=None):
+    """4 saatlik mumlar (ayrıntı için _4saat_ham). gunluk verilirse her günün son mumunun kapanışı resmi kapanışa çekilir."""
+    return gun_kapanisi_duzelt(_4saat_ham(sembol), gunluk)
+
+
+def nw_zarf(kapanis, h=NW_BANT, carpan=NW_CARPAN, adet=NW_MUM):
+    """LuxAlgo Nadaraya-Watson Envelope'un 'Repainting Smoothing' AÇIK halinin Python karşılığı:
+    son 'adet' kapanışın tamamı üzerinden Gauss çekirdekli düzeltme, bant = düzeltme +/- (ort. mutlak hata * carpan).
+    k[0] = en son mum. ▲ = kapanış alt bandın altına inmiş (bir önceki kapanış bandın üstündeyken),
+    ▼ = kapanış üst bandın üstüne çıkmış. Göstergedeki gibi bir mumun bandı olarak bir sonraki (daha yeni) mumun
+    düzeltme değeri kullanılır; bu yüzden en son mumda işaret oluşmaz.
+    Not: Pine kodundan hatırlanan mantığın yeniden yazımıdır; gerçek grafikle karşılaştırılarak doğrulanmalıdır."""
+    k = np.asarray(kapanis, dtype=float)[::-1][:adet]
+    n = len(k)
+    if n < 30:
+        return None
+    idx = np.arange(n)
+    w = np.exp(-((idx[:, None] - idx[None, :]) ** 2) / (2 * h * h))
+    y = (w @ k) / w.sum(axis=1)
+    mae = float(np.abs(k - y).sum() / min(499, n - 1) * carpan)
+    sinyaller = []
+    for i in range(1, n - 1):
+        ust_esik, alt_esik = y[i - 1] + mae, y[i - 1] - mae
+        if k[i] > ust_esik and k[i + 1] < ust_esik:
+            sinyaller.append((i, "▼"))
+        if k[i] < alt_esik and k[i + 1] > alt_esik:
+            sinyaller.append((i, "▲"))
+    return dict(y=y, ust=y + mae, alt=y - mae, mae=mae, sinyaller=sinyaller, k=k)
+
+
+def nw_bilgi(df4, fiyat=None):
+    """Son mumdaki bant değerleri ve durum.
+    durum: "sinyal"     -> son NW_SINYAL_MUM mumda ▲ işareti oluşmuş
+           "değdi"      -> son 2 mumun düşüğü kendi alt bandına değmiş/inmiş ya da fiyat alt bandın altında
+           "yaklaşıyor" -> fiyat alt bandın en fazla %NW_YAKIN üstünde
+           "yok"        -> hiçbiri"""
+    z = nw_zarf(df4["Close"].to_numpy(dtype=float))
+    if z is None:
+        return None
+    if fiyat is None:
+        fiyat = float(z["k"][0])
+    alt0, ust0 = float(z["alt"][0]), float(z["ust"][0])
+    mesafe = (fiyat / alt0 - 1) * 100
+    dusukler = df4["Low"].to_numpy(dtype=float)[::-1]
+    dokundu = any(dusukler[i] <= z["alt"][i] for i in (0, 1) if i < len(dusukler))
+    son_yukari = min((i for i, t in z["sinyaller"] if t == "▲"), default=None)
+    if son_yukari is not None and son_yukari <= NW_SINYAL_MUM:
+        durum = "sinyal"
+    elif dokundu or fiyat <= alt0:
+        durum = "değdi"
+    elif mesafe <= NW_YAKIN:
+        durum = "yaklaşıyor"
+    else:
+        durum = "yok"
+    return dict(alt=alt0, ust=ust0, mesafe=mesafe, durum=durum, son_yukari=son_yukari, zarf=z)
 
 
 def smc_order_bloklar(df4, ic=SMC_IC_BOYUT, swing=SMC_SWING_BOYUT, atr_uz=SMC_ATR_UZUNLUK, adet=SMC_OB_SAYISI, kayit=None):
@@ -514,7 +603,7 @@ def seviye_yazdir(sembol):
             print("  (not: geçmiş veri kısa, EMA200 TradingView'dakinden küçük farklı çıkabilir)")
     else:
         print(f"  EMA{EMA_UZUNLUK} hesaplanamadı (en az ~220 günlük veri gerekir)")
-    df4 = veri_cek_4saat(sembol)
+    df4 = veri_cek_4saat(sembol, df)
     if df4 is None or len(df4) < 100:
         print("  -- 4 saatlik veri alınamadı --")
         return
@@ -538,6 +627,16 @@ def seviye_yazdir(sembol):
             durum = f"fiyat bölgenin %{abs(b['alt'] / fiyat - 1) * 100:.1f} altında" if fiyat < b["alt"] else "fiyat bölgenin içinde/üstünde"
         ad = "BOĞA (mavi)" if b["tur"] == "boga" else "ayı (kırmızı)"
         print(f"  {ad}  bölge {b['alt']:.2f}-{b['ust']:.2f}  mum {b['mum'].strftime('%Y-%m-%d %H:%M')}  {durum}")
+    nb = nw_bilgi(df4, fiyat)
+    print(f"  -- Nadaraya-Watson (4 saatlik, Bandwidth {NW_BANT:g}, Mult {NW_CARPAN:g}, kapanış, repainting AÇIK) --")
+    if nb is None:
+        print("  hesaplanamadı (veri yetersiz)")
+    else:
+        print(f"  son mumda alt bant {nb['alt']:.2f}  üst bant {nb['ust']:.2f}  fiyat alt bandın %{nb['mesafe']:.1f} üstünde  DURUM: {nb['durum']}")
+        z = nb["zarf"]
+        tarihler = df4.index[::-1]
+        isaretler = sorted(z["sinyaller"], key=lambda x: -x[0])[-14:]
+        print("  son işaretler (eskiden yeniye): " + ", ".join(f"{t} {tarihler[i]:%m-%d %H:%M}" for i, t in isaretler))
 
 
 if __name__ == "__main__":
