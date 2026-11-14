@@ -12,6 +12,7 @@ Kurallar (kullanıcıyla netleşenler):
 - Birbirine %4'ten yakın iki seviyeden zayıf olan elenir.
 - Yükselen trend: iki dibin fitil uçlarından geçen, kapanışla kırılmamış, en az 3 temaslı çizgiler.
 - Genel yön aşağıysa (en yüksek kapanıştan inen, kırılmamış düşen trend çizgisi varsa) yükselen trend çizgileri bildirilmez.
+- EMA200 (günlük): fiyat yukarıdan gelip EMA200'e dokunur ya da %2 yaklaşırsa tek başına bildirim konusu; diğer bildirimlerde uzaklığı not olarak yazılır.
 - Sadece fiyatın altında kalan (ya da fiyatı içine alan) bölgeler destek sayılır.
 """
 import sys
@@ -32,6 +33,10 @@ TREND_KIRILIM = 0.01     # kapanış çizginin %1 altına inerse çizgi kırılm
 TREND_EN_AZ_TEMAS = 3    # çizgi için en az temas
 TREND_MIN_GUN = 8        # çizgiyi belirleyen iki dip arası en az bu kadar mum
 DUSEN_MIN_GUN = 30       # düşen çizginin çıktığı zirve en az bu kadar mum eski olmalı (genel yön sayılması için)
+EMA_UZUNLUK = 200        # üstel hareketli ortalama periyodu (günlük)
+EMA_YAKLASMA = 2.0       # fiyat EMA'nın üstünde ve en fazla bu kadar % uzaktaysa "yaklaşıyor"
+EMA_YUKARIDAN_GUN = 10   # "yukarıdan geliyor" kontrolü için bakılan mum sayısı
+EMA_YUKARIDAN_FARK = 2.0 # son mumların en yüksek kapanışı fiyattan en az bu kadar % yukarıdaysa "yukarıdan geliyor"
 GUN_SAYISI = 250     # son kaç günlük mum incelenir
 MAX_UZAKLIK = 30.0   # yazdırırken fiyattan en fazla %30 uzaktaki seviyeler gösterilir
 
@@ -41,7 +46,7 @@ def veri_cek_gunluk(sembol):
     df = None
     for deneme in range(3):
         try:
-            df = yf.Ticker(sembol + ".IS").history(period="1y", interval="1d", auto_adjust=False)
+            df = yf.Ticker(sembol + ".IS").history(period="3y", interval="1d", auto_adjust=False)
         except Exception:
             df = None
         if df is not None and not df.empty:
@@ -53,16 +58,18 @@ def veri_cek_gunluk(sembol):
     return None if df.empty else df
 
 
-def guncel_fiyat(sembol, df):
-    """Gün içi (15 dk) verinin son kapanışı; alınamazsa günlük verinin son kapanışı.
-    (Günlük verinin son mumu Yahoo'da bazen güncellenmiyor.)"""
+def gun_ici_bilgi(sembol, df):
+    """(güncel fiyat, bugünün en düşüğü, bugünün en yükseği). Gün içi (15 dk) veriden alınır;
+    alınamazsa günlük verinin son mumundan. (Günlük verinin son mumu Yahoo'da bazen güncellenmiyor.)"""
     try:
         g = yf.Ticker(sembol + ".IS").history(period="5d", interval="15m", auto_adjust=False)
         if g is not None and not g.empty:
-            return float(g["Close"].dropna().iloc[-1])
+            g = g.dropna(subset=["Close"])
+            bugun = g[g.index.date == g.index[-1].date()]
+            return float(g["Close"].iloc[-1]), float(bugun["Low"].min()), float(bugun["High"].max())
     except Exception:
         pass
-    return float(df["Close"].iloc[-1])
+    return float(df["Close"].iloc[-1]), float(df["Low"].iloc[-1]), float(df["High"].iloc[-1])
 
 
 def pivotlar(df, n=PIVOT_N):
@@ -218,6 +225,52 @@ def dusen_trend(df, fiyat=None):
     return en_iyi
 
 
+def ema_hesapla(kapanis, uzunluk=EMA_UZUNLUK):
+    """Üstel hareketli ortalama, TradingView'daki gibi: ilk değer ilk 'uzunluk' kapanışın ortalaması,
+    sonra EMA = alfa*kapanış + (1-alfa)*önceki EMA, alfa = 2/(uzunluk+1)."""
+    k = np.asarray(kapanis, dtype=float)
+    sonuc = np.full(len(k), np.nan)
+    if len(k) < uzunluk:
+        return sonuc
+    alfa = 2 / (uzunluk + 1)
+    onceki = float(k[:uzunluk].mean())
+    sonuc[uzunluk - 1] = onceki
+    for i in range(uzunluk, len(k)):
+        onceki = alfa * k[i] + (1 - alfa) * onceki
+        sonuc[i] = onceki
+    return sonuc
+
+
+def ema200_bilgi(df, fiyat=None, bugun_alt=None):
+    """EMA200'ün değeri, fiyatın ona % farkı (+ ise üstünde), eğimi ve durumu.
+    durum: "dokundu"    -> bugünün en düşüğü EMA'ya değdi/indi, dün kapanış EMA'nın üstündeydi, fiyat EMA'dan en fazla %1 aşağıda
+           "yaklaşıyor" -> fiyat EMA'nın üstünde, en fazla %EMA_YAKLASMA uzakta ve yukarıdan düşerek geliyor
+           "yok"        -> ikisi de değil
+    Son mumun kapanışı yerine güncel fiyat kullanılır. Veri yetersizse None."""
+    if df is None or len(df) < EMA_UZUNLUK + 20:
+        return None
+    kap = df["Close"].to_numpy(dtype=float).copy()
+    if fiyat is None:
+        fiyat = float(kap[-1])
+    if bugun_alt is None:
+        bugun_alt = float(df["Low"].iloc[-1])
+    kap[-1] = fiyat
+    ema = ema_hesapla(kap)
+    deger = float(ema[-1])
+    mesafe = (fiyat / deger - 1) * 100
+    onceki_zirve = float(kap[-1 - EMA_YUKARIDAN_GUN:-1].max())
+    yukaridan = onceki_zirve >= fiyat * (1 + EMA_YUKARIDAN_FARK / 100)
+    dun_ustunde = kap[-2] > ema[-2]
+    if bugun_alt <= deger * 1.001 and dun_ustunde and fiyat >= deger * 0.99:
+        durum = "dokundu"
+    elif 0 <= mesafe <= EMA_YAKLASMA and yukaridan:
+        durum = "yaklaşıyor"
+    else:
+        durum = "yok"
+    return dict(deger=deger, mesafe=mesafe, durum=durum, yukaridan=yukaridan,
+                egim="yükseliyor" if deger > float(ema[-6]) else "düşüyor")
+
+
 def ayrinti_yazdir(sembol, merkez):
     """Hata ayıklama: merkez fiyatın %6 çevresindeki tüm dip/tepe noktalarını tarihleriyle yazdırır."""
     df = veri_cek_gunluk(sembol)
@@ -240,7 +293,7 @@ def seviye_yazdir(sembol):
     if df is None:
         print(f"{sembol}: veri alınamadı")
         return
-    fiyat = guncel_fiyat(sembol, df)
+    fiyat, bugun_alt, bugun_ust = gun_ici_bilgi(sembol, df)
     print(f"\n=== {sembol}  güncel fiyat {fiyat:.2f}  (günlük verinin son kapanışı {df['Close'].iloc[-1]:.2f}, {len(df)} mum) ===")
     liste = [r for r in yatay_destekler(df, fiyat) if r["mesafe"] <= MAX_UZAKLIK]
     if not liste:
@@ -263,6 +316,16 @@ def seviye_yazdir(sembol):
     for r in trendler:
         print(f"  çizgi bugün {r['deger']:.2f}  başlangıç {r['baslangic']} ({r['uzunluk']} gün)  "
               f"temas {r['temas']}  son temas {r['son_temas_gun']} gün önce  fiyata uzaklık %{r['mesafe']:.1f}")
+    eb = ema200_bilgi(df, fiyat, bugun_alt)
+    print(f"  -- EMA{EMA_UZUNLUK} (günlük) --")
+    if eb:
+        yon = "üstünde" if eb["mesafe"] >= 0 else "altında"
+        print(f"  EMA{EMA_UZUNLUK} {eb['deger']:.2f}  fiyat EMA'nın %{abs(eb['mesafe']):.1f} {yon}  EMA {eb['egim']}  "
+              f"yukarıdan geliyor: {'evet' if eb['yukaridan'] else 'hayır'}  DURUM: {eb['durum']}")
+        if len(df) < 500:
+            print("  (not: geçmiş veri kısa, EMA200 TradingView'dakinden küçük farklı çıkabilir)")
+    else:
+        print(f"  EMA{EMA_UZUNLUK} hesaplanamadı (en az ~220 günlük veri gerekir)")
 
 
 if __name__ == "__main__":
