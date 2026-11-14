@@ -292,20 +292,52 @@ def saatlikten_4saatlige(h):
     return g
 
 
-def veri_cek_4saat(sembol):
-    """~2 yıllık saatlik veriden üretilmiş 4 saatlik mumlar. Alınamazsa None."""
-    h = None
+def bes_dakikadan_4saatlige(m5):
+    """5 dakikalık mumlardan TradingView'daki gibi 4 saatlik mumlar: 09:40-13:40, 13:40-17:40, 17:40-kapanış.
+    (BIST'te TradingView 4 saatlik mumlar seans başına göre hizalanıyor görünüyor; ekran görüntülerindeki
+    çok küçük son mum bunu düşündürüyor.)"""
+    m5 = m5.dropna(subset=["Close"]).copy()
+    if m5.empty:
+        return None
+    idx = m5.index
+    if getattr(idx, "tz", None) is not None:
+        idx = idx.tz_convert("Europe/Istanbul")
+    dk = idx.hour * 60 + idx.minute
+    baslangic = np.where(dk < 13 * 60 + 40, 9 * 60 + 40, np.where(dk < 17 * 60 + 40, 13 * 60 + 40, 17 * 60 + 40))
+    m5["bar"] = idx.tz_localize(None).normalize() + pd.to_timedelta(baslangic, unit="m")
+    return m5.groupby("bar").agg(Open=("Open", "first"), High=("High", "max"), Low=("Low", "min"),
+                                  Close=("Close", "last"), Volume=("Volume", "sum"))
+
+
+def _yf_gecmis(sembol, donem, aralik):
     for deneme in range(3):
         try:
-            h = yf.Ticker(sembol + ".IS").history(period="730d", interval="1h", auto_adjust=False)
+            x = yf.Ticker(sembol + ".IS").history(period=donem, interval=aralik, auto_adjust=False)
         except Exception:
-            h = None
-        if h is not None and not h.empty:
-            break
+            x = None
+        if x is not None and not x.empty:
+            return x
         time.sleep(1.5 * (deneme + 1))
-    if h is None or h.empty:
-        return None
-    return saatlikten_4saatlige(h)
+    return None
+
+
+def veri_cek_4saat(sembol):
+    """4 saatlik mumlar. Son ~2 ay 5 dakikalık veriden (TradingView'a uygun 09:40/13:40/17:40 mumları),
+    daha eskisi saatlik veriden (10:00/14:00 yaklaşık mumlar). Alınamazsa None.
+    Dönüş tablosunun .attrs['bes_dk_mum'] değeri 5 dakikalıktan üretilen mum sayısıdır."""
+    saatlik = _yf_gecmis(sembol, "730d", "1h")
+    bes_dk = _yf_gecmis(sembol, "60d", "5m")
+    eski = saatlikten_4saatlige(saatlik) if saatlik is not None else None
+    yeni = bes_dakikadan_4saatlige(bes_dk) if bes_dk is not None else None
+    if yeni is not None and eski is not None:
+        sinir = yeni.index[0].normalize()
+        sonuc = pd.concat([eski[eski.index < sinir], yeni])
+        sonuc.attrs["bes_dk_mum"] = len(yeni)
+        return sonuc
+    sonuc = yeni if yeni is not None else eski
+    if sonuc is not None:
+        sonuc.attrs["bes_dk_mum"] = len(yeni) if yeni is not None else 0
+    return sonuc
 
 
 def smc_order_bloklar(df4, ic=SMC_IC_BOYUT, swing=SMC_SWING_BOYUT, atr_uz=SMC_ATR_UZUNLUK, adet=SMC_OB_SAYISI, kayit=None):
@@ -486,7 +518,8 @@ def seviye_yazdir(sembol):
     if df4 is None or len(df4) < 100:
         print("  -- 4 saatlik veri alınamadı --")
         return
-    print("  -- 4 saatlik mumlar (TradingView ile karşılaştırmak için son 6) --")
+    print(f"  -- 4 saatlik mumlar (TradingView ile karşılaştırmak için son 6; toplam {len(df4)} mum, "
+          f"bunların {df4.attrs.get('bes_dk_mum', 0)} tanesi 5 dakikalık veriden) --")
     for zaman, m in df4.tail(6).iterrows():
         print(f"  {zaman.strftime('%Y-%m-%d %H:%M')}  A {m['Open']:.2f}  Y {m['High']:.2f}  D {m['Low']:.2f}  K {m['Close']:.2f}")
     print(f"  -- SMC iç order block (4 saatlik, aktif son {SMC_OB_SAYISI} blok; boğa = mavi bölge) --")
