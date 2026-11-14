@@ -37,6 +37,10 @@ EMA_UZUNLUK = 200        # üstel hareketli ortalama periyodu (günlük)
 EMA_YAKLASMA = 2.0       # fiyat EMA'nın üstünde ve en fazla bu kadar % uzaktaysa "yaklaşıyor"
 EMA_YUKARIDAN_GUN = 10   # "yukarıdan geliyor" kontrolü için bakılan mum sayısı
 EMA_YUKARIDAN_FARK = 2.0 # son mumların en yüksek kapanışı fiyattan en az bu kadar % yukarıdaysa "yukarıdan geliyor"
+SMC_IC_BOYUT = 5         # LuxAlgo SMC iç yapı pivot uzunluğu (sabit 5)
+SMC_SWING_BOYUT = 50     # LuxAlgo SMC swing pivot uzunluğu (kullanıcının ayarı 50)
+SMC_ATR_UZUNLUK = 200    # Order Block Filter = ATR(200)
+SMC_OB_SAYISI = 5        # gösterilen iç order block sayısı (kullanıcının ayarı 5, boğa+ayı toplam)
 GUN_SAYISI = 250     # son kaç günlük mum incelenir
 MAX_UZAKLIK = 30.0   # yazdırırken fiyattan en fazla %30 uzaktaki seviyeler gösterilir
 
@@ -271,6 +275,124 @@ def ema200_bilgi(df, fiyat=None, bugun_alt=None):
                 egim="yükseliyor" if deger > float(ema[-6]) else "düşüyor")
 
 
+def saatlikten_4saatlige(h):
+    """Saatlik muma dizisini 4 saatlik mumlara çevirir. BIST için mum başlangıçları 10:00, 14:00 ve
+    (varsa) 18:00 kapanış seansı mumu. Dönüş: Open/High/Low/Close/Volume sütunlu, mum başlangıç zamanı indeksli tablo."""
+    h = h.dropna(subset=["Close"]).copy()
+    if h.empty:
+        return None
+    idx = h.index
+    if getattr(idx, "tz", None) is not None:
+        idx = idx.tz_convert("Europe/Istanbul")
+    saat = idx.hour
+    blok = np.where(saat < 14, 10, np.where(saat < 18, 14, 18))
+    h["bar"] = idx.tz_localize(None).normalize() + pd.to_timedelta(blok, unit="h")
+    g = h.groupby("bar").agg(Open=("Open", "first"), High=("High", "max"), Low=("Low", "min"),
+                              Close=("Close", "last"), Volume=("Volume", "sum"))
+    return g
+
+
+def veri_cek_4saat(sembol):
+    """~2 yıllık saatlik veriden üretilmiş 4 saatlik mumlar. Alınamazsa None."""
+    h = None
+    for deneme in range(3):
+        try:
+            h = yf.Ticker(sembol + ".IS").history(period="730d", interval="1h", auto_adjust=False)
+        except Exception:
+            h = None
+        if h is not None and not h.empty:
+            break
+        time.sleep(1.5 * (deneme + 1))
+    if h is None or h.empty:
+        return None
+    return saatlikten_4saatlige(h)
+
+
+def smc_order_bloklar(df4, ic=SMC_IC_BOYUT, swing=SMC_SWING_BOYUT, atr_uz=SMC_ATR_UZUNLUK, adet=SMC_OB_SAYISI):
+    """LuxAlgo 'Smart Money Concepts' göstergesinin iç (internal) order block mantığının Python karşılığı.
+    Ayarlar kullanıcının ekran görüntüsündeki gibi: iç order block açık (5), swing order block kapalı,
+    filtre ATR, mitigation High/Low. Dönüş: en yeni 'adet' aktif blok, en yeniden eskiye:
+    [{tur: 'boga'|'ayi', ust, alt, mum: zaman}, ...]. Boğa order block = grafikteki mavi bölge.
+    Not: Pine kodundan hatırlanan mantığın yeniden yazımıdır; gerçek grafikle karşılaştırılarak doğrulanmalıdır."""
+    h = df4["High"].to_numpy(dtype=float)
+    l = df4["Low"].to_numpy(dtype=float)
+    c = df4["Close"].to_numpy(dtype=float)
+    n = len(df4)
+    if n < max(swing, ic) + 10:
+        return []
+    # ATR (Wilder/RMA) ve yüksek oynaklık mumları: onların high/low'u ters çevrilir
+    onceki_c = np.concatenate([[c[0]], c[:-1]])
+    tr = np.maximum(h - l, np.maximum(np.abs(h - onceki_c), np.abs(l - onceki_c)))
+    tr[0] = h[0] - l[0]
+    atr = np.full(n, np.nan)
+    if n >= atr_uz:
+        atr[atr_uz - 1] = tr[:atr_uz].mean()
+        for i in range(atr_uz, n):
+            atr[i] = (atr[i - 1] * (atr_uz - 1) + tr[i]) / atr_uz
+    yuksek_vol = np.where(np.isnan(atr), False, (h - l) >= 2 * atr)
+    ph = np.where(yuksek_vol, l, h)
+    pl = np.where(yuksek_vol, h, l)
+
+    def bacak(boyut):
+        """Her mum için mevcut bacak: 1 = yükselen (boğa), 0 = düşen (ayı). Pine'daki leg() fonksiyonu."""
+        b = np.zeros(n, dtype=int)
+        for i in range(n):
+            if i >= boyut:
+                yeni_tepe = h[i - boyut] > h[i - boyut + 1:i + 1].max()
+                yeni_dip = l[i - boyut] < l[i - boyut + 1:i + 1].min()
+                if yeni_tepe:
+                    b[i] = 0
+                elif yeni_dip:
+                    b[i] = 1
+                else:
+                    b[i] = b[i - 1]
+            else:
+                b[i] = 0
+        return b
+
+    ic_bacak, sw_bacak = bacak(ic), bacak(swing)
+    nan = float("nan")
+    ic_tepe = dict(seviye=nan, sira=-1, kirildi=False)
+    ic_dip = dict(seviye=nan, sira=-1, kirildi=False)
+    sw_tepe, sw_dip = nan, nan
+    bloklar = []
+    for i in range(n):
+        # 1) swing pivotları (yalnızca "iç seviye swing seviyesiyle aynı mı" kontrolü için)
+        if i > 0:
+            if sw_bacak[i] != sw_bacak[i - 1] and i >= swing:
+                if sw_bacak[i] == 1:
+                    sw_dip = l[i - swing]
+                else:
+                    sw_tepe = h[i - swing]
+            # 2) iç pivotlar
+            if ic_bacak[i] != ic_bacak[i - 1] and i >= ic:
+                if ic_bacak[i] == 1:
+                    ic_dip = dict(seviye=l[i - ic], sira=i - ic, kirildi=False)
+                else:
+                    ic_tepe = dict(seviye=h[i - ic], sira=i - ic, kirildi=False)
+            # 3) yapı kırılımı -> order block
+            ek_tepe = np.isnan(sw_tepe) or ic_tepe["seviye"] != sw_tepe
+            if (not np.isnan(ic_tepe["seviye"]) and not ic_tepe["kirildi"] and ek_tepe
+                    and c[i] > ic_tepe["seviye"] and c[i - 1] <= ic_tepe["seviye"]):
+                ic_tepe["kirildi"] = True
+                dilim = pl[ic_tepe["sira"]:i]
+                if len(dilim):
+                    k = ic_tepe["sira"] + int(np.argmin(dilim))
+                    bloklar.insert(0, dict(tur="boga", ust=float(ph[k]), alt=float(pl[k]), mum=df4.index[k]))
+            ek_dip = np.isnan(sw_dip) or ic_dip["seviye"] != sw_dip
+            if (not np.isnan(ic_dip["seviye"]) and not ic_dip["kirildi"] and ek_dip
+                    and c[i] < ic_dip["seviye"] and c[i - 1] >= ic_dip["seviye"]):
+                ic_dip["kirildi"] = True
+                dilim = ph[ic_dip["sira"]:i]
+                if len(dilim):
+                    k = ic_dip["sira"] + int(np.argmax(dilim))
+                    bloklar.insert(0, dict(tur="ayi", ust=float(ph[k]), alt=float(pl[k]), mum=df4.index[k]))
+        # 4) mitigation (High/Low): boğa blok low altına inerse, ayı blok high üstüne çıkarsa silinir
+        bloklar = [b for b in bloklar
+                   if not ((b["tur"] == "ayi" and h[i] > b["ust"]) or (b["tur"] == "boga" and l[i] < b["alt"]))]
+    return bloklar[:adet]
+
+
 def ayrinti_yazdir(sembol, merkez):
     """Hata ayıklama: merkez fiyatın %6 çevresindeki tüm dip/tepe noktalarını tarihleriyle yazdırır."""
     df = veri_cek_gunluk(sembol)
@@ -326,6 +448,29 @@ def seviye_yazdir(sembol):
             print("  (not: geçmiş veri kısa, EMA200 TradingView'dakinden küçük farklı çıkabilir)")
     else:
         print(f"  EMA{EMA_UZUNLUK} hesaplanamadı (en az ~220 günlük veri gerekir)")
+    df4 = veri_cek_4saat(sembol)
+    if df4 is None or len(df4) < 100:
+        print("  -- 4 saatlik veri alınamadı --")
+        return
+    print("  -- 4 saatlik mumlar (TradingView ile karşılaştırmak için son 6) --")
+    for zaman, m in df4.tail(6).iterrows():
+        print(f"  {zaman.strftime('%Y-%m-%d %H:%M')}  A {m['Open']:.2f}  Y {m['High']:.2f}  D {m['Low']:.2f}  K {m['Close']:.2f}")
+    print(f"  -- SMC iç order block (4 saatlik, aktif son {SMC_OB_SAYISI} blok; boğa = mavi bölge) --")
+    bloklar = smc_order_bloklar(df4)
+    if not bloklar:
+        print("  aktif order block yok")
+    for b in bloklar:
+        if b["tur"] == "boga":
+            if b["alt"] <= fiyat <= b["ust"]:
+                durum = "fiyat BÖLGENİN İÇİNDE"
+            elif fiyat > b["ust"]:
+                durum = f"fiyat bölgenin %{(fiyat / b['ust'] - 1) * 100:.1f} üstünde"
+            else:
+                durum = "fiyat bölgenin altında"
+        else:
+            durum = f"fiyat bölgenin %{abs(b['alt'] / fiyat - 1) * 100:.1f} altında" if fiyat < b["alt"] else "fiyat bölgenin içinde/üstünde"
+        ad = "BOĞA (mavi)" if b["tur"] == "boga" else "ayı (kırmızı)"
+        print(f"  {ad}  bölge {b['alt']:.2f}-{b['ust']:.2f}  mum {b['mum'].strftime('%Y-%m-%d %H:%M')}  {durum}")
 
 
 if __name__ == "__main__":
