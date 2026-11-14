@@ -308,11 +308,12 @@ def veri_cek_4saat(sembol):
     return saatlikten_4saatlige(h)
 
 
-def smc_order_bloklar(df4, ic=SMC_IC_BOYUT, swing=SMC_SWING_BOYUT, atr_uz=SMC_ATR_UZUNLUK, adet=SMC_OB_SAYISI):
+def smc_order_bloklar(df4, ic=SMC_IC_BOYUT, swing=SMC_SWING_BOYUT, atr_uz=SMC_ATR_UZUNLUK, adet=SMC_OB_SAYISI, kayit=None):
     """LuxAlgo 'Smart Money Concepts' göstergesinin iç (internal) order block mantığının Python karşılığı.
     Ayarlar kullanıcının ekran görüntüsündeki gibi: iç order block açık (5), swing order block kapalı,
     filtre ATR, mitigation High/Low. Dönüş: en yeni 'adet' aktif blok, en yeniden eskiye:
     [{tur: 'boga'|'ayi', ust, alt, mum: zaman}, ...]. Boğa order block = grafikteki mavi bölge.
+    kayit: bir liste verilirse yapı kırılımları ve blok silinmeleri oraya metin olarak eklenir (hata ayıklama).
     Not: Pine kodundan hatırlanan mantığın yeniden yazımıdır; gerçek grafikle karşılaştırılarak doğrulanmalıdır."""
     h = df4["High"].to_numpy(dtype=float)
     l = df4["Low"].to_numpy(dtype=float)
@@ -356,6 +357,7 @@ def smc_order_bloklar(df4, ic=SMC_IC_BOYUT, swing=SMC_SWING_BOYUT, atr_uz=SMC_AT
     ic_dip = dict(seviye=nan, sira=-1, kirildi=False)
     sw_tepe, sw_dip = nan, nan
     bloklar = []
+    egilim = 0                      # iç yapı yönü: 1 yukarı, -1 aşağı, 0 henüz yok
     for i in range(n):
         # 1) swing pivotları (yalnızca "iç seviye swing seviyesiyle aynı mı" kontrolü için)
         if i > 0:
@@ -375,22 +377,54 @@ def smc_order_bloklar(df4, ic=SMC_IC_BOYUT, swing=SMC_SWING_BOYUT, atr_uz=SMC_AT
             if (not np.isnan(ic_tepe["seviye"]) and not ic_tepe["kirildi"] and ek_tepe
                     and c[i] > ic_tepe["seviye"] and c[i - 1] <= ic_tepe["seviye"]):
                 ic_tepe["kirildi"] = True
+                etiket = "CHoCH" if egilim == -1 else "BOS"
+                egilim = 1
                 dilim = pl[ic_tepe["sira"]:i]
                 if len(dilim):
                     k = ic_tepe["sira"] + int(np.argmin(dilim))
                     bloklar.insert(0, dict(tur="boga", ust=float(ph[k]), alt=float(pl[k]), mum=df4.index[k]))
+                    if kayit is not None:
+                        kayit.append(f"{df4.index[i]:%Y-%m-%d %H:%M}  YUKARI {etiket}: kapanış {c[i]:.2f} > iç tepe {ic_tepe['seviye']:.2f} "
+                                     f"(pivot {df4.index[ic_tepe['sira']]:%m-%d %H:%M})  -> BOĞA blok {pl[k]:.2f}-{ph[k]:.2f} "
+                                     f"(mum {df4.index[k]:%m-%d %H:%M}{', yüksek oynaklık mumu' if yuksek_vol[k] else ''})")
             ek_dip = np.isnan(sw_dip) or ic_dip["seviye"] != sw_dip
             if (not np.isnan(ic_dip["seviye"]) and not ic_dip["kirildi"] and ek_dip
                     and c[i] < ic_dip["seviye"] and c[i - 1] >= ic_dip["seviye"]):
                 ic_dip["kirildi"] = True
+                etiket = "CHoCH" if egilim == 1 else "BOS"
+                egilim = -1
                 dilim = ph[ic_dip["sira"]:i]
                 if len(dilim):
                     k = ic_dip["sira"] + int(np.argmax(dilim))
                     bloklar.insert(0, dict(tur="ayi", ust=float(ph[k]), alt=float(pl[k]), mum=df4.index[k]))
+                    if kayit is not None:
+                        kayit.append(f"{df4.index[i]:%Y-%m-%d %H:%M}  AŞAĞI {etiket}: kapanış {c[i]:.2f} < iç dip {ic_dip['seviye']:.2f} "
+                                     f"(pivot {df4.index[ic_dip['sira']]:%m-%d %H:%M})  -> AYI blok {pl[k]:.2f}-{ph[k]:.2f} "
+                                     f"(mum {df4.index[k]:%m-%d %H:%M}{', yüksek oynaklık mumu' if yuksek_vol[k] else ''})")
         # 4) mitigation (High/Low): boğa blok low altına inerse, ayı blok high üstüne çıkarsa silinir
-        bloklar = [b for b in bloklar
-                   if not ((b["tur"] == "ayi" and h[i] > b["ust"]) or (b["tur"] == "boga" and l[i] < b["alt"]))]
+        kalanlar = []
+        for b in bloklar:
+            silindi = (b["tur"] == "ayi" and h[i] > b["ust"]) or (b["tur"] == "boga" and l[i] < b["alt"])
+            if silindi and kayit is not None:
+                kayit.append(f"{df4.index[i]:%Y-%m-%d %H:%M}  {'BOĞA' if b['tur'] == 'boga' else 'AYI'} blok {b['alt']:.2f}-{b['ust']:.2f} SİLİNDİ "
+                             f"(mum düşüğü {l[i]:.2f}, yüksek {h[i]:.2f})")
+            if not silindi:
+                kalanlar.append(b)
+        bloklar = kalanlar
     return bloklar[:adet]
+
+
+def smc_kayit_yazdir(sembol, son=30):
+    """Hata ayıklama: iç yapı kırılımlarının ve order block oluşum/silinme olaylarının son kayıtları."""
+    df4 = veri_cek_4saat(sembol)
+    if df4 is None:
+        print(f"{sembol}: 4 saatlik veri alınamadı")
+        return
+    kayit = []
+    smc_order_bloklar(df4, kayit=kayit)
+    print(f"\n=== {sembol}: SMC olay kaydı  ({len(df4)} 4 saatlik mum, {df4.index[0]:%Y-%m-%d} ... {df4.index[-1]:%Y-%m-%d %H:%M}) ===")
+    for satir in kayit[-son:]:
+        print("  " + satir)
 
 
 def ayrinti_yazdir(sembol, merkez):
@@ -477,9 +511,12 @@ if __name__ == "__main__":
     if len(sys.argv) >= 3 and sys.argv[1] == "seviye":
         for s in sys.argv[2:]:
             s = s.strip().upper()
-            if ":" in s:                      # örn. GUBRF:263.5  -> o fiyatın çevresindeki noktalar
-                kod, fiyat_metni = s.split(":", 1)
-                ayrinti_yazdir(kod, float(fiyat_metni.replace(",", ".")))
+            if ":" in s:                      # GUBRF:263.5 -> o fiyatın çevresindeki noktalar; TRALT:SMC -> SMC olay kaydı
+                kod, ek = s.split(":", 1)
+                if ek == "SMC":
+                    smc_kayit_yazdir(kod)
+                else:
+                    ayrinti_yazdir(kod, float(ek.replace(",", ".")))
             else:
                 seviye_yazdir(s)
     else:
