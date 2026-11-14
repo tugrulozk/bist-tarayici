@@ -10,6 +10,8 @@ Kurallar (kullanıcıyla netleşenler):
 - Birbirine yakın adaylar (en alttakinin %2 üstüne kadar) tek bölgede birleşir.
 - En az 2 temas gerekir ve bunların en az 2'si dip olmalı (BIMAS'ta kullanıcının seçtikleriyle gürültü bu kuralla ayrıldı).
 - Birbirine %4'ten yakın iki seviyeden zayıf olan elenir.
+- Yükselen trend: iki dibin fitil uçlarından geçen, kapanışla kırılmamış, en az 3 temaslı çizgiler.
+- Genel yön aşağıysa (en yüksek kapanıştan inen, kırılmamış düşen trend çizgisi varsa) yükselen trend çizgileri bildirilmez.
 - Sadece fiyatın altında kalan (ya da fiyatı içine alan) bölgeler destek sayılır.
 """
 import sys
@@ -24,6 +26,12 @@ BOLGE_TOL = 0.02     # bölge genişliği: en alttaki adayın en fazla %2 üstü
 EN_AZ_TEMAS = 2      # bir bölgenin destek sayılması için en az temas
 EN_AZ_DIP = 2        # bunların en az kaçı dip (fitil dibi) olmalı; tepeler bölgeyi güçlendirir ama tek başına yetmez
 MIN_ARALIK = 0.04    # iki seviye arası bundan yakınsa zayıf olan elenir (kullanıcının seviyeleri hep %4,8'den uzak)
+TREND_PIVOT_N = 2        # trend çizgisi bağlantı noktaları için dip sayılma penceresi
+TREND_TOL = 0.01         # fitil dibi çizginin %1'i içindeyse temas sayılır
+TREND_KIRILIM = 0.01     # kapanış çizginin %1 altına inerse çizgi kırılmış sayılır
+TREND_EN_AZ_TEMAS = 3    # çizgi için en az temas
+TREND_MIN_GUN = 8        # çizgiyi belirleyen iki dip arası en az bu kadar mum
+DUSEN_MIN_GUN = 30       # düşen çizginin çıktığı zirve en az bu kadar mum eski olmalı (genel yön sayılması için)
 GUN_SAYISI = 250     # son kaç günlük mum incelenir
 MAX_UZAKLIK = 30.0   # yazdırırken fiyattan en fazla %30 uzaktaki seviyeler gösterilir
 
@@ -119,6 +127,97 @@ def yatay_destekler(df, fiyat=None):
     return sorted(kalan, key=lambda r: r["mesafe"])
 
 
+def yukselen_trendler(df, fiyat=None):
+    """Hâlâ geçerli (kırılmamış) yükselen trend çizgileri, fiyata yakından uzağa.
+    Çizgi iki dibin fitil uçlarından geçer; en az TREND_EN_AZ_TEMAS temas aranır;
+    kapanış çizginin %TREND_KIRILIM altına inmişse çizgi elenir (fitil delmesi kırılma sayılmaz)."""
+    if df is None or len(df) < 40:
+        return []
+    df = df.tail(GUN_SAYISI)
+    alt = df["Low"].to_numpy(dtype=float)
+    kap = df["Close"].to_numpy(dtype=float)
+    son = len(df) - 1
+    if fiyat is None:
+        fiyat = float(kap[-1])
+    n = TREND_PIVOT_N
+    dipler = [i for i in range(n, len(df) - n) if alt[i] == alt[i - n:i + n + 1].min()]
+    bulunanlar = []
+    for a in range(len(dipler)):
+        for b in range(a + 1, len(dipler)):
+            i, j = dipler[a], dipler[b]
+            if j - i < TREND_MIN_GUN or alt[j] <= alt[i]:
+                continue
+            egim = (alt[j] - alt[i]) / (j - i)
+            cizgi = alt[i] + egim * (np.arange(i, son + 1) - i)
+            if (kap[i:] < cizgi * (1 - TREND_KIRILIM)).any():      # kapanışla kırılmış
+                continue
+            if (alt[i:] < cizgi * 0.97).any():                     # fitil çok derin delmiş
+                continue
+            yakin = np.flatnonzero(np.abs(alt[i:] / cizgi - 1) <= TREND_TOL) + i
+            temaslar = []
+            for t in yakin:
+                if not temaslar or t - temaslar[-1] >= 3:
+                    temaslar.append(int(t))
+            if len(temaslar) < TREND_EN_AZ_TEMAS:
+                continue
+            deger = float(cizgi[-1])
+            if fiyat < deger * (1 - TREND_KIRILIM):                # güncel fiyat çizginin altında
+                continue
+            bulunanlar.append(dict(
+                deger=deger, baslangic=df.index[i].strftime("%Y-%m-%d"), uzunluk=son - i,
+                temas=len(temaslar), son_temas_gun=son - temaslar[-1],
+                mesafe=max(0.0, (fiyat / deger - 1) * 100)))
+    # bugünkü değeri birbirine %1,5'ten yakın olan çizgilerden en çok temaslıyı tut
+    kalan = []
+    for r in sorted(bulunanlar, key=lambda r: (r["temas"], r["uzunluk"]), reverse=True):
+        if any(abs(r["deger"] / k["deger"] - 1) < 0.015 for k in kalan):
+            continue
+        kalan.append(r)
+    return sorted(kalan, key=lambda r: r["mesafe"])
+
+
+def dusen_trend(df, fiyat=None):
+    """Genel yön aşağı mı? En yüksek kapanıştan başlayan, kapanışla kırılmamış, en az 3 temaslı
+    düşen trend çizgisi varsa ve fiyat hâlâ çizginin altındaysa o çizgiyi döndürür, yoksa None."""
+    if df is None or len(df) < 60:
+        return None
+    df = df.tail(GUN_SAYISI)
+    kap = df["Close"].to_numpy(dtype=float)
+    ust = df["High"].to_numpy(dtype=float)
+    son = len(df) - 1
+    if fiyat is None:
+        fiyat = float(kap[-1])
+    h = int(np.argmax(kap))                               # zirve: en yüksek kapanış
+    if son - h < DUSEN_MIN_GUN:
+        return None
+    n = TREND_PIVOT_N
+    en_iyi = None
+    for j in range(max(h + TREND_MIN_GUN, n), son - n + 1):
+        if kap[j] >= kap[h] or kap[j] != kap[j - n:j + n + 1].max():
+            continue
+        egim = (kap[j] - kap[h]) / (j - h)
+        cizgi = kap[h] + egim * (np.arange(h, son + 1) - h)
+        if (kap[h:] > cizgi * (1 + TREND_KIRILIM)).any():   # kapanışla kırılmış
+            continue
+        if (ust[h:] > cizgi * 1.04).any():                  # fitil çok yukarı delmiş
+            continue
+        yakin = np.flatnonzero(np.abs(kap[h:] / cizgi - 1) <= TREND_TOL) + h
+        temaslar = []
+        for t in yakin:
+            if not temaslar or t - temaslar[-1] >= 3:
+                temaslar.append(int(t))
+        if len(temaslar) < TREND_EN_AZ_TEMAS:
+            continue
+        deger = float(cizgi[-1])
+        if fiyat > deger * (1 + TREND_KIRILIM):              # fiyat şu an çizginin üstüne çıkmış
+            continue
+        aday = dict(deger=deger, baslangic=df.index[h].strftime("%Y-%m-%d"), temas=len(temaslar),
+                    mesafe=max(0.0, (deger / fiyat - 1) * 100))
+        if en_iyi is None or aday["temas"] > en_iyi["temas"]:
+            en_iyi = aday
+    return en_iyi
+
+
 def ayrinti_yazdir(sembol, merkez):
     """Hata ayıklama: merkez fiyatın %6 çevresindeki tüm dip/tepe noktalarını tarihleriyle yazdırır."""
     df = veri_cek_gunluk(sembol)
@@ -150,6 +249,20 @@ def seviye_yazdir(sembol):
         print(f"  seviye {r['seviye']:.2f}  (bölge {r['alt']:.2f}-{r['ust']:.2f})  "
               f"temas {r['temas']} (dip {r['dip']}, tepe {r['tepe']})  "
               f"son temas {r['son_temas_gun']} gün önce  fiyata uzaklık %{r['mesafe']:.1f}")
+    trendler = [r for r in yukselen_trendler(df, fiyat) if r["mesafe"] <= MAX_UZAKLIK]
+    dt = dusen_trend(df, fiyat)
+    if dt:
+        print(f"  genel yön: AŞAĞI  (düşen trend çizgisi bugün {dt['deger']:.2f}, başlangıç {dt['baslangic']}, "
+              f"temas {dt['temas']}; fiyat çizginin %{dt['mesafe']:.1f} altında)")
+        print("  -- yükselen trend çizgileri (ELENDİ: genel yön aşağı, bildirilmez) --")
+    else:
+        print("  genel yön: aşağı değil (kırılmamış düşen trend çizgisi bulunamadı)")
+        print("  -- yükselen trend çizgileri --")
+    if not trendler:
+        print("  geçerli yükselen trend çizgisi bulunamadı")
+    for r in trendler:
+        print(f"  çizgi bugün {r['deger']:.2f}  başlangıç {r['baslangic']} ({r['uzunluk']} gün)  "
+              f"temas {r['temas']}  son temas {r['son_temas_gun']} gün önce  fiyata uzaklık %{r['mesafe']:.1f}")
 
 
 if __name__ == "__main__":
