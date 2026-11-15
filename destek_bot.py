@@ -54,6 +54,11 @@ HACIM_DILIM = 0.5        # fiyat dilimi genişliği (%): fiyat aralığı bu ora
 HACIM_EN_AZ_KAT = 2.0    # düğüm sayılması için dilimin hacmi, ortalama dilim hacminin en az bu kadar katı olmalı (sahte veride gürültü 1,7-2,2 kata çıktı; gerçek veride gözleyip ayarlanacak)
 HACIM_BOLGE_ORAN = 0.7   # düğüm bölgesi: tepe dilimin hacminin en az %70'i olan komşu dilimler (her yana en fazla 3 dilim)
 HACIM_MAX_DUGUM = 3      # en fazla kaç düğüm gösterilir (fiyata en yakın olanlar)
+ATR_UZUNLUK = 14         # günlük ATR uzunluğu (yaklaşma mesafesi için oynaklık ölçüsü)
+ATR_KAT = 1.0            # yaklaşma eşiği = ATR% x bu kat (hisse oynaksa eşik geniş, sakinse dar)
+YAKIN_MIN = 1.0          # yaklaşma eşiği en az %1
+YAKIN_MAX = 4.0          # yaklaşma eşiği en çok %4
+KESISIM_TOL = 0.003      # iki bölge arası bu orandan yakınsa (%0,3) kesişiyor sayılır
 
 
 def veri_cek_gunluk(sembol):
@@ -228,6 +233,78 @@ def hacim_mumlari(df, ham):
         if len(h) >= HACIM_GUN * 4 and float(h["Volume"].sum()) > 0:
             return h, "saatlik"
     return df.tail(HACIM_GUN), "günlük"
+
+
+def atr_yuzde(df, n=ATR_UZUNLUK):
+    """Günlük ATR (Wilder) / son kapanış, yüzde olarak. Veri kısaysa None."""
+    if df is None or len(df) < n + 2:
+        return None
+    h = df["High"].to_numpy(dtype=float)
+    l = df["Low"].to_numpy(dtype=float)
+    c = df["Close"].to_numpy(dtype=float)
+    tr = np.maximum(h[1:] - l[1:], np.maximum(abs(h[1:] - c[:-1]), abs(l[1:] - c[:-1])))
+    atr = tr[:n].mean()
+    for t in tr[n:]:
+        atr = (atr * (n - 1) + t) / n
+    return float(atr / c[-1] * 100)
+
+
+def yakinlik_esigi(df):
+    """(yaklaşma eşiği %, ATR %). Eşik = ATR% x ATR_KAT, YAKIN_MIN ile YAKIN_MAX arasına sıkıştırılır.
+    ATR hesaplanamazsa eşik %2 (eski sabit değer)."""
+    a = atr_yuzde(df)
+    if a is None:
+        return 2.0, None
+    return float(min(max(ATR_KAT * a, YAKIN_MIN), YAKIN_MAX)), a
+
+
+def kesisim_bolgeleri(parcalar, fiyat, esik):
+    """parcalar: [(arac_adi, alt, ust)]. Fiyatın altındaki ya da fiyatı içine alan parçalardan, birbirine
+    değen/çok yakın olanları tek bölgede toplar. Her bölge: alt, ust, araclar (benzersiz araç adları, sayısı = puan),
+    mesafe (% , fiyat bölgenin içindeyse 0), yakin (mesafe <= eşik). Fiyata yakından uzağa sıralı."""
+    p = sorted([x for x in parcalar if x[1] <= fiyat], key=lambda x: x[1])
+    gruplar = []
+    for ad, alt, ust in p:
+        if gruplar and alt <= gruplar[-1]["ust"] * (1 + KESISIM_TOL):
+            g = gruplar[-1]
+            g["ust"] = max(g["ust"], ust)
+            if ad not in g["araclar"]:
+                g["araclar"].append(ad)
+        else:
+            gruplar.append(dict(alt=alt, ust=ust, araclar=[ad]))
+    for g in gruplar:
+        g["mesafe"] = 0.0 if g["ust"] >= fiyat else (fiyat / g["ust"] - 1) * 100
+        g["yakin"] = g["mesafe"] <= esik
+    return sorted(gruplar, key=lambda g: g["mesafe"])
+
+
+def ozet_yazdir(df, fiyat, yatay, trendler, dt, eb, dugumler, bloklar, nb):
+    """Tüm destek araçlarını tek tabloda toplar: kesişim puanı (kaç farklı araç aynı bölgede) ve ATR'ye göre yakınlık."""
+    esik, atr = yakinlik_esigi(df)
+    atr_txt = f"ATR{ATR_UZUNLUK} %{atr:.1f}" if atr is not None else "ATR hesaplanamadı"
+    print(f"  -- ÖZET: kesişen destekler ({atr_txt} -> yaklaşma eşiği %{esik:.1f}) --")
+    parca = []
+    for r in yatay:
+        parca.append(("Yatay destek", r["alt"], r["ust"]))
+    if not dt:                                           # genel yön aşağıyken yükselen trend desteği sayılmaz
+        for r in trendler:
+            parca.append(("Yükselen trend", r["deger"] * 0.995, r["deger"] * 1.005))
+    if eb:
+        parca.append(("EMA200", eb["deger"] * 0.995, eb["deger"] * 1.005))
+    for x in dugumler:
+        parca.append(("Hacim düğümü", x["alt"], x["ust"]))
+    for b in (bloklar or []):
+        if b["tur"] == "boga":
+            parca.append(("SMC mavi blok", b["alt"], b["ust"]))
+    if nb:
+        parca.append(("NW alt bant", nb["alt"] * 0.995, nb["alt"] * 1.005))
+    gruplar = [g for g in kesisim_bolgeleri(parca, fiyat, esik) if g["mesafe"] <= MAX_UZAKLIK]
+    if not gruplar:
+        print("  fiyatın altında ya da içinde destek bölgesi yok")
+    for g in gruplar[:6]:
+        durum = "YAKIN" if g["yakin"] else "uzak"
+        konum = "fiyat bölgenin İÇİNDE" if g["mesafe"] == 0 else f"fiyata uzaklık %{g['mesafe']:.1f}"
+        print(f"  bölge {g['alt']:.2f}-{g['ust']:.2f}  {len(g['araclar'])} araç ({', '.join(g['araclar'])})  {konum}  [{durum}]")
 
 
 def yukselen_trendler(df, fiyat=None):
@@ -790,6 +867,7 @@ def seviye_yazdir(sembol):
     df4 = veri_cek_4saat(sembol, df, ham)
     if df4 is None or len(df4) < 100:
         print("  -- 4 saatlik veri alınamadı --")
+        ozet_yazdir(df, fiyat, liste, trendler, dt, eb, dugumler, [], None)
         return
     print(f"  -- 4 saatlik mumlar (TradingView ile karşılaştırmak için son 6; toplam {len(df4)} mum, "
           f"bunların {df4.attrs.get('bes_dk_mum', 0)} tanesi 5 dakikalık veriden) --")
@@ -825,6 +903,7 @@ def seviye_yazdir(sembol):
         tarihler = dfn.index[::-1]
         isaretler = sorted(z["sinyaller"], key=lambda x: -x[0])[-14:]
         print("  son işaretler (eskiden yeniye): " + ", ".join(f"{t} {tarihler[i]:%m-%d %H:%M}" for i, t in isaretler))
+    ozet_yazdir(df, fiyat, liste, trendler, dt, eb, dugumler, bloklar, nb)
 
 
 if __name__ == "__main__":
