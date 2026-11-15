@@ -149,11 +149,12 @@ def yatay_destekler(df, fiyat=None):
     return sorted(kalan, key=lambda r: r["mesafe"])
 
 
-def hacim_dugumleri(df, fiyat=None):
+def hacim_dugumleri(df, fiyat=None, hepsi=False):
     """Hacim profili: son HACIM_GUN günde en çok hacmin işlem gördüğü fiyat bölgeleri (düğümler).
     Her günün hacmi, o günün en düşük-en yüksek aralığına eşit dağıtılır (gün içi dağılım bilinmediği için tahmin).
     Yalnız fiyatın altındaki (ya da fiyatı içine alan) düğümler döner, fiyata yakından uzağa.
-    Her düğüm: merkez, alt, ust, kat (ortalama dilim hacminin kaç katı), pay (toplam hacmin %'si), mesafe (%)."""
+    Her düğüm: merkez, alt, ust, kat (ortalama dilim hacminin kaç katı), pay (toplam hacmin %'si), mesafe (%).
+    hepsi=True: tanı için; fiyatın üstündekiler ve zayıflar da dahil, en güçlü 3 düğüm (kata göre) döner."""
     if df is None or len(df) < 40:
         return []
     d = df.tail(HACIM_GUN)
@@ -191,7 +192,7 @@ def hacim_dugumleri(df, fiyat=None):
     for i in range(n):
         sol = duz[i - 1] if i > 0 else -1.0
         sag = duz[i + 1] if i < n - 1 else -1.0
-        if duz[i] > sol and duz[i] >= sag and duz[i] >= HACIM_EN_AZ_KAT * ort:
+        if duz[i] > sol and duz[i] >= sag and duz[i] >= (1.0 if hepsi else HACIM_EN_AZ_KAT) * ort:
             adaylar.append(i)
     sonuc = []
     for i in sorted(adaylar, key=lambda i: duz[i], reverse=True):     # güçlüden zayıfa
@@ -202,13 +203,15 @@ def hacim_dugumleri(df, fiyat=None):
             r += 1
         alt, ust = float(kenar[l]), float(kenar[r + 1])
         merkez = float(np.sqrt(kenar[i] * kenar[i + 1]))
-        if alt > fiyat:                                                # fiyatın üstünde: destek değil
+        if alt > fiyat and not hepsi:                                  # fiyatın üstünde: destek değil
             continue
         if any(abs(merkez / k["merkez"] - 1) < MIN_ARALIK for k in sonuc):
             continue
         sonuc.append(dict(merkez=merkez, alt=alt, ust=ust, kat=float(duz[i] / ort),
                           pay=float(profil[l:r + 1].sum() / toplam * 100),
                           mesafe=0.0 if ust >= fiyat else (fiyat / ust - 1) * 100))
+    if hepsi:
+        return sorted(sonuc, key=lambda x: x["kat"], reverse=True)[:3]
     sonuc = [x for x in sonuc if x["mesafe"] <= MAX_UZAKLIK]
     return sorted(sonuc, key=lambda x: x["mesafe"])[:HACIM_MAX_DUGUM]
 
@@ -756,6 +759,16 @@ def seviye_yazdir(sembol):
     dugumler = hacim_dugumleri(df, fiyat)
     if not dugumler:
         print("  fiyatın altında belirgin hacim düğümü yok")
+        d120 = df.tail(HACIM_GUN)
+        print(f"  (tanı: son {len(d120)} günün {int((d120['Volume'] > 0).sum())} tanesinde hacim var; filtresiz en güçlü düğümler:)")
+        for x in hacim_dugumleri(df, fiyat, hepsi=True):
+            if x["alt"] > fiyat:
+                konum = f"fiyatın %{(x['alt'] / fiyat - 1) * 100:.1f} üstünde"
+            elif x["ust"] >= fiyat:
+                konum = "fiyatın içinde"
+            else:
+                konum = f"fiyatın %{(fiyat / x['ust'] - 1) * 100:.1f} altında"
+            print(f"    {x['merkez']:.2f}  (bölge {x['alt']:.2f}-{x['ust']:.2f})  ortalama dilimin {x['kat']:.1f} katı  {konum}")
     for x in dugumler:
         print(f"  düğüm {x['merkez']:.2f}  (bölge {x['alt']:.2f}-{x['ust']:.2f})  ortalama dilimin {x['kat']:.1f} katı  "
               f"toplam hacmin %{x['pay']:.1f}'i  fiyata uzaklık %{x['mesafe']:.1f}")
