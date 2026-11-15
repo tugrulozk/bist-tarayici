@@ -14,6 +14,7 @@ Kurallar (kullanıcıyla netleşenler):
 - Genel yön aşağıysa (en yüksek kapanıştan inen, kırılmamış düşen trend çizgisi varsa) yükselen trend çizgileri bildirilmez.
 - EMA200 (günlük): fiyat yukarıdan gelip EMA200'e dokunur ya da %2 yaklaşırsa tek başına bildirim konusu; diğer bildirimlerde uzaklığı not olarak yazılır.
 - Sadece fiyatın altında kalan (ya da fiyatı içine alan) bölgeler destek sayılır.
+- Hacim düğümü (günlük, son 120 gün): en çok hacmin işlem gördüğü fiyat bölgeleri; fiyatın altındaysa destek adayı. Günlük veriden tahmindir (gün içi dağılım bilinmez).
 """
 import sys
 import time
@@ -48,6 +49,11 @@ NW_YAKIN = 1.5           # fiyat alt bandın en fazla bu kadar % üstündeyse "y
 NW_SINYAL_MUM = 3        # ▲ işareti son bu kadar mum içindeyse "sinyal" (son mumda işaret oluşmaz, bir sonraki mumu bekler)
 GUN_SAYISI = 250     # son kaç günlük mum incelenir
 MAX_UZAKLIK = 30.0   # yazdırırken fiyattan en fazla %30 uzaktaki seviyeler gösterilir
+HACIM_GUN = 120          # hacim profili için son kaç günlük mum (kısa vade için)
+HACIM_DILIM = 0.5        # fiyat dilimi genişliği (%): fiyat aralığı bu oranda dilimlere bölünür
+HACIM_EN_AZ_KAT = 2.0    # düğüm sayılması için dilimin hacmi, ortalama dilim hacminin en az bu kadar katı olmalı (sahte veride gürültü 1,7-2,2 kata çıktı; gerçek veride gözleyip ayarlanacak)
+HACIM_BOLGE_ORAN = 0.7   # düğüm bölgesi: tepe dilimin hacminin en az %70'i olan komşu dilimler (her yana en fazla 3 dilim)
+HACIM_MAX_DUGUM = 3      # en fazla kaç düğüm gösterilir (fiyata en yakın olanlar)
 
 
 def veri_cek_gunluk(sembol):
@@ -141,6 +147,70 @@ def yatay_destekler(df, fiyat=None):
             continue
         kalan.append(r)
     return sorted(kalan, key=lambda r: r["mesafe"])
+
+
+def hacim_dugumleri(df, fiyat=None):
+    """Hacim profili: son HACIM_GUN günde en çok hacmin işlem gördüğü fiyat bölgeleri (düğümler).
+    Her günün hacmi, o günün en düşük-en yüksek aralığına eşit dağıtılır (gün içi dağılım bilinmediği için tahmin).
+    Yalnız fiyatın altındaki (ya da fiyatı içine alan) düğümler döner, fiyata yakından uzağa.
+    Her düğüm: merkez, alt, ust, kat (ortalama dilim hacminin kaç katı), pay (toplam hacmin %'si), mesafe (%)."""
+    if df is None or len(df) < 40:
+        return []
+    d = df.tail(HACIM_GUN)
+    alt_f = d["Low"].to_numpy(dtype=float)
+    ust_f = d["High"].to_numpy(dtype=float)
+    hac = d["Volume"].to_numpy(dtype=float)
+    lo, hi = float(alt_f.min()), float(ust_f.max())
+    if fiyat is None:
+        fiyat = float(d["Close"].iloc[-1])
+    if lo <= 0 or hi <= lo or not np.isfinite(hac).any() or hac.sum() <= 0:
+        return []
+    oran = 1 + HACIM_DILIM / 100
+    n = int(np.ceil(np.log(hi / lo) / np.log(oran)))
+    if n < 10:
+        return []
+    kenar = lo * oran ** np.arange(n + 1)
+    kenar[-1] = max(kenar[-1], hi)
+    profil = np.zeros(n)
+    for dusuk, yuksek, v in zip(alt_f, ust_f, hac):
+        if not (v > 0) or not np.isfinite(v):
+            continue
+        if yuksek <= dusuk:                      # tek fiyatlı mum: hacim tek dilime
+            i = min(max(int(np.searchsorted(kenar, dusuk, side="right")) - 1, 0), n - 1)
+            profil[i] += v
+            continue
+        a = np.maximum(kenar[:-1], dusuk)
+        u = np.minimum(kenar[1:], yuksek)
+        kes = np.clip(u - a, 0, None)
+        if kes.sum() > 0:
+            profil += v * kes / kes.sum()
+    toplam = profil.sum()
+    duz = np.convolve(np.pad(profil, 1, mode="edge"), [0.25, 0.5, 0.25], mode="valid")   # hafif düzeltme
+    ort = duz.mean()
+    adaylar = []
+    for i in range(n):
+        sol = duz[i - 1] if i > 0 else -1.0
+        sag = duz[i + 1] if i < n - 1 else -1.0
+        if duz[i] > sol and duz[i] >= sag and duz[i] >= HACIM_EN_AZ_KAT * ort:
+            adaylar.append(i)
+    sonuc = []
+    for i in sorted(adaylar, key=lambda i: duz[i], reverse=True):     # güçlüden zayıfa
+        l = r = i
+        while l > 0 and i - l < 3 and duz[l - 1] >= HACIM_BOLGE_ORAN * duz[i]:
+            l -= 1
+        while r < n - 1 and r - i < 3 and duz[r + 1] >= HACIM_BOLGE_ORAN * duz[i]:
+            r += 1
+        alt, ust = float(kenar[l]), float(kenar[r + 1])
+        merkez = float(np.sqrt(kenar[i] * kenar[i + 1]))
+        if alt > fiyat:                                                # fiyatın üstünde: destek değil
+            continue
+        if any(abs(merkez / k["merkez"] - 1) < MIN_ARALIK for k in sonuc):
+            continue
+        sonuc.append(dict(merkez=merkez, alt=alt, ust=ust, kat=float(duz[i] / ort),
+                          pay=float(profil[l:r + 1].sum() / toplam * 100),
+                          mesafe=0.0 if ust >= fiyat else (fiyat / ust - 1) * 100))
+    sonuc = [x for x in sonuc if x["mesafe"] <= MAX_UZAKLIK]
+    return sorted(sonuc, key=lambda x: x["mesafe"])[:HACIM_MAX_DUGUM]
 
 
 def yukselen_trendler(df, fiyat=None):
@@ -682,6 +752,13 @@ def seviye_yazdir(sembol):
             print("  (not: geçmiş veri kısa, EMA200 TradingView'dakinden küçük farklı çıkabilir)")
     else:
         print(f"  EMA{EMA_UZUNLUK} hesaplanamadı (en az ~220 günlük veri gerekir)")
+    print(f"  -- hacim düğümleri (günlük, son {HACIM_GUN} gün; gün içi dağılım tahmin) --")
+    dugumler = hacim_dugumleri(df, fiyat)
+    if not dugumler:
+        print("  fiyatın altında belirgin hacim düğümü yok")
+    for x in dugumler:
+        print(f"  düğüm {x['merkez']:.2f}  (bölge {x['alt']:.2f}-{x['ust']:.2f})  ortalama dilimin {x['kat']:.1f} katı  "
+              f"toplam hacmin %{x['pay']:.1f}'i  fiyata uzaklık %{x['mesafe']:.1f}")
     ham = ham_veriler(sembol)
     df4 = veri_cek_4saat(sembol, df, ham)
     if df4 is None or len(df4) < 100:
