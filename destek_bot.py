@@ -926,6 +926,7 @@ RSI_UZUNLUK = 14
 MFI_UZUNLUK = 14
 BB_UZUNLUK = 20
 BB_CARPAN = 2.0
+MFI_KULLAN = True        # AÇIK (kullanıcı kararı): ASELS'te TradingView ile ~8 puan fark çıktı (bot 56,9, TradingView 65,0); hacim verisi incelenecek, mesajlarda 'yaklaşık' diye işaretlenir.
 RSI_ASIRI = 30.0
 MFI_ASIRI = 20.0
 UYUMSUZLUK_PENCERE = 60  # uyumsuzluk için bakılan son mum sayısı (4 saatlik)
@@ -1199,7 +1200,7 @@ def teyit_hesapla(df4, simdi, nb=None):
     h, l, c, o = (df4[k].to_numpy(dtype=float) for k in ("High", "Low", "Close", "Open"))
     v = df4["Volume"].to_numpy(dtype=float)
     rsi = rsi_serisi(c)
-    mfi = mfi_serisi(h, l, c, v) if np.nansum(v) > 0 else None
+    mfi = mfi_serisi(h, l, c, v) if MFI_KULLAN and np.nansum(v) > 0 else None
     satirlar = []
     yb = yutan_boga(df4, simdi)
     if yb:
@@ -1207,13 +1208,13 @@ def teyit_hesapla(df4, simdi, nb=None):
     if rsi is not None and pozitif_uyumsuzluk(l, rsi):
         satirlar.append("RSI pozitif uyumsuzluk (fiyat daha düşük dip, RSI daha yüksek dip)")
     if mfi is not None and pozitif_uyumsuzluk(l, mfi):
-        satirlar.append("MFI pozitif uyumsuzluk (fiyat daha düşük dip, MFI daha yüksek dip)")
+        satirlar.append("MFI pozitif uyumsuzluk (fiyat daha düşük dip, MFI daha yüksek dip; MFI yaklaşık)")
     rsi_son = float(rsi[-1]) if rsi is not None and not np.isnan(rsi[-1]) else None
     mfi_son = float(mfi[-1]) if mfi is not None and not np.isnan(mfi[-1]) else None
     if rsi_son is not None and rsi_son < RSI_ASIRI:
         satirlar.append(f"RSI aşırı satımda ({_t(rsi_son, 1)})")
     if mfi_son is not None and mfi_son < MFI_ASIRI:
-        satirlar.append(f"MFI aşırı satımda ({_t(mfi_son, 1)})")
+        satirlar.append(f"MFI aşırı satımda ({_t(mfi_son, 1)}; MFI yaklaşık)")
     bb = bollinger_alt(c)
     if bb is not None:
         if c[-1] < bb:
@@ -1226,7 +1227,7 @@ def teyit_hesapla(df4, simdi, nb=None):
     if rsi_son is not None:
         parcalar.append(f"RSI {_t(rsi_son, 1)}")
     if mfi_son is not None:
-        parcalar.append(f"MFI {_t(mfi_son, 1)}")
+        parcalar.append(f"MFI {_t(mfi_son, 1)} (yaklaşık)")
     return dict(satirlar=satirlar, bilgi=" | ".join(parcalar) if parcalar else "")
 
 
