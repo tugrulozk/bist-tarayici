@@ -1,0 +1,45 @@
+name: Destek Tara
+
+on:
+  schedule:
+    - cron: "*/30 7-15 * * 1-5"
+  workflow_dispatch:
+    inputs:
+      mod:
+        description: "mesaj-test ya da tara"
+        default: "mesaj-test"
+      hisseler:
+        description: "Boşluklu hisse kodları (boşsa hisseler.txt'deki hepsi; yalnız tara için)"
+        default: ""
+      zorla:
+        description: "Seans dışında da çalıştır (true ya da false)"
+        default: "false"
+
+concurrency:
+  group: destek-tara
+  cancel-in-progress: false
+
+jobs:
+  tara:
+    runs-on: ubuntu-latest
+    timeout-minutes: 40
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+      - run: pip install yfinance pandas numpy
+      - name: Durum onbellegi
+        uses: actions/cache@v4
+        with:
+          path: durum_destek
+          key: destek-durum-${{ github.run_id }}
+          restore-keys: destek-durum-
+      - name: Calistir
+        env:
+          DESTEK_TELEGRAM_TOKEN: ${{ secrets.DESTEK_TELEGRAM_TOKEN }}
+          DESTEK_TELEGRAM_SOHBET: ${{ secrets.DESTEK_TELEGRAM_SOHBET }}
+          HISSELER: ${{ inputs.hisseler }}
+          ZORLA: ${{ inputs.zorla }}
+          MOD: ${{ inputs.mod }}
+        run: python destek_bot.py "${MOD:-tara}"
