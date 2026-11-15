@@ -2,8 +2,12 @@
 
 bildirim.py'ye dokunmaz, ondan bağımsız çalışır.
 
-Kullanım (şimdilik sadece seviye yazdırma):
-    python destek_bot.py seviye ASELS BIMAS INVES TRALT
+Kullanım:
+    python destek_bot.py seviye ASELS BIMAS INVES TRALT     (test: seviyeleri yazdırır)
+    python destek_bot.py mesaj-test                        (Telegram bağlantısını dener, tek mesaj yollar)
+    python destek_bot.py tara                              (canlı: tüm hisseleri tarar, takibe alınacakları Telegram'a yollar)
+    Ortam değişkenleri: DESTEK_TELEGRAM_TOKEN, DESTEK_TELEGRAM_SOHBET (zorunlu), HISSELER (boşlukla; boşsa hisseler.txt),
+    ZORLA=true (seans saati dışında da çalıştır).
 
 Kurallar (kullanıcıyla netleşenler):
 - Günlük grafikte dip ve tepelerin fitil uçları aday seviyedir.
@@ -16,8 +20,12 @@ Kurallar (kullanıcıyla netleşenler):
 - Sadece fiyatın altında kalan (ya da fiyatı içine alan) bölgeler destek sayılır.
 - Hacim düğümü (son 120 gün): en çok hacmin işlem gördüğü fiyat bölgeleri; fiyatın altındaysa destek adayı. Saatlik veriden hesaplanır (yoksa günlük veriden; günlükte gün içi dağılım tahmindir).
 """
+import json
+import os
 import sys
 import time
+import urllib.error
+import urllib.request
 
 import numpy as np
 import pandas as pd
@@ -906,6 +914,299 @@ def seviye_yazdir(sembol):
     ozet_yazdir(df, fiyat, liste, trendler, dt, eb, dugumler, bloklar, nb)
 
 
+# ===================== CANLI MOD (tara) =====================
+MAX_ADAY = 40            # 1. aşamadan 2. aşamaya (ayrıntılı analiz) en fazla kaç hisse geçer
+MAX_MESAJ = 15           # bir çalışmada en fazla kaç Telegram mesajı
+ADAY_PAYI = 1.5          # 1. aşamada (yalnız günlük veri) eşiğe eklenen pay (%), aday kaçırmamak için
+DURUM_DOSYASI = os.path.join("durum_destek", "durum.json")
+
+
+def _t(x, n=2):
+    """Türkçe sayı biçimi: 395.75 -> 395,75"""
+    return f"{x:.{n}f}".replace(".", ",")
+
+
+def hisse_listesi():
+    """hisseler.txt: boşluk, virgül ya da satırlarla ayrılmış kodlar; '#' ile başlayan satır yorum; '.IS' eki atılır."""
+    yol = os.path.join(os.path.dirname(os.path.abspath(__file__)), "hisseler.txt")
+    kodlar = []
+    with open(yol, encoding="utf-8") as f:
+        for satir in f:
+            satir = satir.split("#", 1)[0]
+            for k in satir.replace(",", " ").split():
+                k = k.strip().upper()
+                if k.endswith(".IS"):
+                    k = k[:-3]
+                if k and k not in kodlar:
+                    kodlar.append(k)
+    return kodlar
+
+
+def seans_icinde(simdi):
+    """Hafta içi 09:55-18:20 (İstanbul saati). Resmî tatilleri bilmez; tatilde veri değişmediği için en kötü ihtimalle boşa çalışır."""
+    dk = simdi.hour * 60 + simdi.minute
+    return simdi.weekday() < 5 and 9 * 60 + 55 <= dk <= 18 * 60 + 20
+
+
+def telegram_gonder(metin):
+    """Mesajı yollar. Başarılıysa True. Token hiçbir yere yazdırılmaz."""
+    token = os.environ.get("DESTEK_TELEGRAM_TOKEN", "").strip()
+    sohbet = os.environ.get("DESTEK_TELEGRAM_SOHBET", "").strip()
+    if not token or not sohbet:
+        print("Telegram bilgileri (secret) tanımlı değil")
+        return False
+    veri = json.dumps({"chat_id": sohbet, "text": metin, "disable_web_page_preview": True}).encode("utf-8")
+    istek = urllib.request.Request(f"https://api.telegram.org/bot{token}/sendMessage", data=veri,
+                                   headers={"Content-Type": "application/json"})
+    try:
+        with urllib.request.urlopen(istek, timeout=20) as yanit:
+            return yanit.status == 200
+    except urllib.error.HTTPError as e:
+        try:
+            govde = e.read().decode("utf-8", "replace")[:200]
+        except Exception:
+            govde = ""
+        print(f"Telegram hatası: HTTP {e.code} {govde}")
+    except Exception as e:
+        print(f"Telegram hatası: {type(e).__name__}")
+    return False
+
+
+def durum_oku(bugun):
+    try:
+        with open(DURUM_DOSYASI, encoding="utf-8") as f:
+            d = json.load(f)
+        if d.get("gun") == bugun:
+            return d
+    except Exception:
+        pass
+    return {"gun": bugun, "gonderilen": []}
+
+
+def durum_yaz(d):
+    os.makedirs(os.path.dirname(DURUM_DOSYASI), exist_ok=True)
+    with open(DURUM_DOSYASI, "w", encoding="utf-8") as f:
+        json.dump(d, f, ensure_ascii=False)
+
+
+def gunluk_toplu(semboller, parca=80):
+    """1. aşama için günlük veriyi toplu çeker: {sembol: DataFrame}. Alınamayanlar sonuca girmez."""
+    sonuc = {}
+    for i in range(0, len(semboller), parca):
+        grup = semboller[i:i + parca]
+        veri = None
+        for deneme in range(2):
+            try:
+                veri = yf.download(" ".join(x + ".IS" for x in grup), period="3y", interval="1d",
+                                   auto_adjust=False, group_by="ticker", progress=False, threads=True)
+            except Exception:
+                veri = None
+            if veri is not None and not veri.empty:
+                break
+            time.sleep(2)
+        if veri is None or veri.empty:
+            continue
+        for x in grup:
+            try:
+                if isinstance(veri.columns, pd.MultiIndex):
+                    if (x + ".IS") not in veri.columns.get_level_values(0):
+                        continue
+                    d = veri[x + ".IS"]
+                else:
+                    d = veri
+                d = d[["Open", "High", "Low", "Close", "Volume"]].dropna()
+                if len(d) >= 60:
+                    sonuc[x] = d
+            except Exception:
+                pass
+    return sonuc
+
+
+def aday_puani(df):
+    """1. aşama (yalnız günlük veri, ucuz): (puan, aday_mi). Yatay destek, yükselen trend ve EMA200'e bakar."""
+    fiyat = float(df["Close"].iloc[-1])
+    esik, _ = yakinlik_esigi(df)
+    esik += ADAY_PAYI
+    parca = [("Yatay destek", r["alt"], r["ust"]) for r in yatay_destekler(df, fiyat)]
+    if not dusen_trend(df, fiyat):
+        parca += [("Yükselen trend", r["deger"] * 0.995, r["deger"] * 1.005) for r in yukselen_trendler(df, fiyat)]
+    eb = ema200_bilgi(df, fiyat, float(df["Low"].iloc[-1]))
+    if eb:
+        parca.append(("EMA200", eb["deger"] * 0.995, eb["deger"] * 1.005))
+    yakin = [g for g in kesisim_bolgeleri(parca, fiyat, esik) if g["yakin"]]
+    ema_tetik = bool(eb) and eb["durum"] != "yok"
+    puan = (max(len(g["araclar"]) for g in yakin) if yakin else 0) + (1 if ema_tetik else 0)
+    return puan, bool(yakin) or ema_tetik
+
+
+def _mesafe(fiyat, alt, ust):
+    return 0.0 if alt <= fiyat <= ust else (fiyat / ust - 1) * 100
+
+
+def _konum(m):
+    return "fiyat bölgenin içinde" if m == 0 else f"fiyat bölgenin %{_t(m, 1)} üstünde"
+
+
+def analiz(sembol, df):
+    """2. aşama: tüm araçlarla ayrıntılı analiz. Dönüş: mesaj için gereken her şey (sözlük)."""
+    fiyat, bugun_alt, _ = gun_ici_bilgi(sembol, df)
+    esik, atr = yakinlik_esigi(df)
+    yatay = [r for r in yatay_destekler(df, fiyat) if r["mesafe"] <= MAX_UZAKLIK]
+    dt = dusen_trend(df, fiyat)
+    trendler = [] if dt else [r for r in yukselen_trendler(df, fiyat) if r["mesafe"] <= MAX_UZAKLIK]
+    eb = ema200_bilgi(df, fiyat, bugun_alt)
+    ham = ham_veriler(sembol)
+    hmum, _ = hacim_mumlari(df, ham)
+    dugumler = hacim_dugumleri(df, fiyat, mumlar=hmum)
+    df4 = veri_cek_4saat(sembol, df, ham)
+    bloklar = smc_order_bloklar(df4) if df4 is not None and len(df4) >= 100 else []
+    dfn = nw_serisi(ham, df)
+    if dfn is None or len(dfn) < 100:
+        dfn = df4
+    nb = nw_bilgi(dfn, fiyat) if dfn is not None and len(dfn) >= 100 else None
+
+    parcalar = []      # (ad, alt, ust, mesafe, metin); yalnız fiyatın altında/içinde olanlar
+    def ekle(ad, alt, ust, mesafe, metin):
+        if alt <= fiyat:
+            parcalar.append((ad, alt, ust, mesafe, metin))
+    for r in yatay:
+        m = _mesafe(fiyat, r["alt"], r["ust"])
+        ekle("Yatay destek", r["alt"], r["ust"], m,
+             f"Yatay destek {_t(r['alt'])}-{_t(r['ust'])} ({r['temas']} temas): {_konum(m)}")
+    for r in trendler:
+        ekle("Yükselen trend", r["deger"] * 0.995, r["deger"] * 1.005, r["mesafe"],
+             f"Yükselen trend çizgisi {_t(r['deger'])} ({r['temas']} temas, {r['uzunluk']} gün): fiyat çizginin %{_t(r['mesafe'], 1)} üstünde")
+    if eb:
+        if eb["durum"] == "dokundu":
+            d_metin = "bugün dokundu"
+        elif eb["durum"] == "yaklaşıyor":
+            d_metin = "yukarıdan yaklaşıyor"
+        else:
+            d_metin = None
+        yon = "üstünde" if eb["mesafe"] >= 0 else "altında"
+        m_txt = f"EMA200 (günlük) {_t(eb['deger'])}: " + (d_metin + ", " if d_metin else "") + f"fiyat %{_t(abs(eb['mesafe']), 1)} {yon}"
+        ekle("EMA200", eb["deger"] * 0.995, eb["deger"] * 1.005, max(eb["mesafe"], 0.0), m_txt)
+    for x in dugumler:
+        m = _mesafe(fiyat, x["alt"], x["ust"])
+        ekle("Hacim düğümü", x["alt"], x["ust"], m,
+             f"Hacim düğümü {_t(x['alt'])}-{_t(x['ust'])} (ortalamanın {_t(x['kat'], 1)} katı): {_konum(m)}")
+    for b in bloklar:
+        if b["tur"] == "boga":
+            m = _mesafe(fiyat, b["alt"], b["ust"])
+            ekle("SMC mavi blok", b["alt"], b["ust"], m,
+                 f"SMC mavi order block {_t(b['alt'])}-{_t(b['ust'])} (4 saatlik): {_konum(m)}")
+    if nb:
+        ek = {"sinyal": " - son mumlarda ▲ sinyali", "değdi": " - alt banda değdi", "yaklaşıyor": " - yaklaşıyor"}.get(nb["durum"], "")
+        yon = "üstünde" if nb["mesafe"] >= 0 else "altında"
+        ekle("NW alt bant", nb["alt"] * 0.995, nb["alt"] * 1.005, max(nb["mesafe"], 0.0),
+             f"Nadaraya-Watson alt bant {_t(nb['alt'])} (4 saatlik): fiyat %{_t(abs(nb['mesafe']), 1)} {yon}{ek}")
+
+    gruplar = kesisim_bolgeleri([(p[0], p[1], p[2]) for p in parcalar], fiyat, esik)
+    yakin_gruplar = [g for g in gruplar if g["yakin"]]
+    yakin_parca = sorted([p for p in parcalar if p[3] <= esik], key=lambda p: p[3])
+    ema_tetik = bool(eb) and eb["durum"] in ("dokundu", "yaklaşıyor")
+    nw_tetik = bool(nb) and nb["durum"] in ("sinyal", "değdi", "yaklaşıyor")
+    puan = (max(len(g["araclar"]) for g in yakin_gruplar) if yakin_gruplar else 0) + (1 if ema_tetik else 0) + (1 if nw_tetik else 0)
+    return dict(sembol=sembol, fiyat=fiyat, esik=esik, atr=atr, dt=dt, eb=eb, nb=nb, parcalar=parcalar,
+                yakin_parca=yakin_parca, yakin_gruplar=yakin_gruplar, gruplar=gruplar,
+                tetik=bool(yakin_parca) or ema_tetik or nw_tetik, puan=puan,
+                nw_tetik=nw_tetik, ema_tetik=ema_tetik)
+
+
+def mesaj_olustur(a):
+    """Onaylanan biçim: hisse başına tek mesaj; yaklaşılan tüm yerler, destek altı, EMA200 notu, genel yön."""
+    satirlar = [f"📍 {a['sembol']} – takibe al", f"Fiyat: {_t(a['fiyat'])}", "", "Yaklaştığı yerler:"]
+    gosterilen = list(a["yakin_parca"])
+    for p in a["parcalar"]:                     # eşik dışında ama tetikleyen göstergeler (EMA200 / NW durumu) de yazılsın
+        if p not in gosterilen and ((p[0] == "EMA200" and a["ema_tetik"]) or (p[0] == "NW alt bant" and a["nw_tetik"])):
+            gosterilen.append(p)
+    for p in gosterilen:
+        satirlar.append("• " + p[4])
+    if not gosterilen:
+        satirlar.append("• (yok)")
+    satirlar.append("")
+    if a["yakin_gruplar"]:
+        g = a["yakin_gruplar"][0]
+        if len(g["araclar"]) >= 2:
+            satirlar.append(f"Kesişim: {len(g['araclar'])} araç aynı bölgede ({_t(g['alt'])}-{_t(g['ust'])})")
+        satirlar.append(f"Destek altı: {_t(g['alt'])}")
+    if a["eb"] and not any(p[0] == "EMA200" for p in gosterilen):
+        yon = "üstünde" if a["eb"]["mesafe"] >= 0 else "altında"
+        satirlar.append(f"EMA200: {_t(a['eb']['deger'])} (fiyat %{_t(abs(a['eb']['mesafe']), 1)} {yon})")
+    if a["dt"]:
+        satirlar.append(f"Genel yön: AŞAĞI (düşen çizgi bugün {_t(a['dt']['deger'])}, fiyat %{_t(a['dt']['mesafe'], 1)} altında)")
+    else:
+        satirlar.append("Genel yön: aşağı değil")
+    atr_txt = f", ATR %{_t(a['atr'], 1)}" if a["atr"] is not None else ""
+    satirlar.append(f"(yaklaşma eşiği %{_t(a['esik'], 1)}{atr_txt})")
+    return "\n".join(satirlar)
+
+
+def tara_calistir():
+    zorla = os.environ.get("ZORLA", "").strip().lower() in ("1", "true", "evet")
+    simdi = pd.Timestamp.now(tz="Europe/Istanbul")
+    if not zorla and not seans_icinde(simdi):
+        print(f"Seans dışı ({simdi:%Y-%m-%d %H:%M}), çıkılıyor.")
+        return
+    if not os.environ.get("DESTEK_TELEGRAM_TOKEN", "").strip() or not os.environ.get("DESTEK_TELEGRAM_SOHBET", "").strip():
+        print("HATA: DESTEK_TELEGRAM_TOKEN / DESTEK_TELEGRAM_SOHBET secret'ları tanımlı değil.")
+        sys.exit(1)
+    istenen = [x.strip().upper() for x in os.environ.get("HISSELER", "").replace(",", " ").split() if x.strip()]
+    semboller = istenen or hisse_listesi()
+    print(f"{simdi:%Y-%m-%d %H:%M} tarama başladı: {len(semboller)} hisse")
+    t0 = time.time()
+    veriler = gunluk_toplu(semboller)
+    print(f"1. aşama: {len(veriler)}/{len(semboller)} hissenin günlük verisi alındı ({time.time() - t0:.0f} sn)")
+    adaylar = []
+    for s, d in veriler.items():
+        try:
+            puan, aday = aday_puani(d)
+        except Exception as e:
+            print(f"  {s}: 1. aşama hatası ({type(e).__name__})")
+            continue
+        if aday:
+            adaylar.append((puan, s))
+    adaylar.sort(reverse=True)
+    print(f"1. aşama sonucu: {len(adaylar)} aday" + (f" (en güçlü {MAX_ADAY} tanesi incelenecek)" if len(adaylar) > MAX_ADAY else ""))
+    adaylar = adaylar[:MAX_ADAY]
+    durum = durum_oku(f"{simdi:%Y-%m-%d}")
+    sonuc_listesi = []
+    for _, s in adaylar:
+        if s in durum["gonderilen"]:
+            continue
+        try:
+            df = veri_cek_gunluk(s)
+            if df is None:
+                continue
+            a = analiz(s, df)
+        except Exception as e:
+            print(f"  {s}: 2. aşama hatası ({type(e).__name__}: {str(e)[:80]})")
+            continue
+        print(f"  {s}: fiyat {a['fiyat']:.2f}  tetik={'evet' if a['tetik'] else 'hayır'}  puan={a['puan']}")
+        if a["tetik"]:
+            sonuc_listesi.append(a)
+    sonuc_listesi.sort(key=lambda a: -a["puan"])
+    gonderilen = 0
+    for a in sonuc_listesi[:MAX_MESAJ]:
+        if telegram_gonder(mesaj_olustur(a)):
+            durum["gonderilen"].append(a["sembol"])
+            gonderilen += 1
+            durum_yaz(durum)
+            time.sleep(0.6)
+    if len(sonuc_listesi) > MAX_MESAJ:
+        print(f"Uyarı: {len(sonuc_listesi)} tetikleme vardı, ilk {MAX_MESAJ} tanesi gönderildi (diğerleri sonraki çalışmada).")
+    print(f"Bitti: {gonderilen} mesaj gönderildi ({time.time() - t0:.0f} sn)")
+
+
+def mesaj_testi():
+    simdi = pd.Timestamp.now(tz="Europe/Istanbul")
+    if telegram_gonder(f"✅ Destek botu bağlantı testi başarılı ({simdi:%Y-%m-%d %H:%M})."):
+        print("Test mesajı gönderildi.")
+    else:
+        print("HATA: test mesajı gönderilemedi (yukarıdaki satıra bak).")
+        sys.exit(1)
+
+
 if __name__ == "__main__":
     if len(sys.argv) >= 3 and sys.argv[1] == "seviye":
         for s in sys.argv[2:]:
@@ -918,5 +1219,9 @@ if __name__ == "__main__":
                     ayrinti_yazdir(kod, float(ek.replace(",", ".")))
             else:
                 seviye_yazdir(s)
+    elif len(sys.argv) >= 2 and sys.argv[1] == "mesaj-test":
+        mesaj_testi()
+    elif len(sys.argv) >= 2 and sys.argv[1] == "tara":
+        tara_calistir()
     else:
-        print("Kullanım: python destek_bot.py seviye ASELS BIMAS")
+        print("Kullanım: python destek_bot.py seviye ASELS BIMAS | mesaj-test | tara")
