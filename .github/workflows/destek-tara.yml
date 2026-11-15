@@ -2,7 +2,8 @@ name: Destek Tara
 
 on:
   schedule:
-    - cron: "*/30 7-15 * * 1-5"
+    - cron: "0 6 * * 1-5"
+    - cron: "0 11 * * 1-5"
   workflow_dispatch:
     inputs:
       mod:
@@ -12,7 +13,7 @@ on:
         description: "Boşluklu hisse kodları (boşsa hisseler.txt'deki hepsi; yalnız tara için)"
         default: ""
       zorla:
-        description: "Seans dışında da çalıştır (true ya da false)"
+        description: "true yazarsan seans saati dışında tek tur çalışır"
         default: "false"
 
 concurrency:
@@ -22,7 +23,7 @@ concurrency:
 jobs:
   tara:
     runs-on: ubuntu-latest
-    timeout-minutes: 40
+    timeout-minutes: 350
     steps:
       - uses: actions/checkout@v4
       - uses: actions/setup-python@v5
