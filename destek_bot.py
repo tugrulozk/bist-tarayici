@@ -1280,6 +1280,43 @@ def _konum(m):
     return "fiyat bölgenin içinde" if m == 0 else f"fiyat bölgenin %{_t(m, 1)} üstünde"
 
 
+def en_yogun_kesisim(parcalar):
+    """parcalar: [(arac_adi, alt, ust)]. Farklı araçların en çok üst üste bindiği fiyat aralığını bulur (zincirleme birleştirme yok).
+    Dönüş: (araç sayısı, alt, ust, araç adları) ya da parça yoksa None. Eşitlikte fiyata yakın (yüksek) aralık seçilir."""
+    if not parcalar:
+        return None
+    sinir = sorted({x for p in parcalar for x in (p[1], p[2])})
+    aralik = []
+    for lo, hi in zip(sinir[:-1], sinir[1:]):
+        adlar = tuple(sorted({p[0] for p in parcalar if p[1] <= lo and p[2] >= hi}))
+        if adlar:
+            aralik.append([lo, hi, adlar])
+    if not aralik:                                           # hepsi tek noktaysa
+        p = parcalar[0]
+        return (1, p[1], p[2], [p[0]])
+    birlesik = []
+    for lo, hi, adlar in aralik:                             # bitişik, aynı araç kümesi olan aralıkları birleştir
+        if birlesik and birlesik[-1][2] == adlar and abs(birlesik[-1][1] - lo) < 1e-9:
+            birlesik[-1][1] = hi
+        else:
+            birlesik.append([lo, hi, adlar])
+    en = max(birlesik, key=lambda x: (len(x[2]), x[0]))
+    return (len(en[2]), en[0], en[1], list(en[2]))
+
+
+DESTEK_ALTI_SIRA = ["Yatay destek", "SMC mavi blok", "Hacim düğümü", "EMA200", "Yükselen trend", "NW alt bant"]
+
+
+def destek_alti(yakin_parca):
+    """Yaklaşılan yerler arasından 'bunun altına inerse destek bozulur' seviyesi: yatay destek varsa onun alt kenarı,
+    yoksa sırayla SMC bloğu, hacim düğümü, EMA200, trend, NW. Aynı araçtan birden çok varsa fiyata en yakın olan."""
+    for ad in DESTEK_ALTI_SIRA:
+        adaylar = [p for p in yakin_parca if p[0] == ad]
+        if adaylar:
+            return min(adaylar, key=lambda p: p[3])[1]
+    return None
+
+
 def analiz(sembol, df, fiyat=None, bugun_alt=None):
     """2. aşama: tüm araçlarla ayrıntılı analiz. Dönüş: mesaj için gereken her şey (sözlük)."""
     if fiyat is None or bugun_alt is None:
@@ -1341,12 +1378,13 @@ def analiz(sembol, df, fiyat=None, bugun_alt=None):
     ema_tetik = bool(eb) and eb["durum"] in ("dokundu", "yaklaşıyor")
     nw_tetik = bool(nb) and nb["durum"] in ("sinyal", "değdi", "yaklaşıyor")
     teyit = teyit_hesapla(df4, _simdi(), nb)
-    puan = (max(len(g["araclar"]) for g in yakin_gruplar) if yakin_gruplar else 0) + (1 if ema_tetik else 0) + (1 if nw_tetik else 0) \
-        + (len(teyit["satirlar"]) if teyit else 0)
+    kes = en_yogun_kesisim([(p[0], p[1], p[2]) for p in yakin_parca])
+    puan = (kes[0] if kes else 0) + (1 if ema_tetik else 0) + (1 if nw_tetik else 0) + (len(teyit["satirlar"]) if teyit else 0)
     return dict(sembol=sembol, fiyat=fiyat, esik=esik, atr=atr, dt=dt, eb=eb, nb=nb, parcalar=parcalar,
                 yakin_parca=yakin_parca, yakin_gruplar=yakin_gruplar, gruplar=gruplar,
                 tetik=bool(yakin_parca) or ema_tetik or nw_tetik, puan=puan,
-                nw_tetik=nw_tetik, ema_tetik=ema_tetik, teyit=teyit)
+                nw_tetik=nw_tetik, ema_tetik=ema_tetik, teyit=teyit,
+                kesisim=kes, destek_alti=destek_alti(yakin_parca))
 
 
 def mesaj_olustur(a):
@@ -1361,11 +1399,11 @@ def mesaj_olustur(a):
     if not gosterilen:
         satirlar.append("• (yok)")
     satirlar.append("")
-    if a["yakin_gruplar"]:
-        g = a["yakin_gruplar"][0]
-        if len(g["araclar"]) >= 2:
-            satirlar.append(f"Kesişim: {len(g['araclar'])} araç aynı bölgede ({_t(g['alt'])}-{_t(g['ust'])})")
-        satirlar.append(f"Destek altı: {_t(g['alt'])}")
+    k = a.get("kesisim")
+    if k and k[0] >= 2:
+        satirlar.append(f"Kesişim: {k[0]} araç aynı yerde ({_t(k[1])}-{_t(k[2])}: {', '.join(k[3])})")
+    if a.get("destek_alti") is not None:
+        satirlar.append(f"Destek altı: {_t(a['destek_alti'])}")
     t = a.get("teyit")
     if t:
         satirlar.append("Teyitler (4 saatlik):" + (" yok" if not t["satirlar"] else ""))
