@@ -915,10 +915,25 @@ def seviye_yazdir(sembol):
 
 
 # ===================== CANLI MOD (tara) =====================
-MAX_ADAY = 40            # 1. aşamadan 2. aşamaya (ayrıntılı analiz) en fazla kaç hisse geçer
-MAX_MESAJ = 15           # bir çalışmada en fazla kaç Telegram mesajı
-ADAY_PAYI = 1.5          # 1. aşamada (yalnız günlük veri) eşiğe eklenen pay (%), aday kaçırmamak için
+MAX_ADAY = 40            # bir turda en fazla kaç hisse ayrıntılı analize girer
+MAX_MESAJ = 30           # bir turda en fazla kaç Telegram mesajı (yalnız taşkın koruması; gerçek tetiklemeyi sınırlamaz)
+ADAY_PAYI = 1.5          # hızlı elemede eşiğe eklenen pay (%), aday kaçırmamak için
+CEVRIM_SN = 300          # iki tarama turu arası hedef süre (saniye)
+ROT_ADET = 25            # her turda kaç hissenin 4 saatlik seviyeleri (SMC, NW) yenilenir
+TEKRAR_BAKMA_SN = 1800   # ayrıntılı analizde tetiklemeyen hisseye bu süre bir daha bakılmaz
 DURUM_DOSYASI = os.path.join("durum_destek", "durum.json")
+RSI_UZUNLUK = 14
+MFI_UZUNLUK = 14
+BB_UZUNLUK = 20
+BB_CARPAN = 2.0
+RSI_ASIRI = 30.0
+MFI_ASIRI = 20.0
+UYUMSUZLUK_PENCERE = 60  # uyumsuzluk için bakılan son mum sayısı (4 saatlik)
+UYUMSUZLUK_YAKIN = 12    # son dip bu kadar mum içinde olmalı
+
+
+def _simdi():
+    return pd.Timestamp.now(tz="Europe/Istanbul")
 
 
 def _t(x, n=2):
@@ -946,6 +961,12 @@ def seans_icinde(simdi):
     """Hafta içi 09:55-18:20 (İstanbul saati). Resmî tatilleri bilmez; tatilde veri değişmediği için en kötü ihtimalle boşa çalışır."""
     dk = simdi.hour * 60 + simdi.minute
     return simdi.weekday() < 5 and 9 * 60 + 55 <= dk <= 18 * 60 + 20
+
+
+def seans_oncesi(simdi):
+    """Hafta içi 08:30-09:55: 4 saatlik seviyeleri önceden hazırlama vakti."""
+    dk = simdi.hour * 60 + simdi.minute
+    return simdi.weekday() < 5 and 8 * 60 + 30 <= dk < 9 * 60 + 55
 
 
 def telegram_gonder(metin):
@@ -981,6 +1002,25 @@ def durum_oku(bugun):
     except Exception:
         pass
     return {"gun": bugun, "gonderilen": []}
+
+
+DORT_DOSYASI = os.path.join("durum_destek", "dort.json")
+
+
+def dort_oku(semboller):
+    """Önceki çalışmadan kalan 4 saatlik seviyeler (ikinci iş anında hazır başlasın diye). Okunamazsa boş."""
+    try:
+        with open(DORT_DOSYASI, encoding="utf-8") as f:
+            d = json.load(f)
+        return {k: v for k, v in d.items() if k in semboller and isinstance(v, dict) and "bloklar" in v}
+    except Exception:
+        return {}
+
+
+def dort_yaz(dort):
+    os.makedirs(os.path.dirname(DORT_DOSYASI), exist_ok=True)
+    with open(DORT_DOSYASI, "w", encoding="utf-8") as f:
+        json.dump(dort, f, ensure_ascii=False)
 
 
 def durum_yaz(d):
@@ -1022,21 +1062,214 @@ def gunluk_toplu(semboller, parca=80):
     return sonuc
 
 
-def aday_puani(df):
-    """1. aşama (yalnız günlük veri, ucuz): (puan, aday_mi). Yatay destek, yükselen trend ve EMA200'e bakar."""
+def anlik_fiyatlar(semboller, parca=60):
+    """5 dakikalık veriden toplu: {sembol: (son fiyat, bugünün en düşüğü)}. Alınamayan hisse sonuca girmez."""
+    sonuc = {}
+    for i in range(0, len(semboller), parca):
+        grup = semboller[i:i + parca]
+        veri = None
+        for deneme in range(2):
+            try:
+                veri = yf.download(" ".join(x + ".IS" for x in grup), period="1d", interval="5m",
+                                   auto_adjust=False, group_by="ticker", progress=False, threads=True)
+            except Exception:
+                veri = None
+            if veri is not None and not veri.empty:
+                break
+            time.sleep(1.5)
+        if veri is None or veri.empty:
+            continue
+        for x in grup:
+            try:
+                if isinstance(veri.columns, pd.MultiIndex):
+                    if (x + ".IS") not in veri.columns.get_level_values(0):
+                        continue
+                    d = veri[x + ".IS"]
+                else:
+                    d = veri
+                d = d[["Low", "Close"]].dropna()
+                if len(d):
+                    sonuc[x] = (float(d["Close"].iloc[-1]), float(d["Low"].min()))
+            except Exception:
+                pass
+    return sonuc
+
+
+# ---------- teyit göstergeleri (4 saatlik) ----------
+def rsi_serisi(c, n=RSI_UZUNLUK):
+    """Wilder RSI (TradingView ta.rsi ile aynı mantık). Veri kısaysa None."""
+    c = np.asarray(c, dtype=float)
+    if len(c) < n + 2:
+        return None
+    d = np.diff(c)
+    yuk = np.where(d > 0, d, 0.0)
+    asa = np.where(d < 0, -d, 0.0)
+    ru, rd = yuk[:n].mean(), asa[:n].mean()
+    cikti = np.full(len(c), np.nan)
+    cikti[n] = 100.0 if rd == 0 else 100 - 100 / (1 + ru / rd)
+    for i in range(n, len(d)):
+        ru = (ru * (n - 1) + yuk[i]) / n
+        rd = (rd * (n - 1) + asa[i]) / n
+        cikti[i + 1] = 100.0 if rd == 0 else 100 - 100 / (1 + ru / rd)
+    return cikti
+
+
+def mfi_serisi(h, l, c, v, n=MFI_UZUNLUK):
+    """Money Flow Index (tipik fiyat = (H+L+C)/3). Veri kısaysa None."""
+    h, l, c, v = (np.asarray(x, dtype=float) for x in (h, l, c, v))
+    if len(c) < n + 2:
+        return None
+    tp = (h + l + c) / 3
+    mf = tp * v
+    poz = np.zeros(len(c))
+    neg = np.zeros(len(c))
+    for i in range(1, len(c)):
+        if tp[i] > tp[i - 1]:
+            poz[i] = mf[i]
+        elif tp[i] < tp[i - 1]:
+            neg[i] = mf[i]
+    cikti = np.full(len(c), np.nan)
+    for i in range(n, len(c)):
+        p, q = poz[i - n + 1:i + 1].sum(), neg[i - n + 1:i + 1].sum()
+        if p == 0 and q == 0:
+            cikti[i] = 50.0
+        else:
+            cikti[i] = 100.0 if q == 0 else 100 - 100 / (1 + p / q)
+    return cikti
+
+
+def bollinger_alt(c, n=BB_UZUNLUK, k=BB_CARPAN):
+    """Son mumdaki Bollinger alt bandı (ortalama - k x popülasyon std, TradingView gibi). Veri kısaysa None."""
+    c = np.asarray(c, dtype=float)
+    if len(c) < n:
+        return None
+    son = c[-n:]
+    return float(son.mean() - k * son.std())
+
+
+def pozitif_uyumsuzluk(dusuk, gosterge, n=3):
+    """Fiyat daha düşük dip yaparken gösterge daha yüksek dip yapmış mı? Son iki onaylı dip (solunda/sağında n mum)
+    karşılaştırılır; ikinci dip son UYUMSUZLUK_YAKIN mum içinde olmalı, gösterge 50'nin altında kalmalı."""
+    dusuk = np.asarray(dusuk, dtype=float)
+    gosterge = np.asarray(gosterge, dtype=float)
+    uz = len(dusuk)
+    if gosterge is None or uz < 2 * n + 5:
+        return False
+    bas = max(n, uz - UYUMSUZLUK_PENCERE)
+    dipler = [i for i in range(bas, uz - n)
+              if dusuk[i] == dusuk[i - n:i + n + 1].min() and not np.isnan(gosterge[i])]
+    if len(dipler) < 2:
+        return False
+    i1, i2 = dipler[-2], dipler[-1]
+    if i2 < uz - 1 - UYUMSUZLUK_YAKIN:
+        return False
+    return bool(dusuk[i2] < dusuk[i1] * 0.999 and gosterge[i2] > gosterge[i1] + 1.0 and gosterge[i2] < 50)
+
+
+def mum_kapandi(zaman, simdi):
+    """BIST 4 saatlik mumları 09:40 / 13:40 / 17:40'ta başlar; kapanışları 13:40, 17:40, 18:10."""
+    if zaman.date() < simdi.date():
+        return True
+    bas = zaman.hour * 60 + zaman.minute
+    kapanis = 13 * 60 + 40 if bas < 13 * 60 + 40 else (17 * 60 + 40 if bas < 17 * 60 + 40 else 18 * 60 + 10)
+    return simdi.hour * 60 + simdi.minute >= kapanis
+
+
+def yutan_boga(df4, simdi):
+    """Son mum ya da bir öncekisi yutan boğa mumu mu? Dönüş: açıklama metni ya da None.
+    Yutan boğa: önceki mum kırmızı, bu mum yeşil, açılışı önceki kapanışın altında/eşit, kapanışı önceki açılışın üstünde/eşit."""
+    o = df4["Open"].to_numpy(dtype=float)
+    c = df4["Close"].to_numpy(dtype=float)
+    if len(o) < 3:
+        return None
+    def f(i):
+        return c[i - 1] < o[i - 1] and c[i] > o[i] and o[i] <= c[i - 1] and c[i] >= o[i - 1]
+    if f(len(o) - 1):
+        kapali = mum_kapandi(df4.index[-1], simdi)
+        return "son 4 saatlik mum" + ("" if kapali else " (henüz kapanmadı)")
+    if f(len(o) - 2):
+        return "bir önceki 4 saatlik mum"
+    return None
+
+
+def teyit_hesapla(df4, simdi, nb=None):
+    """4 saatlik mumlarla teyitler. Dönüş: dict(satirlar=[...yalnız var olanlar...], bilgi='RSI x | MFI y'), veri yoksa None."""
+    if df4 is None or len(df4) < 60:
+        return None
+    h, l, c, o = (df4[k].to_numpy(dtype=float) for k in ("High", "Low", "Close", "Open"))
+    v = df4["Volume"].to_numpy(dtype=float)
+    rsi = rsi_serisi(c)
+    mfi = mfi_serisi(h, l, c, v) if np.nansum(v) > 0 else None
+    satirlar = []
+    yb = yutan_boga(df4, simdi)
+    if yb:
+        satirlar.append(f"Yutan boğa mumu ({yb})")
+    if rsi is not None and pozitif_uyumsuzluk(l, rsi):
+        satirlar.append("RSI pozitif uyumsuzluk (fiyat daha düşük dip, RSI daha yüksek dip)")
+    if mfi is not None and pozitif_uyumsuzluk(l, mfi):
+        satirlar.append("MFI pozitif uyumsuzluk (fiyat daha düşük dip, MFI daha yüksek dip)")
+    rsi_son = float(rsi[-1]) if rsi is not None and not np.isnan(rsi[-1]) else None
+    mfi_son = float(mfi[-1]) if mfi is not None and not np.isnan(mfi[-1]) else None
+    if rsi_son is not None and rsi_son < RSI_ASIRI:
+        satirlar.append(f"RSI aşırı satımda ({_t(rsi_son, 1)})")
+    if mfi_son is not None and mfi_son < MFI_ASIRI:
+        satirlar.append(f"MFI aşırı satımda ({_t(mfi_son, 1)})")
+    bb = bollinger_alt(c)
+    if bb is not None:
+        if c[-1] < bb:
+            satirlar.append("Bollinger alt bandın dışında")
+        elif l[-1] <= bb:
+            satirlar.append("Bollinger alt banda değdi")
+    if nb and nb.get("durum") == "sinyal":
+        satirlar.append("Nadaraya-Watson ▲ sinyali (son 3 mumda)")
+    parcalar = []
+    if rsi_son is not None:
+        parcalar.append(f"RSI {_t(rsi_son, 1)}")
+    if mfi_son is not None:
+        parcalar.append(f"MFI {_t(mfi_son, 1)}")
+    return dict(satirlar=satirlar, bilgi=" | ".join(parcalar) if parcalar else "")
+
+
+def dort_saat_seviye(sembol, df):
+    """Bir hissenin 4 saatlik seviyeleri (SMC mavi bloklar, NW alt bant). Sırayla (rotasyonla) yenilenir. Veri yoksa None."""
+    ham = ham_veriler(sembol)
+    df4 = veri_cek_4saat(sembol, df, ham)
+    if df4 is None or len(df4) < 100:
+        return None
     fiyat = float(df["Close"].iloc[-1])
+    bloklar = [dict(alt=float(b["alt"]), ust=float(b["ust"])) for b in smc_order_bloklar(df4) if b["tur"] == "boga"]
+    dfn = nw_serisi(ham, df)
+    if dfn is None or len(dfn) < 100:
+        dfn = df4
+    nb = nw_bilgi(dfn, fiyat)
+    return dict(bloklar=bloklar, nb_alt=float(nb["alt"]) if nb else None, nb_durum=nb["durum"] if nb else None)
+
+
+def aday_puani(df, fiyat=None, bugun_alt=None, d4=None):
+    """Hızlı eleme (ucuz, bellekteki verilerle): (puan, aday_mi). Günlük araçlar (yatay destek, yükselen trend, EMA200)
+    ve varsa 4 saatlik seviyeler (SMC mavi blok, NW alt bant) güncel fiyata yakın mı bakar."""
+    if fiyat is None:
+        fiyat = float(df["Close"].iloc[-1])
+    if bugun_alt is None:
+        bugun_alt = float(df["Low"].iloc[-1])
     esik, _ = yakinlik_esigi(df)
     esik += ADAY_PAYI
     parca = [("Yatay destek", r["alt"], r["ust"]) for r in yatay_destekler(df, fiyat)]
     if not dusen_trend(df, fiyat):
         parca += [("Yükselen trend", r["deger"] * 0.995, r["deger"] * 1.005) for r in yukselen_trendler(df, fiyat)]
-    eb = ema200_bilgi(df, fiyat, float(df["Low"].iloc[-1]))
+    eb = ema200_bilgi(df, fiyat, bugun_alt)
     if eb:
         parca.append(("EMA200", eb["deger"] * 0.995, eb["deger"] * 1.005))
+    nw_sinyal = False
+    if d4:
+        parca += [("SMC mavi blok", b["alt"], b["ust"]) for b in d4["bloklar"]]
+        if d4.get("nb_alt"):
+            parca.append(("NW alt bant", d4["nb_alt"] * 0.995, d4["nb_alt"] * 1.005))
+        nw_sinyal = d4.get("nb_durum") == "sinyal"
     yakin = [g for g in kesisim_bolgeleri(parca, fiyat, esik) if g["yakin"]]
     ema_tetik = bool(eb) and eb["durum"] != "yok"
-    puan = (max(len(g["araclar"]) for g in yakin) if yakin else 0) + (1 if ema_tetik else 0)
-    return puan, bool(yakin) or ema_tetik
+    puan = (max(len(g["araclar"]) for g in yakin) if yakin else 0) + (1 if ema_tetik else 0) + (1 if nw_sinyal else 0)
+    return puan, bool(yakin) or ema_tetik or nw_sinyal
 
 
 def _mesafe(fiyat, alt, ust):
@@ -1047,9 +1280,10 @@ def _konum(m):
     return "fiyat bölgenin içinde" if m == 0 else f"fiyat bölgenin %{_t(m, 1)} üstünde"
 
 
-def analiz(sembol, df):
+def analiz(sembol, df, fiyat=None, bugun_alt=None):
     """2. aşama: tüm araçlarla ayrıntılı analiz. Dönüş: mesaj için gereken her şey (sözlük)."""
-    fiyat, bugun_alt, _ = gun_ici_bilgi(sembol, df)
+    if fiyat is None or bugun_alt is None:
+        fiyat, bugun_alt, _ = gun_ici_bilgi(sembol, df)
     esik, atr = yakinlik_esigi(df)
     yatay = [r for r in yatay_destekler(df, fiyat) if r["mesafe"] <= MAX_UZAKLIK]
     dt = dusen_trend(df, fiyat)
@@ -1106,11 +1340,13 @@ def analiz(sembol, df):
     yakin_parca = sorted([p for p in parcalar if p[3] <= esik], key=lambda p: p[3])
     ema_tetik = bool(eb) and eb["durum"] in ("dokundu", "yaklaşıyor")
     nw_tetik = bool(nb) and nb["durum"] in ("sinyal", "değdi", "yaklaşıyor")
-    puan = (max(len(g["araclar"]) for g in yakin_gruplar) if yakin_gruplar else 0) + (1 if ema_tetik else 0) + (1 if nw_tetik else 0)
+    teyit = teyit_hesapla(df4, _simdi(), nb)
+    puan = (max(len(g["araclar"]) for g in yakin_gruplar) if yakin_gruplar else 0) + (1 if ema_tetik else 0) + (1 if nw_tetik else 0) \
+        + (len(teyit["satirlar"]) if teyit else 0)
     return dict(sembol=sembol, fiyat=fiyat, esik=esik, atr=atr, dt=dt, eb=eb, nb=nb, parcalar=parcalar,
                 yakin_parca=yakin_parca, yakin_gruplar=yakin_gruplar, gruplar=gruplar,
                 tetik=bool(yakin_parca) or ema_tetik or nw_tetik, puan=puan,
-                nw_tetik=nw_tetik, ema_tetik=ema_tetik)
+                nw_tetik=nw_tetik, ema_tetik=ema_tetik, teyit=teyit)
 
 
 def mesaj_olustur(a):
@@ -1130,6 +1366,12 @@ def mesaj_olustur(a):
         if len(g["araclar"]) >= 2:
             satirlar.append(f"Kesişim: {len(g['araclar'])} araç aynı bölgede ({_t(g['alt'])}-{_t(g['ust'])})")
         satirlar.append(f"Destek altı: {_t(g['alt'])}")
+    t = a.get("teyit")
+    if t:
+        satirlar.append("Teyitler (4 saatlik):" + (" yok" if not t["satirlar"] else ""))
+        for x in t["satirlar"]:
+            satirlar.append("✅ " + x)
+        satirlar.append(t["bilgi"])
     if a["eb"] and not any(p[0] == "EMA200" for p in gosterilen):
         yon = "üstünde" if a["eb"]["mesafe"] >= 0 else "altında"
         satirlar.append(f"EMA200: {_t(a['eb']['deger'])} (fiyat %{_t(abs(a['eb']['mesafe']), 1)} {yon})")
@@ -1143,9 +1385,11 @@ def mesaj_olustur(a):
 
 
 def tara_calistir():
+    """Canlı döngü: sabah günlük veriyi alır, 4 saatlik seviyeleri sırayla hazırlar, sonra seans boyunca her ~5 dakikada
+    güncel fiyatları çekip seviyelere yaklaşanları ayrıntılı inceler ve Telegram'a yollar. ZORLA=true: tek tur, seans kontrolü yok."""
     zorla = os.environ.get("ZORLA", "").strip().lower() in ("1", "true", "evet")
-    simdi = pd.Timestamp.now(tz="Europe/Istanbul")
-    if not zorla and not seans_icinde(simdi):
+    simdi = _simdi()
+    if not zorla and not (seans_icinde(simdi) or seans_oncesi(simdi)):
         print(f"Seans dışı ({simdi:%Y-%m-%d %H:%M}), çıkılıyor.")
         return
     if not os.environ.get("DESTEK_TELEGRAM_TOKEN", "").strip() or not os.environ.get("DESTEK_TELEGRAM_SOHBET", "").strip():
@@ -1153,49 +1397,109 @@ def tara_calistir():
         sys.exit(1)
     istenen = [x.strip().upper() for x in os.environ.get("HISSELER", "").replace(",", " ").split() if x.strip()]
     semboller = istenen or hisse_listesi()
-    print(f"{simdi:%Y-%m-%d %H:%M} tarama başladı: {len(semboller)} hisse")
-    t0 = time.time()
-    veriler = gunluk_toplu(semboller)
-    print(f"1. aşama: {len(veriler)}/{len(semboller)} hissenin günlük verisi alındı ({time.time() - t0:.0f} sn)")
-    adaylar = []
-    for s, d in veriler.items():
-        try:
-            puan, aday = aday_puani(d)
-        except Exception as e:
-            print(f"  {s}: 1. aşama hatası ({type(e).__name__})")
-            continue
-        if aday:
-            adaylar.append((puan, s))
-    adaylar.sort(reverse=True)
-    print(f"1. aşama sonucu: {len(adaylar)} aday" + (f" (en güçlü {MAX_ADAY} tanesi incelenecek)" if len(adaylar) > MAX_ADAY else ""))
-    adaylar = adaylar[:MAX_ADAY]
+    sure_limit = float(os.environ.get("DONGU_SAAT", "5.2")) * 3600
+    t_basla = time.time()
+    print(f"{simdi:%Y-%m-%d %H:%M} başladı: {len(semboller)} hisse, " + ("tek tur (ZORLA)" if zorla else "döngü modu"))
+    gunluk = gunluk_toplu(semboller)
+    print(f"günlük veri: {len(gunluk)}/{len(semboller)} hisse ({time.time() - t_basla:.0f} sn)")
+    if not gunluk:
+        print("HATA: hiçbir hissenin günlük verisi alınamadı.")
+        sys.exit(1)
+    kuyruk = [s for s in semboller if s in gunluk]
+    dort = dort_oku(set(kuyruk))
+    if dort:
+        print(f"önceki çalışmadan {len(dort)} hissenin 4 saatlik seviyesi devralındı")
+    rot = 0
     durum = durum_oku(f"{simdi:%Y-%m-%d}")
-    sonuc_listesi = []
-    for _, s in adaylar:
-        if s in durum["gonderilen"]:
-            continue
+    bakildi = {}
+    tur = 0
+    while True:
+        t_tur = time.time()
+        simdi = _simdi()
+        seans = zorla or seans_icinde(simdi)
+        if not seans and not seans_oncesi(simdi):
+            print("Seans bitti, döngü kapanıyor.")
+            break
+        if time.time() - t_basla > sure_limit:
+            print("Süre sınırı doldu, döngü kapanıyor (sonraki çalışma devralır).")
+            break
+        tur += 1
         try:
-            df = veri_cek_gunluk(s)
-            if df is None:
+            # 1) 4 saatlik seviyeleri sırayla yenile (zorla modunda hepsi tek turda, en fazla 60 hisse)
+            if not seans and (rot >= len(kuyruk) or len(dort) >= 0.9 * len(kuyruk)):   # hazırlık bitti: seansı bekle
+                print(f"[{simdi:%H:%M}] hazırlık tamam: 4 saatlik seviyeler {len(dort)}/{len(kuyruk)}, seans bekleniyor")
+                time.sleep(120)
                 continue
-            a = analiz(s, df)
+            adet = len(kuyruk) if zorla and len(kuyruk) <= 60 else ROT_ADET
+            for _ in range(adet):
+                s = kuyruk[rot % len(kuyruk)]
+                rot += 1
+                try:
+                    r = dort_saat_seviye(s, gunluk[s])
+                    if r:
+                        dort[s] = r
+                except Exception as e:
+                    print(f"  {s}: 4 saatlik seviye hatası ({type(e).__name__})")
+            if not seans:                                    # seans öncesi: yalnız hazırlık
+                print(f"[{simdi:%H:%M}] hazırlık: 4 saatlik seviyeler {len(dort)}/{len(kuyruk)}")
+                time.sleep(2)
+                continue
+            # 2) güncel fiyatlar ve hızlı eleme
+            fiyatlar = anlik_fiyatlar(kuyruk)
+            adaylar = []
+            for s in kuyruk:
+                if s in durum["gonderilen"] or s not in fiyatlar:
+                    continue
+                if time.time() - bakildi.get(s, 0) < TEKRAR_BAKMA_SN:
+                    continue
+                f, alt_bugun = fiyatlar[s]
+                try:
+                    puan, aday = aday_puani(gunluk[s], f, alt_bugun, dort.get(s))
+                except Exception as e:
+                    print(f"  {s}: hızlı eleme hatası ({type(e).__name__})")
+                    continue
+                if aday:
+                    adaylar.append((puan, s))
+            adaylar.sort(reverse=True)
+            n_aday = len(adaylar)
+            # 3) ayrıntılı analiz
+            sonuclar = []
+            for _, s in adaylar[:MAX_ADAY]:
+                f, alt_bugun = fiyatlar[s]
+                bakildi[s] = time.time()
+                try:
+                    a = analiz(s, gunluk[s], f, alt_bugun)
+                except Exception as e:
+                    print(f"  {s}: ayrıntılı analiz hatası ({type(e).__name__}: {str(e)[:80]})")
+                    continue
+                if a["tetik"]:
+                    sonuclar.append(a)
+            sonuclar.sort(key=lambda a: -a["puan"])
+            # 4) gönder
+            gonderilen = 0
+            for a in sonuclar[:MAX_MESAJ]:
+                if telegram_gonder(mesaj_olustur(a)):
+                    durum["gonderilen"].append(a["sembol"])
+                    gonderilen += 1
+                    durum_yaz(durum)
+                    time.sleep(0.6)
+                else:
+                    bakildi.pop(a["sembol"], None)           # gönderilemedi: sonraki turda yeniden denensin
+            if tur % 5 == 0:
+                dort_yaz(dort)
+            print(f"[{simdi:%H:%M}] tur {tur}: fiyat {len(fiyatlar)}/{len(kuyruk)}, aday {n_aday}, tetik {len(sonuclar)}, "
+                  f"mesaj {gonderilen}, 4s seviye {len(dort)}/{len(kuyruk)} ({time.time() - t_tur:.0f} sn)")
+            if len(sonuclar) > MAX_MESAJ:
+                print(f"  uyarı: {len(sonuclar)} tetikleme var, bu turda {MAX_MESAJ} tanesi gönderildi, kalanı sonraki turda.")
         except Exception as e:
-            print(f"  {s}: 2. aşama hatası ({type(e).__name__}: {str(e)[:80]})")
-            continue
-        print(f"  {s}: fiyat {a['fiyat']:.2f}  tetik={'evet' if a['tetik'] else 'hayır'}  puan={a['puan']}")
-        if a["tetik"]:
-            sonuc_listesi.append(a)
-    sonuc_listesi.sort(key=lambda a: -a["puan"])
-    gonderilen = 0
-    for a in sonuc_listesi[:MAX_MESAJ]:
-        if telegram_gonder(mesaj_olustur(a)):
-            durum["gonderilen"].append(a["sembol"])
-            gonderilen += 1
-            durum_yaz(durum)
-            time.sleep(0.6)
-    if len(sonuc_listesi) > MAX_MESAJ:
-        print(f"Uyarı: {len(sonuc_listesi)} tetikleme vardı, ilk {MAX_MESAJ} tanesi gönderildi (diğerleri sonraki çalışmada).")
-    print(f"Bitti: {gonderilen} mesaj gönderildi ({time.time() - t0:.0f} sn)")
+            print(f"tur hatası ({type(e).__name__}: {str(e)[:100]})")
+        if zorla:
+            break
+        gecen = time.time() - t_tur
+        time.sleep(max(20, CEVRIM_SN - gecen))
+    durum_yaz(durum)
+    dort_yaz(dort)
+    print(f"Bitti ({time.time() - t_basla:.0f} sn).")
 
 
 def mesaj_testi():
