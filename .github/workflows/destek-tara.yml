@@ -7,8 +7,8 @@ on:
   workflow_dispatch:
     inputs:
       mod:
-        description: "mesaj-test ya da tara"
-        default: "mesaj-test"
+        description: "tara (gün içi bot) | rapor (gün sonu raporu) | rapor toplu | mesaj-test"
+        default: "tara"
       hisseler:
         description: "Boşluklu hisse kodları (boşsa hisseler.txt'deki hepsi; yalnız tara için)"
         default: ""
@@ -30,8 +30,8 @@ jobs:
         with:
           python-version: "3.11"
       - run: pip install yfinance pandas numpy
-      - name: Durum onbellegi
-        uses: actions/cache@v4
+      - name: Durum onbellegini geri yukle
+        uses: actions/cache/restore@v4
         with:
           path: durum_destek
           key: destek-durum-${{ github.run_id }}
@@ -43,4 +43,10 @@ jobs:
           HISSELER: ${{ inputs.hisseler }}
           ZORLA: ${{ inputs.zorla }}
           MOD: ${{ inputs.mod }}
-        run: python destek_bot.py "${MOD:-tara}"
+        run: python destek_bot.py ${MOD:-tara}
+      - name: Durum onbellegini kaydet (is elle durdurulsa bile)
+        if: always()
+        uses: actions/cache/save@v4
+        with:
+          path: durum_destek
+          key: destek-durum-${{ github.run_id }}
