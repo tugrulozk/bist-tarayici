@@ -1398,7 +1398,9 @@ def kapanis_ozeti(sonuclar):
 def rapor_calistir(simdi, bugun):
     kayitlar = kayit_oku(str(bugun))
     if not kayitlar:
-        print("Bugün bildirilmiş sinyal kaydı yok, rapor gönderilmedi.")
+        print(f"{bugun} için bildirilmiş sinyal kaydı yok, rapor gönderilmedi.")
+        telegram_gonder(f"📊 Gün sonu raporu · {bugun:%d.%m.%Y}: bu tarih için kayıtlı sinyal yok "
+                        "(o gün sinyal gelmedi ya da kayıt dosyası bulunamadı).")
         return
     semboller = sorted({k["sembol"] for k in kayitlar})
     with ThreadPoolExecutor(max_workers=4) as havuz:
@@ -1593,7 +1595,16 @@ def main(mod=None):
         sys.exit(0 if ok else 1)
 
     if mod == "rapor":
-        rapor_calistir(simdi, bugun)
+        hedef = bugun
+        if not kayit_oku(str(bugun)):        # gece yarısından sonra çalıştırılırsa: kayıtlı son günün raporu verilir
+            try:
+                son = dt.date.fromisoformat(json.loads(kayit_dosyasi().read_text(encoding="utf-8")).get("tarih", ""))
+                if son < bugun:
+                    print(f"Bugün ({bugun}) kayıt yok; kayıtlı son gün ({son}) için rapor hazırlanıyor.")
+                    hedef = son
+            except Exception:
+                pass
+        rapor_calistir(simdi, hedef)
         return
 
     if mod == "bildirim" and not seans_icinde(simdi):
