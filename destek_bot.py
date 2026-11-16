@@ -927,6 +927,11 @@ MFI_UZUNLUK = 14
 BB_UZUNLUK = 20
 BB_CARPAN = 2.0
 MFI_KULLAN = True        # AÇIK (kullanıcı kararı): ASELS'te TradingView ile ~8 puan fark çıktı (bot 56,9, TradingView 65,0); hacim verisi incelenecek, mesajlarda 'yaklaşık' diye işaretlenir.
+MAX_MESAJ_HISSE = 3      # aynı hisse için günde en fazla kaç mesaj (ilk + güncellemeler)
+GUNCELLEME_ARASI = 1800  # aynı hisse için iki mesaj arası en az süre (sn)
+YAKLASMA_ORAN = 0.5      # güncelleme: en yakın desteğe uzaklık önceki mesajdakinin bu katına inerse
+YAKLASMA_MIN_FARK = 0.3  # ... ve en az bu kadar puan (%) azalmışsa
+TEKRAR_ANALIZ_SN = 3600  # mesaj atılmış hisse, hâlâ desteğe yakınsa bu sürede bir yeni teyit/tetik için yeniden incelenir
 RSI_ASIRI = 30.0
 MFI_ASIRI = 20.0
 UYUMSUZLUK_PENCERE = 60  # uyumsuzluk için bakılan son mum sayısı (4 saatlik)
@@ -1002,7 +1007,7 @@ def durum_oku(bugun):
             return d
     except Exception:
         pass
-    return {"gun": bugun, "gonderilen": []}
+    return {"gun": bugun, "gonderilen": [], "kayit": {}}
 
 
 DORT_DOSYASI = os.path.join("durum_destek", "dort.json")
@@ -1194,41 +1199,45 @@ def yutan_boga(df4, simdi):
 
 
 def teyit_hesapla(df4, simdi, nb=None):
-    """4 saatlik mumlarla teyitler. Dönüş: dict(satirlar=[...yalnız var olanlar...], bilgi='RSI x | MFI y'), veri yoksa None."""
+    """4 saatlik mumlarla teyitler. Dönüş: dict(satirlar=[kısa metinler], anahtar=[kararlı kodlar], bilgi='RSI x | MFI y'), veri yoksa None."""
     if df4 is None or len(df4) < 60:
         return None
     h, l, c, o = (df4[k].to_numpy(dtype=float) for k in ("High", "Low", "Close", "Open"))
     v = df4["Volume"].to_numpy(dtype=float)
     rsi = rsi_serisi(c)
     mfi = mfi_serisi(h, l, c, v) if MFI_KULLAN and np.nansum(v) > 0 else None
-    satirlar = []
+    satirlar, anahtar = [], []
+
+    def ekle(kod, metin):
+        anahtar.append(kod)
+        satirlar.append(metin)
     yb = yutan_boga(df4, simdi)
     if yb:
-        satirlar.append(f"Yutan boğa mumu ({yb})")
+        ekle("yutan", f"Yutan boğa ({yb.replace(' (henüz kapanmadı)', '')})")
     if rsi is not None and pozitif_uyumsuzluk(l, rsi):
-        satirlar.append("RSI pozitif uyumsuzluk (fiyat daha düşük dip, RSI daha yüksek dip)")
+        ekle("rsi_uyumsuzluk", "RSI pozitif uyumsuzluk")
     if mfi is not None and pozitif_uyumsuzluk(l, mfi):
-        satirlar.append("MFI pozitif uyumsuzluk (fiyat daha düşük dip, MFI daha yüksek dip; MFI yaklaşık)")
+        ekle("mfi_uyumsuzluk", "MFI pozitif uyumsuzluk (MFI yaklaşık)")
     rsi_son = float(rsi[-1]) if rsi is not None and not np.isnan(rsi[-1]) else None
     mfi_son = float(mfi[-1]) if mfi is not None and not np.isnan(mfi[-1]) else None
     if rsi_son is not None and rsi_son < RSI_ASIRI:
-        satirlar.append(f"RSI aşırı satımda ({_t(rsi_son, 1)})")
+        ekle("rsi_asiri", f"RSI aşırı satım ({_t(rsi_son, 1)})")
     if mfi_son is not None and mfi_son < MFI_ASIRI:
-        satirlar.append(f"MFI aşırı satımda ({_t(mfi_son, 1)}; MFI yaklaşık)")
+        ekle("mfi_asiri", f"MFI aşırı satım ({_t(mfi_son, 1)}, yaklaşık)")
     bb = bollinger_alt(c)
     if bb is not None:
         if c[-1] < bb:
-            satirlar.append("Bollinger alt bandın dışında")
+            ekle("bb", "Bollinger alt bandın dışında")
         elif l[-1] <= bb:
-            satirlar.append("Bollinger alt banda değdi")
+            ekle("bb", "Bollinger alt banda değdi")
     if nb and nb.get("durum") == "sinyal":
-        satirlar.append("Nadaraya-Watson ▲ sinyali (son 3 mumda)")
+        ekle("nw_sinyal", "NW ▲ sinyali (son 3 mumda)")
     parcalar = []
     if rsi_son is not None:
         parcalar.append(f"RSI {_t(rsi_son, 1)}")
     if mfi_son is not None:
         parcalar.append(f"MFI {_t(mfi_son, 1)} (yaklaşık)")
-    return dict(satirlar=satirlar, bilgi=" | ".join(parcalar) if parcalar else "")
+    return dict(satirlar=satirlar, anahtar=anahtar, bilgi=" | ".join(parcalar) if parcalar else "")
 
 
 def dort_saat_seviye(sembol, df):
@@ -1397,49 +1406,126 @@ def analiz(sembol, df, fiyat=None, bugun_alt=None):
     nw_tetik = bool(nb) and nb["durum"] in ("sinyal", "değdi", "yaklaşıyor")
     teyit = teyit_hesapla(df4, _simdi(), nb)
     smc_tetik = any(p[0] == "SMC mavi blok" for p in yakin_parca)
+    gosterilen = list(yakin_parca)
+    for p in parcalar:                           # eşik dışında ama tetikleyen göstergeler (EMA200 / NW durumu) de gösterilsin
+        if p not in gosterilen and ((p[0] == "EMA200" and ema_tetik) or (p[0] == "NW alt bant" and nw_tetik)):
+            gosterilen.append(p)
     kes = en_yogun_kesisim([(p[0], p[1], p[2]) for p in yakin_parca])
+    ana = None
+    if kes and kes[0] >= 2:
+        ana = dict(alt=kes[1], ust=kes[2], araclar=list(kes[3]), mesafe=_mesafe(fiyat, kes[1], kes[2]))
+    elif gosterilen:
+        p0 = min(gosterilen, key=lambda p: p[3])
+        ana = dict(alt=p0[1], ust=p0[2], araclar=[p0[0]], mesafe=p0[3])
+    en_yakin = min((p[3] for p in gosterilen), default=None)
+    bagimsiz = [k for k, v in (("ema", ema_tetik), ("nw", nw_tetik), ("smc", smc_tetik)) if v]
     puan = (kes[0] if kes else 0) + (1 if ema_tetik else 0) + (1 if nw_tetik else 0) + (len(teyit["satirlar"]) if teyit else 0)
     return dict(sembol=sembol, fiyat=fiyat, esik=esik, atr=atr, dt=dt, eb=eb, nb=nb, parcalar=parcalar,
                 yakin_parca=yakin_parca, yakin_gruplar=yakin_gruplar, gruplar=gruplar,
                 tetik=bool(yakin_parca) or ema_tetik or nw_tetik, puan=puan,
                 nw_tetik=nw_tetik, ema_tetik=ema_tetik, smc_tetik=smc_tetik, teyit=teyit,
-                kesisim=kes, destek_alti=destek_alti(yakin_parca))
+                kesisim=kes, destek_alti=destek_alti(yakin_parca),
+                gosterilen=gosterilen, ana=ana, en_yakin_mesafe=en_yakin, bagimsiz=bagimsiz)
 
 
-def mesaj_olustur(a):
-    """Onaylanan biçim: hisse başına tek mesaj; yaklaşılan tüm yerler, destek altı, EMA200 notu, genel yön."""
+KISA = {"Yatay destek": "yatay", "Yükselen trend": "trend", "EMA200": "EMA200", "NW alt bant": "NW alt bant",
+        "SMC mavi blok": "SMC blok", "Hacim düğümü": "hacim"}
+TEYIT_AD = {"yutan": "yutan boğa", "rsi_uyumsuzluk": "RSI uyumsuzluk", "mfi_uyumsuzluk": "MFI uyumsuzluk",
+            "rsi_asiri": "RSI aşırı satım", "mfi_asiri": "MFI aşırı satım", "bb": "Bollinger", "nw_sinyal": "NW ▲ sinyali"}
+BAG_AD = {"ema": "〰️ EMA200", "nw": "🌊 NW", "smc": "🟦 SMC"}
+
+
+def _kisa_parca(p, a):
+    ad, alt, ust, m = p[0], p[1], p[2], p[3]
+    yer = _t((alt + ust) / 2) if ad in ("EMA200", "Yükselen trend", "NW alt bant") else f"{_t(alt)}-{_t(ust)}"
+    ek = ""
+    if ad == "EMA200" and a.get("eb") and a["eb"]["durum"] in ("dokundu", "yaklaşıyor"):
+        ek = ", " + a["eb"]["durum"]
+    if ad == "NW alt bant" and a.get("nb") and a["nb"]["durum"] in ("sinyal", "değdi", "yaklaşıyor"):
+        ek = ", " + {"sinyal": "▲ sinyali", "değdi": "değdi", "yaklaşıyor": "yaklaşıyor"}[a["nb"]["durum"]]
+    konum = "içinde" if m == 0 else f"%{_t(m, 1)} üstünde"
+    return f"{IKON.get(ad, '•')} {KISA.get(ad, ad)} {yer} ({konum}{ek})"
+
+
+def mesaj_olustur(a, guncelleme=None):
+    """Kısa biçim: üstte en önemli bilgi (ana destek, kopuş seviyesi, teyit), altta ayrıntı.
+    guncelleme: None (ilk mesaj) ya da dict(n=2, degisim=[...]) (aynı hisse için güncelleme)."""
     ik = bagimsiz_ikonlar(a)
-    satirlar = [f"📍 {a['sembol']} – takibe al (puan {a['puan']})" + (f" {ik}" if ik else ""), f"Fiyat: {_t(a['fiyat'])}", "", "Yaklaştığı yerler:"]
-    gosterilen = list(a["yakin_parca"])
-    for p in a["parcalar"]:                     # eşik dışında ama tetikleyen göstergeler (EMA200 / NW durumu) de yazılsın
-        if p not in gosterilen and ((p[0] == "EMA200" and a["ema_tetik"]) or (p[0] == "NW alt bant" and a["nw_tetik"])):
-            gosterilen.append(p)
-    for p in gosterilen:
-        satirlar.append(f"{IKON.get(p[0], '•')} {p[4]}")
-    if not gosterilen:
-        satirlar.append("• (yok)")
-    satirlar.append("")
-    k = a.get("kesisim")
-    if k and k[0] >= 2:
-        satirlar.append(f"Kesişim: {k[0]} araç aynı yerde ({_t(k[1])}-{_t(k[2])}: {', '.join(k[3])})")
-    if a.get("destek_alti") is not None:
-        satirlar.append(f"Destek altı: {_t(a['destek_alti'])}")
+    son = f"{_t(a['fiyat'])} (puan {a['puan']})" + (f" {ik}" if ik else "")
+    if guncelleme:
+        satirlar = [f"↗️ GÜNCELLEME {guncelleme['n']}/{MAX_MESAJ_HISSE} – {a['sembol']} {son}",
+                    "Değişiklik: " + " · ".join(guncelleme["degisim"])]
+    else:
+        satirlar = [f"📍 {a['sembol']} {son}"]
+    ana = a.get("ana")
+    if ana:
+        konum = "fiyat bölgenin içinde" if ana["mesafe"] == 0 else f"fiyat %{_t(ana['mesafe'], 1)} üstünde"
+        satirlar.append(f"🎯 Ana destek: {_t(ana['alt'])}-{_t(ana['ust'])} ({konum})")
+        if len(ana["araclar"]) >= 2:
+            satirlar.append(f"   {len(ana['araclar'])} araç üst üste: " + " · ".join(f"{IKON.get(x, '•')} {KISA.get(x, x)}" for x in ana["araclar"]))
+        else:
+            x = ana["araclar"][0]
+            satirlar.append(f"   {IKON.get(x, '•')} {KISA.get(x, x)}")
+    bozulma = ana["alt"] if ana else a.get("destek_alti")
+    if bozulma is not None:
+        satirlar.append(f"⛔ {_t(bozulma)} altına inerse destek bozulur")
     t = a.get("teyit")
-    if t:
-        satirlar.append("Teyitler (4 saatlik):" + (" yok" if not t["satirlar"] else ""))
-        for x in t["satirlar"]:
-            satirlar.append("✅ " + x)
-        satirlar.append(t["bilgi"])
-    if a["eb"] and not any(p[0] == "EMA200" for p in gosterilen):
-        yon = "üstünde" if a["eb"]["mesafe"] >= 0 else "altında"
-        satirlar.append(f"EMA200: {_t(a['eb']['deger'])} (fiyat %{_t(abs(a['eb']['mesafe']), 1)} {yon})")
+    if t is None:
+        satirlar.append("✅ Teyit: hesaplanamadı (4 saatlik veri yok)")
+    else:
+        satirlar.append("✅ Teyit: " + (" · ".join(t["satirlar"]) if t["satirlar"] else "yok"))
+        if t["bilgi"]:
+            satirlar.append("📊 " + t["bilgi"])
+    diger = [p for p in a.get("gosterilen", []) if not (ana and p[1] <= ana["ust"] and p[2] >= ana["alt"])]
+    if diger:
+        satirlar.append("Diğer yakın yerler: " + " · ".join(_kisa_parca(p, a) for p in diger[:4]))
     if a["dt"]:
-        satirlar.append(f"Genel yön: AŞAĞI (düşen çizgi bugün {_t(a['dt']['deger'])}, fiyat %{_t(a['dt']['mesafe'], 1)} altında)")
+        satirlar.append(f"Genel yön: AŞAĞI (düşen çizgi {_t(a['dt']['deger'])})")
     else:
         satirlar.append("Genel yön: aşağı değil")
-    atr_txt = f", ATR %{_t(a['atr'], 1)}" if a["atr"] is not None else ""
-    satirlar.append(f"(yaklaşma eşiği %{_t(a['esik'], 1)}{atr_txt})")
     return "\n".join(satirlar)
+
+
+# ---- aynı hisse için güncelleme mantığı
+def kayit_al(durum):
+    """Hisse başına mesaj kaydı: {sembol: {n, zaman, mesafe, ana_mesafe, destek_alt, destek_ust, teyit, bagimsiz}}.
+    Eski biçim (yalnız gönderilen listesi) varsa sessiz başlangıç kaydına çevrilir ('eski'=True)."""
+    k = durum.setdefault("kayit", {})
+    for s in durum.get("gonderilen", []):
+        if s not in k:
+            k[s] = dict(n=1, zaman=time.time(), mesafe=None, ana_mesafe=None, destek_alt=None, destek_ust=None,
+                        teyit=[], bagimsiz=[], eski=True)
+    durum["gonderilen"] = []
+    return k
+
+
+def kayit_yaz(kayit, a, zaman, onceki=None, n=None):
+    onceki = onceki or {}
+    ana = a.get("ana")
+    yeni_teyit = a["teyit"]["anahtar"] if a.get("teyit") else []
+    kayit[a["sembol"]] = dict(
+        n=n if n is not None else onceki.get("n", 0) + 1, zaman=zaman, mesafe=a.get("en_yakin_mesafe"),
+        ana_mesafe=ana["mesafe"] if ana else None, destek_alt=ana["alt"] if ana else None, destek_ust=ana["ust"] if ana else None,
+        teyit=sorted(set(onceki.get("teyit", [])) | set(yeni_teyit)),
+        bagimsiz=sorted(set(onceki.get("bagimsiz", [])) | set(a.get("bagimsiz", []))))
+
+
+def guncelleme_degisimleri(k, a):
+    """Önceki mesaja göre ne değişti? Boş liste = güncelleme gerekmez."""
+    d = []
+    onceki, simdi = k.get("mesafe"), a.get("en_yakin_mesafe")
+    if onceki is not None and simdi is not None and onceki > 0:
+        if simdi == 0:
+            d.append("fiyat desteğin içine girdi")
+        elif simdi <= onceki * YAKLASMA_ORAN and onceki - simdi >= YAKLASMA_MIN_FARK:
+            d.append(f"fiyat desteğe yaklaştı: %{_t(onceki, 1)} → %{_t(simdi, 1)}")
+    yeni_t = [x for x in (a["teyit"]["anahtar"] if a.get("teyit") else []) if x not in k.get("teyit", [])]
+    if yeni_t:
+        d.append("yeni teyit: " + ", ".join(TEYIT_AD.get(x, x) for x in yeni_t))
+    yeni_b = [x for x in a.get("bagimsiz", []) if x not in k.get("bagimsiz", [])]
+    if yeni_b:
+        d.append("yeni tetik: " + " ".join(BAG_AD.get(x, x) for x in yeni_b))
+    return d
 
 
 def tara_calistir():
@@ -1469,6 +1555,7 @@ def tara_calistir():
         print(f"önceki çalışmadan {len(dort)} hissenin 4 saatlik seviyesi devralındı")
     rot = 0
     durum = durum_oku(f"{simdi:%Y-%m-%d}")
+    kayit = kayit_al(durum)
     bakildi = {}
     tur = 0
     while True:
@@ -1504,20 +1591,44 @@ def tara_calistir():
                 continue
             # 2) güncel fiyatlar ve hızlı eleme
             fiyatlar = anlik_fiyatlar(kuyruk)
+            simdi_t = time.time()
             adaylar = []
             for s in kuyruk:
-                if s in durum["gonderilen"] or s not in fiyatlar:
-                    continue
-                if time.time() - bakildi.get(s, 0) < TEKRAR_BAKMA_SN:
+                if s not in fiyatlar:
                     continue
                 f, alt_bugun = fiyatlar[s]
-                try:
-                    puan, aday = aday_puani(gunluk[s], f, alt_bugun, dort.get(s))
-                except Exception as e:
-                    print(f"  {s}: hızlı eleme hatası ({type(e).__name__})")
+                k = kayit.get(s)
+                if k is None:                                    # henüz mesaj atılmamış hisse: hızlı eleme
+                    if simdi_t - bakildi.get(s, 0) < TEKRAR_BAKMA_SN:
+                        continue
+                    try:
+                        puan, aday = aday_puani(gunluk[s], f, alt_bugun, dort.get(s))
+                    except Exception as e:
+                        print(f"  {s}: hızlı eleme hatası ({type(e).__name__})")
+                        continue
+                    if aday:
+                        adaylar.append((puan, s))
                     continue
-                if aday:
-                    adaylar.append((puan, s))
+                if simdi_t - max(k["zaman"], bakildi.get(s, 0)) < GUNCELLEME_ARASI:
+                    continue
+                if k.get("eski"):                                # eski biçimden devralınan: bir kez sessiz başlangıç analizi
+                    try:
+                        puan, aday = aday_puani(gunluk[s], f, alt_bugun, dort.get(s))
+                    except Exception:
+                        continue
+                    if aday:
+                        adaylar.append((puan, s))
+                    continue
+                if k["n"] >= MAX_MESAJ_HISSE or k.get("destek_ust") is None or k.get("destek_alt") is None:
+                    continue
+                if f < k["destek_alt"]:                          # fiyat desteğin altına inmiş: güncelleme yok
+                    continue
+                d = 0.0 if f <= k["destek_ust"] else (f / k["destek_ust"] - 1) * 100
+                am = k.get("ana_mesafe")
+                yaklasti = am is not None and am > 0 and d <= am * YAKLASMA_ORAN
+                periyodik = simdi_t - max(k["zaman"], bakildi.get(s, 0)) >= TEKRAR_ANALIZ_SN and d <= 5.0
+                if yaklasti or periyodik:
+                    adaylar.append((0, s))
             adaylar.sort(reverse=True)
             n_aday = len(adaylar)
             # 3) ayrıntılı analiz
@@ -1530,24 +1641,37 @@ def tara_calistir():
                 except Exception as e:
                     print(f"  {s}: ayrıntılı analiz hatası ({type(e).__name__}: {str(e)[:80]})")
                     continue
-                if a["tetik"]:
+                if not a["tetik"]:
+                    continue
+                k = kayit.get(s)
+                if k is None:
+                    a["_guncelleme"] = None
                     sonuclar.append(a)
+                elif k.get("eski"):                              # sessiz başlangıç: mevcut durumu kaydet, mesaj atma
+                    kayit_yaz(kayit, a, time.time(), None, n=1)
+                else:
+                    dg = guncelleme_degisimleri(k, a)
+                    if dg:
+                        a["_guncelleme"] = dict(n=k["n"] + 1, degisim=dg)
+                        sonuclar.append(a)
             sonuclar.sort(key=lambda a: -a["puan"])
             # 4) gönder
             gonderilen = 0
+            n_guncelleme = 0
             gonderilecek = sonuclar[:MAX_MESAJ]
             if len(gonderilecek) >= 3:                       # çok mesaj gelecekse önce tek satırlık sıralı özet
-                ozet = [f"📋 Tur özeti ({simdi:%H:%M}): {len(gonderilecek)} hisse, en güçlüden başlayarak"]
+                ozet = [f"📋 Tur özeti ({simdi:%H:%M}): {len(gonderilecek)} mesaj, en güçlüden başlayarak"]
                 for i, a in enumerate(gonderilecek, 1):
                     ik = bagimsiz_ikonlar(a)
-                    ozet.append(f"{i}. {a['sembol']} (puan {a['puan']})" + (f" {ik}" if ik else ""))
+                    ozet.append(f"{i}. {a['sembol']} (puan {a['puan']})" + (f" {ik}" if ik else "") + (" ↗️ güncelleme" if a.get("_guncelleme") else ""))
                 ozet.append(SIMGE_ACIKLAMA)
                 telegram_gonder("\n".join(ozet))
                 time.sleep(0.6)
             for a in gonderilecek:
-                if telegram_gonder(mesaj_olustur(a)):
-                    durum["gonderilen"].append(a["sembol"])
+                if telegram_gonder(mesaj_olustur(a, a.get("_guncelleme"))):
+                    kayit_yaz(kayit, a, time.time(), kayit.get(a["sembol"]))
                     gonderilen += 1
+                    n_guncelleme += 1 if a.get("_guncelleme") else 0
                     durum_yaz(durum)
                     time.sleep(0.6)
                 else:
@@ -1555,7 +1679,7 @@ def tara_calistir():
             if tur % 5 == 0:
                 dort_yaz(dort)
             print(f"[{simdi:%H:%M}] tur {tur}: fiyat {len(fiyatlar)}/{len(kuyruk)}, aday {n_aday}, tetik {len(sonuclar)}, "
-                  f"mesaj {gonderilen}, 4s seviye {len(dort)}/{len(kuyruk)} ({time.time() - t_tur:.0f} sn)")
+                  f"mesaj {gonderilen} (güncelleme {n_guncelleme}), 4s seviye {len(dort)}/{len(kuyruk)} ({time.time() - t_tur:.0f} sn)")
             if len(sonuclar) > MAX_MESAJ:
                 print(f"  uyarı: {len(sonuclar)} tetikleme var, bu turda {MAX_MESAJ} tanesi gönderildi, kalanı sonraki turda.")
         except Exception as e:
