@@ -422,6 +422,32 @@ def ema_hesapla(kapanis, uzunluk=EMA_UZUNLUK):
     return sonuc
 
 
+def bugunlu_kapanis(df, fiyat):
+    """Günlük kapanışlar; son eleman bugünün güncel fiyatı, sondan ikinci eleman dünün kapanışı olacak şekilde.
+    Seans öncesi çekilen günlük veride bugünün mumu yoktur (son mum dün) -> güncel fiyat sona eklenir.
+    Seans içinde çekilmişse bugünün (eksik) mumu vardır -> son kapanış güncel fiyatla değiştirilir."""
+    kap = df["Close"].to_numpy(dtype=float).copy()
+    if df.index[-1].date() == _simdi().date():
+        kap[-1] = fiyat
+        return kap
+    return np.append(kap, fiyat)
+
+
+def gelis_bilgi(df, fiyat, bugun_alt):
+    """Fiyat yukarıdan mı geliyor? dun = dünün kapanışı; yukaridan = son EMA_YUKARIDAN_GUN günün en yüksek kapanışı
+    fiyattan en az %EMA_YUKARIDAN_FARK yukarıda; bugun_alt = bugünün en düşüğü."""
+    kap = bugunlu_kapanis(df, fiyat)
+    onceki = kap[-1 - EMA_YUKARIDAN_GUN:-1]
+    return dict(dun=float(kap[-2]), yukaridan=bool(onceki.max() >= fiyat * (1 + EMA_YUKARIDAN_FARK / 100)),
+                bugun_alt=float(bugun_alt))
+
+
+def gelis_uygun(g, alt, ust):
+    """Destek bölgesine fiyat yukarıdan inerek mi yaklaştı? Dün kapanış bölgenin altında olmamalı (aşağıdan gelen fiyat için
+    o bölge direnç olur, destek değil); ve ya fiyat son günlerde belirgin yukarıdan inmiş ya da bugün bölgeye dokunmuş olmalı."""
+    return g["dun"] >= alt * 0.995 and (g["yukaridan"] or g["bugun_alt"] <= ust * 1.001)
+
+
 def ema200_bilgi(df, fiyat=None, bugun_alt=None):
     """EMA200'ün değeri, fiyatın ona % farkı (+ ise üstünde), eğimi ve durumu.
     durum: "dokundu"    -> bugünün en düşüğü EMA'ya değdi/indi, dün kapanış EMA'nın üstündeydi, fiyat EMA'dan en fazla %1 aşağıda
@@ -430,12 +456,11 @@ def ema200_bilgi(df, fiyat=None, bugun_alt=None):
     Son mumun kapanışı yerine güncel fiyat kullanılır. Veri yetersizse None."""
     if df is None or len(df) < EMA_UZUNLUK + 20:
         return None
-    kap = df["Close"].to_numpy(dtype=float).copy()
     if fiyat is None:
-        fiyat = float(kap[-1])
+        fiyat = float(df["Close"].iloc[-1])
     if bugun_alt is None:
         bugun_alt = float(df["Low"].iloc[-1])
-    kap[-1] = fiyat
+    kap = bugunlu_kapanis(df, fiyat)
     ema = ema_hesapla(kap)
     deger = float(ema[-1])
     mesafe = (fiyat / deger - 1) * 100
@@ -936,6 +961,7 @@ RSI_ASIRI = 30.0
 MFI_ASIRI = 20.0
 UYUMSUZLUK_PENCERE = 60  # uyumsuzluk için bakılan son mum sayısı (4 saatlik)
 UYUMSUZLUK_YAKIN = 12    # son dip bu kadar mum içinde olmalı
+UYUMSUZLUK_MIN_ARA = 5   # iki dip arası en az bu kadar mum (4 saatlik); daha yakın dipler gürültü sayılır (TradingView uyumsuzluk göstergelerinde de varsayılan 5)
 
 
 def _simdi():
@@ -1153,23 +1179,73 @@ def bollinger_alt(c, n=BB_UZUNLUK, k=BB_CARPAN):
     return float(son.mean() - k * son.std())
 
 
-def pozitif_uyumsuzluk(dusuk, gosterge, n=3):
-    """Fiyat daha düşük dip yaparken gösterge daha yüksek dip yapmış mı? Son iki onaylı dip (solunda/sağında n mum)
-    karşılaştırılır; ikinci dip son UYUMSUZLUK_YAKIN mum içinde olmalı, gösterge 50'nin altında kalmalı."""
+def uyumsuzluk_ayrinti(dusuk, gosterge, n=3):
+    """Pozitif uyumsuzluk kararını ve nedenini verir. Son iki onaylı dip (solunda/sağında n mum) karşılaştırılır:
+    fiyat daha düşük dip yapmış (en az %0,1), gösterge daha yüksek dip yapmış (en az 1 puan), ikinci dipte gösterge 50'nin altında,
+    iki dip arası en az UYUMSUZLUK_MIN_ARA mum, ikinci dip son UYUMSUZLUK_YAKIN mum içinde.
+    Dönüş: dict(var=bool, neden=str, dipler=[mum sıraları], i1, i2)."""
     dusuk = np.asarray(dusuk, dtype=float)
     gosterge = np.asarray(gosterge, dtype=float)
     uz = len(dusuk)
-    if gosterge is None or uz < 2 * n + 5:
-        return False
+    if uz < 2 * n + 5:
+        return dict(var=False, neden="veri kısa", dipler=[], i1=None, i2=None)
     bas = max(n, uz - UYUMSUZLUK_PENCERE)
     dipler = [i for i in range(bas, uz - n)
               if dusuk[i] == dusuk[i - n:i + n + 1].min() and not np.isnan(gosterge[i])]
     if len(dipler) < 2:
-        return False
+        return dict(var=False, neden="son 60 mumda 2 onaylı dip yok", dipler=dipler, i1=None, i2=None)
     i1, i2 = dipler[-2], dipler[-1]
+    sonuc = dict(var=False, neden="", dipler=dipler, i1=i1, i2=i2)
     if i2 < uz - 1 - UYUMSUZLUK_YAKIN:
+        sonuc["neden"] = f"son dip çok eski ({uz - 1 - i2} mum önce, en fazla {UYUMSUZLUK_YAKIN})"
+    elif i2 - i1 < UYUMSUZLUK_MIN_ARA:
+        sonuc["neden"] = f"iki dip birbirine çok yakın ({i2 - i1} mum, en az {UYUMSUZLUK_MIN_ARA})"
+    elif not dusuk[i2] < dusuk[i1] * 0.999:
+        sonuc["neden"] = "fiyat daha düşük dip yapmamış"
+    elif not gosterge[i2] > gosterge[i1] + 1.0:
+        sonuc["neden"] = "gösterge daha yüksek dip yapmamış"
+    elif not gosterge[i2] < 50:
+        sonuc["neden"] = "gösterge 50'nin üstünde"
+    else:
+        sonuc["var"] = True
+        sonuc["neden"] = "fiyat daha düşük dip, gösterge daha yüksek dip"
+    return sonuc
+
+
+def pozitif_uyumsuzluk(dusuk, gosterge, n=3):
+    """Fiyat daha düşük dip yaparken gösterge daha yüksek dip yapmış mı? (ayrıntı: uyumsuzluk_ayrinti)"""
+    if gosterge is None:
         return False
-    return bool(dusuk[i2] < dusuk[i1] * 0.999 and gosterge[i2] > gosterge[i1] + 1.0 and gosterge[i2] < 50)
+    return bool(uyumsuzluk_ayrinti(dusuk, gosterge, n)["var"])
+
+
+def uyumsuzluk_yazdir(sembol):
+    """Kontrol çıktısı: son 4 saatlik dipler (tarih, en düşük, RSI, MFI) ve uyumsuzluk kararı. TradingView'da karşılaştırmak için."""
+    gunluk = veri_cek_gunluk(sembol)
+    if gunluk is None:
+        print(f"{sembol}: günlük veri alınamadı")
+        return
+    df4 = veri_cek_4saat(sembol, gunluk)
+    if df4 is None or len(df4) < 60:
+        print(f"{sembol}: 4 saatlik veri yetersiz")
+        return
+    h, l, c = (df4[k].to_numpy(dtype=float) for k in ("High", "Low", "Close"))
+    v = df4["Volume"].to_numpy(dtype=float)
+    rsi = rsi_serisi(c)
+    mfi = mfi_serisi(h, l, c, v) if np.nansum(v) > 0 else None
+    print(f"\n===== {sembol}: 4 saatlik mumlar, son mum {df4.index[-1]:%Y-%m-%d %H:%M} (toplam {len(df4)}) =====")
+    for ad, g in (("RSI", rsi), ("MFI (yaklaşık)", mfi)):
+        if g is None:
+            print(f"{ad}: hesaplanamadı")
+            continue
+        r = uyumsuzluk_ayrinti(l, g)
+        print(f"\n-- {ad}: son 60 mumdaki dipler (solunda/sağında 3 mum daha yüksek) --")
+        print("  mum tarihi (açılış)   en düşük   " + ad.split()[0] + "     not")
+        for i in r["dipler"]:
+            isaret = "  <-- 1. dip" if i == r["i1"] else ("  <-- 2. dip (son)" if i == r["i2"] else "")
+            print(f"  {df4.index[i]:%Y-%m-%d %H:%M}   {l[i]:9.2f}   {g[i]:6.1f}{isaret}")
+        print(f"  KARAR: {'UYUMSUZLUK VAR' if r['var'] else 'uyumsuzluk yok'} - {r['neden']}")
+    print("\nTradingView'da 4 saatlik grafikte aynı mumların en düşüğüne ve RSI değerine bakıp karşılaştır.")
 
 
 def mum_kapandi(zaman, simdi):
@@ -1264,20 +1340,27 @@ def aday_puani(df, fiyat=None, bugun_alt=None, d4=None):
         bugun_alt = float(df["Low"].iloc[-1])
     esik, _ = yakinlik_esigi(df)
     esik += ADAY_PAYI
+    gb = gelis_bilgi(df, fiyat, bugun_alt)
     parca = [("Yatay destek", r["alt"], r["ust"]) for r in yatay_destekler(df, fiyat)]
     if not dusen_trend(df, fiyat):
         parca += [("Yükselen trend", r["deger"] * 0.995, r["deger"] * 1.005) for r in yukselen_trendler(df, fiyat)]
     eb = ema200_bilgi(df, fiyat, bugun_alt)
+    ema_tetik = False
     if eb:
-        parca.append(("EMA200", eb["deger"] * 0.995, eb["deger"] * 1.005))
+        ema_parca = ("EMA200", eb["deger"] * 0.995, eb["deger"] * 1.005)
+        parca.append(ema_parca)
+        ema_tetik = eb["durum"] == "dokundu" or (eb["durum"] == "yaklaşıyor" and gelis_uygun(gb, ema_parca[1], ema_parca[2]))
     nw_sinyal = False
+    nw_dokundu = False
     if d4:
         parca += [("SMC mavi blok", b["alt"], b["ust"]) for b in d4["bloklar"]]
+        nw_sinyal = d4.get("nb_durum") == "sinyal"
+        nw_dokundu = d4.get("nb_durum") in ("sinyal", "değdi")
         if d4.get("nb_alt"):
             parca.append(("NW alt bant", d4["nb_alt"] * 0.995, d4["nb_alt"] * 1.005))
-        nw_sinyal = d4.get("nb_durum") == "sinyal"
+    # yön filtresi: fiyat yukarıdan inerek gelmiyorsa o araç aday sayılmaz (NW'nin değdi/sinyal durumu hariç)
+    parca = [p for p in parca if (p[0] == "NW alt bant" and nw_dokundu) or gelis_uygun(gb, p[1], p[2])]
     yakin = [g for g in kesisim_bolgeleri(parca, fiyat, esik) if g["yakin"]]
-    ema_tetik = bool(eb) and eb["durum"] != "yok"
     puan = (max(len(g["araclar"]) for g in yakin) if yakin else 0) + (1 if ema_tetik else 0) + (1 if nw_sinyal else 0)
     return puan, bool(yakin) or ema_tetik or nw_sinyal
 
@@ -1363,9 +1446,12 @@ def analiz(sembol, df, fiyat=None, bugun_alt=None):
         dfn = df4
     nb = nw_bilgi(dfn, fiyat) if dfn is not None and len(dfn) >= 100 else None
 
-    parcalar = []      # (ad, alt, ust, mesafe, metin); yalnız fiyatın altında/içinde olanlar
-    def ekle(ad, alt, ust, mesafe, metin):
-        if alt <= fiyat:
+    gb = gelis_bilgi(df, fiyat, bugun_alt)
+    nw_dokundu = bool(nb) and nb["durum"] in ("sinyal", "değdi")
+    parcalar = []      # (ad, alt, ust, mesafe, metin); yalnız fiyatın altında/içinde olanlar, fiyat yukarıdan inerek gelmişse
+    def ekle(ad, alt, ust, mesafe, metin, yon_atla=False):
+        # yön filtresi: aşağıdan yukarı gelen fiyat için o seviye direnç olur, destek değil -> alınmaz (NW değdi/sinyal hariç)
+        if alt <= fiyat and (yon_atla or gelis_uygun(gb, alt, ust)):
             parcalar.append((ad, alt, ust, mesafe, metin))
     for r in yatay:
         m = _mesafe(fiyat, r["alt"], r["ust"])
@@ -1397,13 +1483,14 @@ def analiz(sembol, df, fiyat=None, bugun_alt=None):
         ek = {"sinyal": " - son mumlarda ▲ sinyali", "değdi": " - alt banda değdi", "yaklaşıyor": " - yaklaşıyor"}.get(nb["durum"], "")
         yon = "üstünde" if nb["mesafe"] >= 0 else "altında"
         ekle("NW alt bant", nb["alt"] * 0.995, nb["alt"] * 1.005, max(nb["mesafe"], 0.0),
-             f"Nadaraya-Watson alt bant {_t(nb['alt'])} (4 saatlik): fiyat %{_t(abs(nb['mesafe']), 1)} {yon}{ek}")
+             f"Nadaraya-Watson alt bant {_t(nb['alt'])} (4 saatlik): fiyat %{_t(abs(nb['mesafe']), 1)} {yon}{ek}",
+             yon_atla=nw_dokundu)
 
     gruplar = kesisim_bolgeleri([(p[0], p[1], p[2]) for p in parcalar], fiyat, esik)
     yakin_gruplar = [g for g in gruplar if g["yakin"]]
     yakin_parca = sorted([p for p in parcalar if p[3] <= esik], key=lambda p: p[3])
-    ema_tetik = bool(eb) and eb["durum"] in ("dokundu", "yaklaşıyor")
-    nw_tetik = bool(nb) and nb["durum"] in ("sinyal", "değdi", "yaklaşıyor")
+    ema_tetik = bool(eb) and (eb["durum"] == "dokundu" or (eb["durum"] == "yaklaşıyor" and any(p[0] == "EMA200" for p in parcalar)))
+    nw_tetik = bool(nb) and (nw_dokundu or (nb["durum"] == "yaklaşıyor" and any(p[0] == "NW alt bant" for p in parcalar)))
     teyit = teyit_hesapla(df4, _simdi(), nb)
     smc_tetik = any(p[0] == "SMC mavi blok" for p in yakin_parca)
     gosterilen = list(yakin_parca)
@@ -1556,7 +1643,9 @@ def tara_calistir():
     rot = 0
     durum = durum_oku(f"{simdi:%Y-%m-%d}")
     kayit = kayit_al(durum)
+    sinyaller = sinyal_oku()
     bakildi = {}
+    seans_bitti = False
     tur = 0
     while True:
         t_tur = time.time()
@@ -1564,6 +1653,7 @@ def tara_calistir():
         seans = zorla or seans_icinde(simdi)
         if not seans and not seans_oncesi(simdi):
             print("Seans bitti, döngü kapanıyor.")
+            seans_bitti = True
             break
         if time.time() - t_basla > sure_limit:
             print("Süre sınırı doldu, döngü kapanıyor (sonraki çalışma devralır).")
@@ -1670,6 +1760,8 @@ def tara_calistir():
             for a in gonderilecek:
                 if telegram_gonder(mesaj_olustur(a, a.get("_guncelleme"))):
                     kayit_yaz(kayit, a, time.time(), kayit.get(a["sembol"]))
+                    sinyal_ekle(sinyaller, a, a["_guncelleme"]["n"] if a.get("_guncelleme") else 1, time.time())
+                    sinyal_yaz(sinyaller)
                     gonderilen += 1
                     n_guncelleme += 1 if a.get("_guncelleme") else 0
                     durum_yaz(durum)
@@ -1690,7 +1782,236 @@ def tara_calistir():
         time.sleep(max(20, CEVRIM_SN - gecen))
     durum_yaz(durum)
     dort_yaz(dort)
+    simdi = _simdi()
+    if (seans_bitti and not zorla and simdi.weekday() < 5 and simdi.hour * 60 + simdi.minute >= 18 * 60 + 10
+            and not durum.get("rapor_gonderildi")):
+        try:
+            print("Gün sonu raporu hazırlanıyor...")
+            rapor_calistir(None, gonder=True)
+            durum["rapor_gonderildi"] = True
+            durum_yaz(durum)
+        except Exception as e:
+            print(f"Gün sonu raporu hatası ({type(e).__name__}: {str(e)[:100]}); elle: mod=rapor")
     print(f"Bitti ({time.time() - t_basla:.0f} sn).")
+
+
+# ---------- sinyal kaydı ve gün sonu raporu ----------
+SINYAL_DOSYASI = os.path.join("durum_destek", "sinyaller.json")
+SINYAL_SAKLAMA_GUN = 120   # kayıtlar bu kadar gün saklanır (toplu başarı özeti için)
+RAPOR_MAX_SATIR = 40       # raporda hisse hisse listelenecek en fazla satır
+TELEGRAM_PARCA = 3800      # Telegram mesajı 4096 karakteri geçemez; uzun rapor bu uzunlukta parçalara bölünür
+
+
+def sinyal_oku():
+    """Gönderilen mesajların kalıcı kaydı. Okunamazsa boş kayıt."""
+    try:
+        with open(SINYAL_DOSYASI, encoding="utf-8") as f:
+            d = json.load(f)
+        if isinstance(d, dict) and isinstance(d.get("kayitlar"), list):
+            return d
+    except Exception:
+        pass
+    return {"kayitlar": []}
+
+
+def sinyal_yaz(sd):
+    sinir = (_simdi() - pd.Timedelta(days=SINYAL_SAKLAMA_GUN)).strftime("%Y-%m-%d")
+    sd["kayitlar"] = [k for k in sd["kayitlar"] if k.get("gun", "") >= sinir]
+    os.makedirs(os.path.dirname(SINYAL_DOSYASI), exist_ok=True)
+    with open(SINYAL_DOSYASI, "w", encoding="utf-8") as f:
+        json.dump(sd, f, ensure_ascii=False)
+
+
+def sinyal_ekle(sd, a, n, zaman):
+    """Gönderilen her mesajı (ilk mesaj ve güncellemeler) kaydeder. Raporda yalnız n=1 olanlar (ilk sinyal) ölçülür."""
+    ana = a.get("ana")
+    t = pd.Timestamp.fromtimestamp(zaman, tz="Europe/Istanbul")
+    sd["kayitlar"].append(dict(
+        gun=f"{t:%Y-%m-%d}", saat=f"{t:%H:%M}", zaman=zaman, sembol=a["sembol"], n=n, fiyat=a["fiyat"], puan=a["puan"],
+        destek_alt=ana["alt"] if ana else None, destek_ust=ana["ust"] if ana else None,
+        araclar=list(ana["araclar"]) if ana else [], teyit=list(a["teyit"]["anahtar"]) if a.get("teyit") else [],
+        bagimsiz=list(a.get("bagimsiz", [])), sonuc=None))
+
+
+def bes_dk_gun(semboller, gun, parca=40):
+    """5 dakikalık mumlar (yalnız o güne ait): {sembol: DataFrame(High, Low, Close)}. Yahoo 5 dakikalık veriyi ~60 gün tutar;
+    burada son 5 işlem günü istenir (rapor aynı gün ya da ertesi gün alınmalı)."""
+    sonuc = {}
+    for i in range(0, len(semboller), parca):
+        grup = semboller[i:i + parca]
+        veri = None
+        for deneme in range(2):
+            try:
+                veri = yf.download(" ".join(x + ".IS" for x in grup), period="5d", interval="5m",
+                                   auto_adjust=False, group_by="ticker", progress=False, threads=True)
+            except Exception:
+                veri = None
+            if veri is not None and not veri.empty:
+                break
+            time.sleep(1.5)
+        if veri is None or veri.empty:
+            continue
+        for x in grup:
+            try:
+                if isinstance(veri.columns, pd.MultiIndex):
+                    if (x + ".IS") not in veri.columns.get_level_values(0):
+                        continue
+                    d = veri[x + ".IS"]
+                else:
+                    d = veri
+                d = d[["High", "Low", "Close"]].dropna()
+                d = d[np.array([t.date() == gun for t in d.index], dtype=bool)]
+                if len(d):
+                    sonuc[x] = d
+            except Exception:
+                pass
+    return sonuc
+
+
+def sinyal_sonucu(k, d):
+    """Tek sinyalin sonucu. d: o günün 5 dakikalık mumları. Dönüş: sonuç sözlüğü (sinyal fiyatına göre yüzdeler).
+    Not: sinyalin içinde bulunduğu 5 dakikalık mum da 'sonrası'na katılır (en fazla 5 dk'lık fark)."""
+    t = pd.Timestamp(k["zaman"], unit="s", tz="UTC")
+    if d.index.tz is None:
+        t = t.tz_convert("Europe/Istanbul").tz_localize(None)
+    sonra = d[d.index >= t.floor("5min")]
+    if sonra.empty:
+        return None
+    f = float(k["fiyat"])
+    kap = float(d["Close"].iloc[-1])
+    yuksek = float(sonra["High"].max())
+    dusuk = float(sonra["Low"].min())
+    son_mum = d.index[-1]
+    return dict(kapanis=kap, kapanis_yuzde=(kap / f - 1) * 100, en_yuksek_yuzde=(yuksek / f - 1) * 100,
+                en_dusuk_yuzde=(dusuk / f - 1) * 100,
+                destek_bozuldu=bool(k.get("destek_alt") is not None and dusuk < float(k["destek_alt"])),
+                tam_gun=bool(son_mum.hour * 60 + son_mum.minute >= 17 * 60 + 50))
+
+
+def _yz(x, n=1):
+    """İşaretli Türkçe yüzde: 1.234 -> +1,2 (yuvarlayınca sıfır olan -0,0 yerine +0,0 yazılır)"""
+    return f"{round(x, n) + 0.0:+.{n}f}".replace(".", ",")
+
+
+def _grup_satiri(ad, liste):
+    if not liste:
+        return None
+    n = len(liste)
+    yuk = sum(1 for k in liste if k["sonuc"]["kapanis_yuzde"] > 0)
+    ort = sum(k["sonuc"]["kapanis_yuzde"] for k in liste) / n
+    return f"  {ad}: {n} hisse · kapanış üstte {yuk}/{n} · ort {_yz(ort)}%"
+
+
+def rapor_metni(olcumlu, gun_etiket, hisse_listesi_yaz=True, eksik=0):
+    """olcumlu: sonucu hesaplanmış ilk sinyaller. Telegram'a gidecek metin satırları (liste)."""
+    n = len(olcumlu)
+    if n == 0:
+        return [f"📊 GÜN SONU RAPORU – {gun_etiket}", "Ölçülebilen sinyal yok."]
+    yuk = sum(1 for k in olcumlu if k["sonuc"]["kapanis_yuzde"] > 0)
+    ort_k = sum(k["sonuc"]["kapanis_yuzde"] for k in olcumlu) / n
+    ort_y = sum(k["sonuc"]["en_yuksek_yuzde"] for k in olcumlu) / n
+    ort_d = sum(k["sonuc"]["en_dusuk_yuzde"] for k in olcumlu) / n
+    boz = sum(1 for k in olcumlu if k["sonuc"]["destek_bozuldu"])
+    sat = [f"📊 GÜN SONU RAPORU – {gun_etiket}",
+           f"Sinyal veren hisse: {n} (ilk mesajdaki fiyat baz alındı)",
+           f"Gün sonu fiyatı sinyal fiyatının üstünde: {yuk}/{n} (%{yuk * 100 // n})",
+           f"Ortalama: gün sonu {_yz(ort_k)}% · sinyalden sonra en yüksek {_yz(ort_y)}% · en düşük {_yz(ort_d)}%",
+           f"Destek bölgesinin altına inen: {boz} hisse"]
+    if eksik:
+        sat.append(f"⚠️ {eksik} sinyal için fiyat verisi alınamadı, hesaba katılmadı")
+    if not all(k["sonuc"]["tam_gun"] for k in olcumlu):
+        sat.append("⚠️ Gün henüz bitmemiş olabilir: 'gün sonu' yerine son fiyat kullanıldı")
+    sat.append("")
+    sat.append("Puana göre:")
+    for ad, f in (("puan 5 ve üstü", lambda k: k["puan"] >= 5), ("puan 3-4", lambda k: 3 <= k["puan"] <= 4),
+                  ("puan 1-2", lambda k: k["puan"] <= 2)):
+        x = _grup_satiri(ad, [k for k in olcumlu if f(k)])
+        if x:
+            sat.append(x)
+    sat.append("Teyide göre:")
+    for ad, f in (("teyitli", lambda k: bool(k["teyit"])), ("teyitsiz", lambda k: not k["teyit"])):
+        x = _grup_satiri(ad, [k for k in olcumlu if f(k)])
+        if x:
+            sat.append(x)
+    sat.append("Araca göre:")
+    for ad, f in (("2+ araç üst üste", lambda k: len(k["araclar"]) >= 2), ("tek araç", lambda k: len(k["araclar"]) < 2),
+                  ("〰️ EMA200 tetikli", lambda k: "ema" in k["bagimsiz"]), ("🌊 NW tetikli", lambda k: "nw" in k["bagimsiz"]),
+                  ("🟦 SMC tetikli", lambda k: "smc" in k["bagimsiz"])):
+        x = _grup_satiri(ad, [k for k in olcumlu if f(k)])
+        if x:
+            sat.append(x)
+    if hisse_listesi_yaz:
+        sat.append("")
+        sat.append("Hisse hisse (puana göre):")
+        sirali = sorted(olcumlu, key=lambda k: (-k["puan"], k["saat"]))
+        for i, k in enumerate(sirali[:RAPOR_MAX_SATIR], 1):
+            r = k["sonuc"]
+            ik = "🟢" if r["kapanis_yuzde"] > 0 else "🔴"
+            sat.append(f"{i}. {ik} {k['sembol']} {k['saat']} (puan {k['puan']}): {_t(k['fiyat'])} → {_t(r['kapanis'])} "
+                       f"({_yz(r['kapanis_yuzde'])}%) · yüksek {_yz(r['en_yuksek_yuzde'])}% · düşük {_yz(r['en_dusuk_yuzde'])}%"
+                       + (" ⛔destek bozuldu" if r["destek_bozuldu"] else ""))
+        if len(sirali) > RAPOR_MAX_SATIR:
+            sat.append(f"... ve {len(sirali) - RAPOR_MAX_SATIR} hisse daha (listede gösterilmedi)")
+    sat.append("")
+    sat.append("Not: stop/hedef kullanılmadı; yalnızca sinyal fiyatına göre. Gün sonu fiyatı = son 5 dakikalık mum.")
+    return sat
+
+
+def telegram_parcali(satirlar):
+    """Satırları Telegram sınırına uygun parçalara bölüp gönderir. Hepsi gittiyse True."""
+    parcalar, cur = [], ""
+    for s in satirlar:
+        if cur and len(cur) + len(s) + 1 > TELEGRAM_PARCA:
+            parcalar.append(cur)
+            cur = ""
+        cur += (("\n" if cur else "") + s)
+    if cur:
+        parcalar.append(cur)
+    tamam = True
+    for p in parcalar:
+        tamam = telegram_gonder(p) and tamam
+        time.sleep(0.6)
+    return tamam
+
+
+def rapor_calistir(hedef=None, gonder=True):
+    """hedef: None -> bugün; 'toplu' -> kayıtlı tüm günlerin özeti; 'YYYY-MM-DD' -> o gün. Ölçülen sonuçlar kayda yazılır."""
+    sd = sinyal_oku()
+    bugun = _simdi().strftime("%Y-%m-%d")
+    if hedef == "toplu":
+        gunler = sorted({k["gun"] for k in sd["kayitlar"] if k["n"] == 1})
+    else:
+        gunler = [hedef or bugun]
+    for gun in gunler:
+        ilk = [k for k in sd["kayitlar"] if k["gun"] == gun and k["n"] == 1]
+        bekleyen = [k for k in ilk if k.get("sonuc") is None or not k["sonuc"].get("tam_gun")]
+        if bekleyen:
+            gun_tarih = pd.Timestamp(gun).date()
+            veri = bes_dk_gun(sorted({k["sembol"] for k in bekleyen}), gun_tarih)
+            for k in bekleyen:
+                d = veri.get(k["sembol"])
+                if d is not None:
+                    r = sinyal_sonucu(k, d)
+                    if r:
+                        k["sonuc"] = r
+        if hedef != "toplu":
+            olcumlu = [k for k in ilk if k.get("sonuc")]
+            etiket = pd.Timestamp(gun).strftime("%d.%m.%Y")
+            if not ilk:
+                metin = [f"📊 GÜN SONU RAPORU – {etiket}", "Bu gün için kayıtlı sinyal yok (bot çalışmadı ya da hiç mesaj atılmadı)."]
+            else:
+                metin = rapor_metni(olcumlu, etiket, True, eksik=len(ilk) - len(olcumlu))
+            print("\n".join(metin))
+            if gonder:
+                telegram_parcali(metin)
+    sinyal_yaz(sd)
+    if hedef == "toplu":
+        olcumlu = [k for k in sd["kayitlar"] if k["n"] == 1 and k.get("sonuc")]
+        etiket = f"TOPLU ({len(gunler)} gün)"
+        metin = rapor_metni(olcumlu, etiket, False)
+        print("\n".join(metin))
+        if gonder:
+            telegram_parcali(metin)
 
 
 def mesaj_testi():
@@ -1710,6 +2031,8 @@ if __name__ == "__main__":
                 kod, ek = s.split(":", 1)
                 if ek == "SMC":
                     smc_kayit_yazdir(kod)
+                elif ek in ("UYUM", "UYUMSUZLUK"):
+                    uyumsuzluk_yazdir(kod)
                 else:
                     ayrinti_yazdir(kod, float(ek.replace(",", ".")))
             else:
@@ -1718,5 +2041,9 @@ if __name__ == "__main__":
         mesaj_testi()
     elif len(sys.argv) >= 2 and sys.argv[1] == "tara":
         tara_calistir()
+    elif len(sys.argv) >= 2 and sys.argv[1] == "rapor":
+        # python destek_bot.py rapor            -> bugünün raporu
+        # python destek_bot.py rapor 2026-11-17 -> o günün raporu;  rapor toplu -> tüm kayıtlı günlerin özeti
+        rapor_calistir(sys.argv[2] if len(sys.argv) >= 3 else None, gonder=bool(os.environ.get("DESTEK_TELEGRAM_TOKEN", "").strip()))
     else:
-        print("Kullanım: python destek_bot.py seviye ASELS BIMAS | mesaj-test | tara")
+        print("Kullanım: python destek_bot.py seviye ASELS BIMAS | seviye ASELS:UYUM | mesaj-test | tara | rapor [YYYY-AA-GG | toplu]")
