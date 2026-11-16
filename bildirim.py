@@ -4,7 +4,8 @@ app.py'den bağımsız çalışır, app.py'ye dokunmaz. GitHub Actions tarafınd
 seans saatlerinde 15 dakikada bir çalıştırılır.
 
 Sabit kurallar:
-- Saatlik mum (15 dakikalık veriden tam saatlere birleştirilir), aktif mum dahil
+- Mum: ZAMAN_DILIMI="4s" (varsayılan) ise 4 saatlik mum (09:40-13:40, 13:40-17:40, 17:40-kapanış; son ~60 gün 15 dakikalık veriden,
+  eskisi saatlik veriden); "1s" ise eski saatlik mum (15 dakikalık veriden tam saatlere). Aktif (kapanmamış) mum dahil, 5 dakikada bir taranır
 - Düşen trend çizgisi kırılımı (🚀): en az 3 temas, eğim %3, temas yakınlığı %0,5
 - Kırılım: kapanmış mum çizginin en az %0,2 üstünde kapanmış ya da aktif mum %0,5 üstünde, ve fiyat hâlâ çizgi üstünde
 - Dönüş teyidi: 6 şart (yeşil mum, hacim, dip korunması, fiyat KAMA üstünde, MACD ve Wave Trend yukarı kesişimi son 5 mumda);
@@ -46,16 +47,25 @@ TOKEN = os.environ.get("TELEGRAM_TOKEN", "").strip()
 CHAT_ID = os.environ.get("TELEGRAM_CHAT_ID", "").strip()
 
 PERIYOT, ARALIK, MUM_DAKIKA = "60d", "15m", 60
-MIN_MUM = 270      # app.py ile aynı: bundan az mumu olan hisse atlanır (NW 50 + MAE 200 + 20)
+# Analiz mumu: "4s" = 4 saatlik (varsayılan), "1s" = eski saatlik. Ortam değişkeni ZAMAN_DILIMI ile ya da bu satırdan değiştirilir.
+ZAMAN_DILIMI = os.environ.get("ZAMAN_DILIMI", "4s").strip().lower()
+if ZAMAN_DILIMI not in ("4s", "1s"):
+    ZAMAN_DILIMI = "4s"
+ETIKET = " (4 saatlik)" if ZAMAN_DILIMI == "4s" else ""
+GECMIS_SN = 6 * 3600     # 4s modunda: eski (saatlikten türetilen) mumlar bu kadar saniye bellekte tutulur, her taramada yeniden çekilmez
+HACIM_TAHMIN_MAX = 4.0   # 4s modunda: kapanmamış mumun hacmi geçen süreye göre en fazla bu kadar katına çıkarılarak tahmin edilir
+GECMIS_SAATLIK = {}      # sembol -> (zaman, saatlik tablo)
+SAATLIK = {}             # sembol -> saatlik tablo (4s modunda likidite ve hareketsiz saat ölçümü için); veri_cek() doldurur
+MIN_MUM = 110 if ZAMAN_DILIMI == "4s" else 270   # saatlikte 270 (app.py ile aynı); 4 saatlikte ~37 işlem günü yeter (göstergelerin ısınması için)
 # Alti teyit: 🟢 yesil mum, 📊 hacim, 🔒 dip korunmus, 📈 fiyat KAMA'nin ustunde,
 #             🔵 MACD (mavi cizgi kirmiziyi yukari kesti), 🌊 Wave Trend (yesil cizgi kirmiziyi yukari kesti)
 TEYIT_TOPLAM = 6
 MIN_TEYIT = 2          # 🚀 icin 6 teyitten en az 2'si VE hacim sartlarin icinde
 MIN_TEYIT_HACIMSIZ = 5  # 🔸 (hacimsiz kirilim) icin: hacim disindaki 5 teyidin hepsi sart
-TEYIT_SON_N = 5        # MACD ve Wave Trend kesisimi icin bakilan son mum sayisi (bolge sarti yok)
+TEYIT_SON_N = 3 if ZAMAN_DILIMI == "4s" else 5   # MACD ve Wave Trend kesisimi icin bakilan son mum sayisi (bolge sarti yok); 4 saatlikte 3 mum = yaklasik 1 islem gunu
 KIRILIM_KAPANMIS = 0.2  # KAPANMIS mum cizginin en az % kac ustunde kapanmali
 KIRILIM_AKTIF = 0.5     # AKTIF (son, kapanmamis) mum cizginin en az % kac ustunde olmali
-KIRILIM_PENCERE = 3     # kirilim, son bu kadar saatlik mumda (aktif mum dahil) aranir
+KIRILIM_PENCERE = 3     # kirilim, son bu kadar mumda (aktif mum dahil) aranir; 4 saatlikte 3 mum = yaklasik 1 islem gunu
 KAMA_N, KAMA_HIZLI, KAMA_YAVAS = 21, 2, 30   # TradingView'deki KAMA ayari
 UST_CIZGI_YAKIN = 1.5   # fiyatin ustundeki gecerli cizgi en fazla bu % uzaktaysa mesaja uyari yazilir
 FIB_GERI = 40          # Fibonacci tepesi: dipten onceki en fazla bu kadar mum icindeki en yuksek nokta
@@ -458,8 +468,8 @@ def hisse_listesi():
     return liste_coz(icerik)
 
 
-def veri_cek(sembol):
-    """app.py'deki veri_cek ile aynı işlem; Yahoo geçici hata verirse 3 kez dener."""
+def _ham_15dk(sembol):
+    """15 dakikalık mumlar (son ~60 gün), Istanbul saatinde; Yahoo geçici hata verirse 3 kez dener. Alınamazsa None."""
     df = None
     for deneme in range(3):
         try:
@@ -477,10 +487,94 @@ def veri_cek(sembol):
     if df.index.tz is None:
         df.index = df.index.tz_localize("UTC")
     df.index = df.index.tz_convert("Europe/Istanbul")
-    df = df.resample(f"{MUM_DAKIKA}min").agg(
+    return df
+
+
+def _saatlik_yap(ham):
+    df = ham.resample(f"{MUM_DAKIKA}min").agg(
         {"Open": "first", "High": "max", "Low": "min", "Close": "last", "Volume": "sum"}
     ).dropna(subset=["Open", "Close"])
     return None if df.empty else df
+
+
+def _ohlcv_topla(m, anahtar):
+    g = m.groupby(anahtar).agg(Open=("Open", "first"), High=("High", "max"), Low=("Low", "min"),
+                               Close=("Close", "last"), Volume=("Volume", "sum"))
+    g.index = pd.DatetimeIndex(g.index).tz_localize("Europe/Istanbul")
+    return g
+
+
+def dort_saatlik_yeni(m):
+    """15 dakikalık mumlardan TradingView'daki gibi 4 saatlik mumlar: 09:40-13:40, 13:40-17:40, 17:40-kapanış.
+    (15 dakikalık mumlar 13:40 ve 17:40 sınırına tam oturmadığı için sınırdaki mum, başlangıç saatine göre bir yana atanır: en fazla 5 dakikalık kayma.)"""
+    idx = m.index
+    dk = idx.hour * 60 + idx.minute
+    bas = np.where(dk < 13 * 60 + 40, 9 * 60 + 40, np.where(dk < 17 * 60 + 40, 13 * 60 + 40, 17 * 60 + 40))
+    return _ohlcv_topla(m, idx.tz_localize(None).normalize() + pd.to_timedelta(bas, unit="m"))
+
+
+def dort_saatlik_eski(h):
+    """Saatlik mumlardan yaklaşık 4 saatlik mumlar (10:00-14:00, 14:00-18:00, 18:00 kapanış): yalnızca 15 dakikalık verinin
+    öncesindeki eski dönem için; saatlik veri 13:40 ve 17:40'ı ayıramaz."""
+    idx = h.index
+    blok = np.where(idx.hour < 14, 10, np.where(idx.hour < 18, 14, 18))
+    return _ohlcv_topla(h, idx.tz_localize(None).normalize() + pd.to_timedelta(blok, unit="h"))
+
+
+def gecmis_saatlik(sembol):
+    """~6 aylık saatlik mumlar (4s modunda 15 dakikalık verinin öncesini doldurur). Bellekte GECMIS_SN saniye tutulur;
+    alınamazsa 10 dakika sonra yeniden denenir."""
+    k = GECMIS_SAATLIK.get(sembol)
+    if k and time.time() - k[0] < GECMIS_SN:
+        return k[1]
+    try:
+        d = veri_cek_uzun(sembol)
+    except Exception:
+        d = None
+    GECMIS_SAATLIK[sembol] = (time.time() if d is not None else time.time() - GECMIS_SN + 600, d)
+    return d
+
+
+def aktif_hacim_tahmini(df):
+    """Kapanmamış 4 saatlik mumun hacmi henüz eksik olduğundan 'hacim ortalamanın üstünde mi' ölçümü hep düşük çıkar.
+    Bu yüzden son mumun hacmi, geçen süreye göre (en fazla HACIM_TAHMIN_MAX kat) büyütülür. Kaba bir tahmindir.
+    17:40 mumu çok kısa (kapanış seansı) olduğu için büyütülmez."""
+    simdi = dt.datetime.now(TR)
+    son = df.index[-1]
+    bas = son.hour * 60 + son.minute
+    if son.date() != simdi.date() or bas >= 17 * 60 + 40:
+        return df
+    gecen = simdi.hour * 60 + simdi.minute - bas
+    if 0 < gecen < 240:
+        df = df.copy()
+        df.iloc[-1, df.columns.get_loc("Volume")] = float(df["Volume"].iloc[-1]) * min(HACIM_TAHMIN_MAX, 240.0 / gecen)
+    return df
+
+
+def dort_saatlik_tablo(sembol, ham):
+    yeni = dort_saatlik_yeni(ham)
+    eski = None
+    h = gecmis_saatlik(sembol)
+    if h is not None:
+        h = h[h.index < ham.index[0].normalize()]
+        if len(h):
+            eski = dort_saatlik_eski(h)
+    df = pd.concat([eski, yeni]) if eski is not None and len(eski) else yeni
+    return aktif_hacim_tahmini(df)
+
+
+def veri_cek(sembol):
+    """Analiz mumları. 1s modunda saatlik, 4s modunda 4 saatlik (ayrıntı: dort_saatlik_tablo). 4s modunda saatlik tablo
+    ayrıca SAATLIK[sembol] içine konur (likidite ve hareketsiz saat ölçümü saatlik mumlarla kalır). Alınamazsa None."""
+    ham = _ham_15dk(sembol)
+    if ham is None:
+        return None
+    saatlik = _saatlik_yap(ham)
+    if ZAMAN_DILIMI != "4s":
+        return saatlik
+    if saatlik is not None:
+        SAATLIK[sembol] = saatlik
+    return dort_saatlik_tablo(sembol, ham)
 
 
 STOP_ALTI = 0.5                 # stop: kirilan cizginin % kac altinda
@@ -810,8 +904,9 @@ def analiz(sembol, bugun):
         return "kisa", None, None
     if df.index[-1].date() != bugun:
         return "bugun_yok", None, None   # tatil günü ya da bugün hiç işlem görmemiş hisse
-    LIKIDITE[sembol] = gunluk_islem_tutari(df, bugun)
-    DONUK[sembol] = donuk_orani(df, bugun)
+    ds = SAATLIK.get(sembol, df)         # 4s modunda likidite ve hareketsiz saat ölçümü saatlik tablodan
+    LIKIDITE[sembol] = gunluk_islem_tutari(ds, bugun)
+    DONUK[sembol] = donuk_orani(ds, bugun)
     if sembol in RETEST_IZLE:            # bu hissenin bugün bildirilmiş kırılımı var: retest oldu mu
         try:
             RETEST_SONUC[sembol] = retest_kontrol(df, RETEST_IZLE[sembol])
@@ -1541,8 +1636,8 @@ def main(mod=None):
     hacimsizler = [r for r in trend_liste if r["kademe"] == "hacimsiz"]
     erkenler = [r for r in trend_liste if r["kademe"] == "erken"] if ERKEN_GOSTER else []
     erkenler.sort(key=lambda r: (abs(r["kirilim"]), -r["temas"], r["sembol"]))   # çizgiye en yakın önce
-    BASLIK_G, BASLIK_E, BASLIK_A = "🚀 Düşen trend kırılımı", "⏳ Kırılım adayı (çizgiye yakın, henüz kırılmadı)", "🔻 Aşırı satış tepkisi"
-    BASLIK_H = "🔸 Hacimsiz kırılım (çizgi kırıldı, hacim henüz teyit etmedi)"
+    BASLIK_G, BASLIK_E, BASLIK_A = "🚀 Düşen trend kırılımı" + ETIKET, "⏳ Kırılım adayı (çizgiye yakın, henüz kırılmadı)" + ETIKET, "🔻 Aşırı satış tepkisi"
+    BASLIK_H = "🔸 Hacimsiz kırılım (çizgi kırıldı, hacim henüz teyit etmedi)" + ETIKET
 
     def bolumleri_kur(g, h, e, a):
         sonuc = []
