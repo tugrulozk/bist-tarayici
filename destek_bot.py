@@ -1390,7 +1390,7 @@ def analiz(sembol, df, fiyat=None, bugun_alt=None):
 
 def mesaj_olustur(a):
     """Onaylanan biçim: hisse başına tek mesaj; yaklaşılan tüm yerler, destek altı, EMA200 notu, genel yön."""
-    satirlar = [f"📍 {a['sembol']} – takibe al", f"Fiyat: {_t(a['fiyat'])}", "", "Yaklaştığı yerler:"]
+    satirlar = [f"📍 {a['sembol']} – takibe al (puan {a['puan']})", f"Fiyat: {_t(a['fiyat'])}", "", "Yaklaştığı yerler:"]
     gosterilen = list(a["yakin_parca"])
     for p in a["parcalar"]:                     # eşik dışında ama tetikleyen göstergeler (EMA200 / NW durumu) de yazılsın
         if p not in gosterilen and ((p[0] == "EMA200" and a["ema_tetik"]) or (p[0] == "NW alt bant" and a["nw_tetik"])):
@@ -1516,7 +1516,14 @@ def tara_calistir():
             sonuclar.sort(key=lambda a: -a["puan"])
             # 4) gönder
             gonderilen = 0
-            for a in sonuclar[:MAX_MESAJ]:
+            gonderilecek = sonuclar[:MAX_MESAJ]
+            if len(gonderilecek) >= 3:                       # çok mesaj gelecekse önce tek satırlık sıralı özet
+                ozet = [f"📋 Tur özeti ({simdi:%H:%M}): {len(gonderilecek)} hisse, en güçlüden başlayarak"]
+                for i, a in enumerate(gonderilecek, 1):
+                    ozet.append(f"{i}. {a['sembol']} (puan {a['puan']})")
+                telegram_gonder("\n".join(ozet))
+                time.sleep(0.6)
+            for a in gonderilecek:
                 if telegram_gonder(mesaj_olustur(a)):
                     durum["gonderilen"].append(a["sembol"])
                     gonderilen += 1
