@@ -21,6 +21,7 @@ Kurallar (kullanıcıyla netleşenler):
 - Hacim düğümü (son 120 gün): en çok hacmin işlem gördüğü fiyat bölgeleri; fiyatın altındaysa destek adayı. Saatlik veriden hesaplanır (yoksa günlük veriden; günlükte gün içi dağılım tahmindir).
 """
 import json
+import logging
 import os
 import sys
 import time
@@ -30,6 +31,8 @@ import urllib.request
 import numpy as np
 import pandas as pd
 import yfinance as yf
+
+logging.getLogger("yfinance").setLevel(logging.CRITICAL)   # "possibly delisted" gibi Yahoo uyarıları günlüğü doldurmasın (bot veri alamayan hisseleri kendisi sayıp listeler)
 
 PIVOT_N = 4          # bir dip/tepe sayılması için solunda ve sağında bakılan mum sayısı
 BOLGE_TOL = 0.02     # bölge genişliği: en alttaki adayın en fazla %2 üstüne kadar birleştirilir
@@ -961,6 +964,11 @@ RSI_ASIRI = 30.0
 MFI_ASIRI = 20.0
 UYUMSUZLUK_PENCERE = 60  # uyumsuzluk için bakılan son mum sayısı (4 saatlik)
 UYUMSUZLUK_YAKIN = 12    # son dip bu kadar mum içinde olmalı
+LIKIDITE_MIN = 5_000_000.0  # günlük işlem tutarı (TL, son LIKIDITE_GUN tam günün medyanı) bunun altındaysa hisse hiç taranmaz; 0 = filtre kapalı (kırılım botuyla aynı eşik)
+LIKIDITE_GUN = 20
+DONUK_GUN = 10           # hareketsiz saat ölçümü: son bu kadar tam gün
+DONUK_MAX = 0.30         # hareketsiz saat oranı bunun üstündeyse yeni mesaj atılmaz; 1.0 = filtre kapalı (kırılım botuyla aynı eşik)
+HAREKET_TIK = 2          # bir saatlik mumun yüksek-düşük farkı en fazla bu kadar fiyat adımıysa (ya da mum hiç yoksa) o saat "hareketsiz" sayılır
 UYUMSUZLUK_MIN_ARA = 5   # iki dip arası en az bu kadar mum (4 saatlik); daha yakın dipler gürültü sayılır (TradingView uyumsuzluk göstergelerinde de varsayılan 5)
 
 
@@ -1316,6 +1324,60 @@ def teyit_hesapla(df4, simdi, nb=None):
     return dict(satirlar=satirlar, anahtar=anahtar, bilgi=" | ".join(parcalar) if parcalar else "")
 
 
+def gunluk_islem_tutari(df):
+    """Son LIKIDITE_GUN tam günün medyan günlük işlem tutarı (kapanış x hacim, TL). Bugünün (eksik) mumu hariç; veri azsa nan."""
+    tutar = (df["Close"] * df["Volume"]).to_numpy(dtype=float)
+    gunler = np.array(df.index.date)
+    tutar = tutar[gunler != _simdi().date()][-LIKIDITE_GUN:]
+    return float(np.median(tutar)) if len(tutar) >= 5 else float("nan")
+
+
+def fiyat_adimi(fiyat):
+    """BIST pay piyasası fiyat adımı (TL), fiyata göre."""
+    for ust, adim in ((20, 0.01), (50, 0.02), (100, 0.05), (250, 0.10), (500, 0.25), (1000, 0.50), (2500, 1.00)):
+        if fiyat < ust:
+            return adim
+    return 2.50
+
+
+def donuk_orani(h):
+    """Saatlik mumlarla (10:00-17:00 arası 8 saat) fiyatın neredeyse kıpırdamadığı saatlerin oranı; kırılım botundaki ölçümün aynısı.
+    Mum hiç yoksa ya da mumun yüksek-düşük farkı en fazla HAREKET_TIK fiyat adımıysa o saat 'hareketsiz' sayılır.
+    Son DONUK_GUN tam gün üzerinden; 5 günden az veri varsa None."""
+    if h is None or len(h) == 0:
+        return None
+    h = h.dropna(subset=["Close"]).copy()
+    if getattr(h.index, "tz", None) is not None:
+        h.index = h.index.tz_convert("Europe/Istanbul")
+    bugun = _simdi().date()
+    gunler = sorted({g for g in h.index.date if g != bugun})[-DONUK_GUN:]
+    if len(gunler) < 5:
+        return None
+    seans = h[(h.index.hour >= 10) & (h.index.hour <= 17)]
+    adim = np.array([fiyat_adimi(x) for x in seans["Close"]])
+    hareketli = ((seans["High"] - seans["Low"]).to_numpy(dtype=float) >= (HAREKET_TIK + 0.5) * adim)
+    gun_dizi = np.array(seans.index.date)
+    donuk = 0
+    for g in gunler:
+        donuk += 8 - min(8, int(hareketli[gun_dizi == g].sum()))
+    return donuk / (8.0 * len(gunler))
+
+
+def likidite_yazdir(sembol):
+    """Kontrol çıktısı: günlük işlem tutarı ve hareketsiz saat oranı, filtreye takılıp takılmadığı."""
+    g = veri_cek_gunluk(sembol)
+    if g is None:
+        print(f"{sembol}: günlük veri alınamadı")
+        return
+    tutar = gunluk_islem_tutari(g)
+    h = _yf_saatlik(sembol)
+    do = donuk_orani(h)
+    print(f"{sembol}: günlük işlem tutarı (medyan) {tutar / 1e6:.1f} mn TL (eşik {LIKIDITE_MIN / 1e6:.0f} mn TL) -> "
+          + ("ELENİR" if LIKIDITE_MIN > 0 and tutar < LIKIDITE_MIN else "geçer"))
+    print(f"{sembol}: hareketsiz saat oranı " + ("hesaplanamadı" if do is None else f"%{do * 100:.0f} (eşik %{DONUK_MAX * 100:.0f})")
+          + (" -> yeni mesaj atılmaz" if do is not None and DONUK_MAX < 1.0 and do > DONUK_MAX else " -> geçer"))
+
+
 def dort_saat_seviye(sembol, df):
     """Bir hissenin 4 saatlik seviyeleri (SMC mavi bloklar, NW alt bant). Sırayla (rotasyonla) yenilenir. Veri yoksa None."""
     ham = ham_veriler(sembol)
@@ -1328,7 +1390,12 @@ def dort_saat_seviye(sembol, df):
     if dfn is None or len(dfn) < 100:
         dfn = df4
     nb = nw_bilgi(dfn, fiyat)
-    return dict(bloklar=bloklar, nb_alt=float(nb["alt"]) if nb else None, nb_durum=nb["durum"] if nb else None)
+    try:
+        donuk = donuk_orani(ham[0])
+    except Exception:
+        donuk = None
+    return dict(bloklar=bloklar, nb_alt=float(nb["alt"]) if nb else None, nb_durum=nb["durum"] if nb else None,
+                donuk=None if donuk is None else float(donuk))
 
 
 def aday_puani(df, fiyat=None, bugun_alt=None, d4=None):
@@ -1636,8 +1703,19 @@ def tara_calistir():
     if not gunluk:
         print("HATA: hiçbir hissenin günlük verisi alınamadı.")
         sys.exit(1)
+    eksik_veri = [s for s in semboller if s not in gunluk]
+    if eksik_veri:
+        print(f"günlük verisi alınamayan {len(eksik_veri)} hisse (hisseler.txt'den çıkarılabilir): " + " ".join(eksik_veri[:150]))
     kuyruk = [s for s in semboller if s in gunluk]
+    if LIKIDITE_MIN > 0:
+        sigdir = {s for s in kuyruk if gunluk_islem_tutari(gunluk[s]) < LIKIDITE_MIN}     # veri azsa nan: filtre uygulanmaz
+        kuyruk = [s for s in kuyruk if s not in sigdir]
+        print(f"sığ hisse (günlük işlem tutarı < {LIKIDITE_MIN / 1e6:.0f} mn TL) taramadan çıkarıldı: {len(sigdir)}; taranacak: {len(kuyruk)}")
+    if not kuyruk:
+        print("HATA: taranacak hisse kalmadı.")
+        sys.exit(1)
     dort = dort_oku(set(kuyruk))
+    donuk_elenen = {s for s, v in dort.items() if v.get("donuk") is not None and DONUK_MAX < 1.0 and v["donuk"] > DONUK_MAX}
     if dort:
         print(f"önceki çalışmadan {len(dort)} hissenin 4 saatlik seviyesi devralındı")
     rot = 0
@@ -1673,6 +1751,10 @@ def tara_calistir():
                     r = dort_saat_seviye(s, gunluk[s])
                     if r:
                         dort[s] = r
+                        if r.get("donuk") is not None and DONUK_MAX < 1.0 and r["donuk"] > DONUK_MAX:
+                            donuk_elenen.add(s)
+                        else:
+                            donuk_elenen.discard(s)
                 except Exception as e:
                     print(f"  {s}: 4 saatlik seviye hatası ({type(e).__name__})")
             if not seans:                                    # seans öncesi: yalnız hazırlık
@@ -1689,7 +1771,7 @@ def tara_calistir():
                 f, alt_bugun = fiyatlar[s]
                 k = kayit.get(s)
                 if k is None:                                    # henüz mesaj atılmamış hisse: hızlı eleme
-                    if simdi_t - bakildi.get(s, 0) < TEKRAR_BAKMA_SN:
+                    if simdi_t - bakildi.get(s, 0) < TEKRAR_BAKMA_SN or s in donuk_elenen:
                         continue
                     try:
                         puan, aday = aday_puani(gunluk[s], f, alt_bugun, dort.get(s))
@@ -1771,7 +1853,7 @@ def tara_calistir():
             if tur % 5 == 0:
                 dort_yaz(dort)
             print(f"[{simdi:%H:%M}] tur {tur}: fiyat {len(fiyatlar)}/{len(kuyruk)}, aday {n_aday}, tetik {len(sonuclar)}, "
-                  f"mesaj {gonderilen} (güncelleme {n_guncelleme}), 4s seviye {len(dort)}/{len(kuyruk)} ({time.time() - t_tur:.0f} sn)")
+                  f"mesaj {gonderilen} (güncelleme {n_guncelleme}), 4s seviye {len(dort)}/{len(kuyruk)}, hareketsiz elenen {len(donuk_elenen)} ({time.time() - t_tur:.0f} sn)")
             if len(sonuclar) > MAX_MESAJ:
                 print(f"  uyarı: {len(sonuclar)} tetikleme var, bu turda {MAX_MESAJ} tanesi gönderildi, kalanı sonraki turda.")
         except Exception as e:
@@ -2033,6 +2115,8 @@ if __name__ == "__main__":
                     smc_kayit_yazdir(kod)
                 elif ek in ("UYUM", "UYUMSUZLUK"):
                     uyumsuzluk_yazdir(kod)
+                elif ek in ("LIKIT", "LIKIDITE"):
+                    likidite_yazdir(kod)
                 else:
                     ayrinti_yazdir(kod, float(ek.replace(",", ".")))
             else:
