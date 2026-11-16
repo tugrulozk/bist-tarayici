@@ -1273,6 +1273,23 @@ def aday_puani(df, fiyat=None, bugun_alt=None, d4=None):
     return puan, bool(yakin) or ema_tetik or nw_sinyal
 
 
+IKON = {"Yatay destek": "🧱", "Yükselen trend": "📐", "EMA200": "〰️", "NW alt bant": "🌊",
+        "SMC mavi blok": "🟦", "Hacim düğümü": "📦"}
+SIMGE_ACIKLAMA = "Simgeler: 〰️ EMA200 · 🌊 NW alt bant · 🟦 SMC mavi blok · 🧱 yatay destek · 📐 trend · 📦 hacim"
+
+
+def bagimsiz_ikonlar(a):
+    """Doğrudan bildirim tetikleyen üç kriterin (EMA200, NW, SMC) simgeleri: başlıkta hızlı tarama için."""
+    k = []
+    if a.get("ema_tetik"):
+        k.append(IKON["EMA200"])
+    if a.get("nw_tetik"):
+        k.append(IKON["NW alt bant"])
+    if a.get("smc_tetik"):
+        k.append(IKON["SMC mavi blok"])
+    return "".join(k)
+
+
 def _mesafe(fiyat, alt, ust):
     return 0.0 if alt <= fiyat <= ust else (fiyat / ust - 1) * 100
 
@@ -1379,24 +1396,26 @@ def analiz(sembol, df, fiyat=None, bugun_alt=None):
     ema_tetik = bool(eb) and eb["durum"] in ("dokundu", "yaklaşıyor")
     nw_tetik = bool(nb) and nb["durum"] in ("sinyal", "değdi", "yaklaşıyor")
     teyit = teyit_hesapla(df4, _simdi(), nb)
+    smc_tetik = any(p[0] == "SMC mavi blok" for p in yakin_parca)
     kes = en_yogun_kesisim([(p[0], p[1], p[2]) for p in yakin_parca])
     puan = (kes[0] if kes else 0) + (1 if ema_tetik else 0) + (1 if nw_tetik else 0) + (len(teyit["satirlar"]) if teyit else 0)
     return dict(sembol=sembol, fiyat=fiyat, esik=esik, atr=atr, dt=dt, eb=eb, nb=nb, parcalar=parcalar,
                 yakin_parca=yakin_parca, yakin_gruplar=yakin_gruplar, gruplar=gruplar,
                 tetik=bool(yakin_parca) or ema_tetik or nw_tetik, puan=puan,
-                nw_tetik=nw_tetik, ema_tetik=ema_tetik, teyit=teyit,
+                nw_tetik=nw_tetik, ema_tetik=ema_tetik, smc_tetik=smc_tetik, teyit=teyit,
                 kesisim=kes, destek_alti=destek_alti(yakin_parca))
 
 
 def mesaj_olustur(a):
     """Onaylanan biçim: hisse başına tek mesaj; yaklaşılan tüm yerler, destek altı, EMA200 notu, genel yön."""
-    satirlar = [f"📍 {a['sembol']} – takibe al (puan {a['puan']})", f"Fiyat: {_t(a['fiyat'])}", "", "Yaklaştığı yerler:"]
+    ik = bagimsiz_ikonlar(a)
+    satirlar = [f"📍 {a['sembol']} – takibe al (puan {a['puan']})" + (f" {ik}" if ik else ""), f"Fiyat: {_t(a['fiyat'])}", "", "Yaklaştığı yerler:"]
     gosterilen = list(a["yakin_parca"])
     for p in a["parcalar"]:                     # eşik dışında ama tetikleyen göstergeler (EMA200 / NW durumu) de yazılsın
         if p not in gosterilen and ((p[0] == "EMA200" and a["ema_tetik"]) or (p[0] == "NW alt bant" and a["nw_tetik"])):
             gosterilen.append(p)
     for p in gosterilen:
-        satirlar.append("• " + p[4])
+        satirlar.append(f"{IKON.get(p[0], '•')} {p[4]}")
     if not gosterilen:
         satirlar.append("• (yok)")
     satirlar.append("")
@@ -1520,7 +1539,9 @@ def tara_calistir():
             if len(gonderilecek) >= 3:                       # çok mesaj gelecekse önce tek satırlık sıralı özet
                 ozet = [f"📋 Tur özeti ({simdi:%H:%M}): {len(gonderilecek)} hisse, en güçlüden başlayarak"]
                 for i, a in enumerate(gonderilecek, 1):
-                    ozet.append(f"{i}. {a['sembol']} (puan {a['puan']})")
+                    ik = bagimsiz_ikonlar(a)
+                    ozet.append(f"{i}. {a['sembol']} (puan {a['puan']})" + (f" {ik}" if ik else ""))
+                ozet.append(SIMGE_ACIKLAMA)
                 telegram_gonder("\n".join(ozet))
                 time.sleep(0.6)
             for a in gonderilecek:
