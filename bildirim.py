@@ -547,6 +547,7 @@ def aktif_hacim_tahmini(df):
     gecen = simdi.hour * 60 + simdi.minute - bas
     if 0 < gecen < 240:
         df = df.copy()
+        df["Volume"] = df["Volume"].astype("float64")   # int64 sütuna ondalık yazılamaz (TypeError)
         df.iloc[-1, df.columns.get_loc("Volume")] = float(df["Volume"].iloc[-1]) * min(HACIM_TAHMIN_MAX, 240.0 / gecen)
     return df
 
