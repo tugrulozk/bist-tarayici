@@ -2024,6 +2024,8 @@ def tara_calistir():
 # ---------- sinyal kaydı ve gün sonu raporu ----------
 SINYAL_DOSYASI = os.path.join("durum_destek", "sinyaller.json")
 SINYAL_SAKLAMA_GUN = 120   # kayıtlar bu kadar gün saklanır (toplu başarı özeti için)
+BOLGE_TEPKI = 1.0          # bölge girişi için 'tepki' eşiği: girişten en az bu kadar % yükselme
+BOLGE_STOP_PAY = 0.3       # bölge girişi için stop: destek bölgesinin altından bu kadar % aşağısı (fitil payı)
 RAPOR_MAX_SATIR = 40       # raporda hisse hisse listelenecek en fazla satır
 TELEGRAM_PARCA = 3800      # Telegram mesajı 4096 karakteri geçemez; uzun rapor bu uzunlukta parçalara bölünür
 
@@ -2111,7 +2113,39 @@ def sinyal_sonucu(k, d):
     return dict(kapanis=kap, kapanis_yuzde=(kap / f - 1) * 100, en_yuksek_yuzde=(yuksek / f - 1) * 100,
                 en_dusuk_yuzde=(dusuk / f - 1) * 100,
                 destek_bozuldu=bool(k.get("destek_alt") is not None and dusuk < float(k["destek_alt"])),
-                tam_gun=bool(son_mum.hour * 60 + son_mum.minute >= 17 * 60 + 50))
+                tam_gun=bool(son_mum.hour * 60 + son_mum.minute >= 17 * 60 + 50),
+                bolge=bolge_sonucu(k, sonra, kap))
+
+
+def bolge_sonucu(k, sonra, kap):
+    """Destek bölgesine göre ölçüm: giriş = bölgenin üst sınırı (fiyat zaten bölgedeyse sinyal fiyatı); 'doldu' = sinyalden sonra
+    fiyat girişe indi. Doldu ise girişten itibaren: gün sonu, en yüksek/düşük (girişe göre %) ve hangisi önce oldu:
+    %BOLGE_TEPKI yükseliş ('tepki') mi, bölge altı - %BOLGE_STOP_PAY ('bozuldu') mu. Bölge bilgisi yoksa None."""
+    if k.get("destek_ust") is None or k.get("destek_alt") is None:
+        return None
+    ust, alt, f = float(k["destek_ust"]), float(k["destek_alt"]), float(k["fiyat"])
+    giris = min(f, ust)
+    dusuk = sonra["Low"].to_numpy(dtype=float)
+    yuksek = sonra["High"].to_numpy(dtype=float)
+    idx = np.flatnonzero(dusuk <= giris * 1.001)
+    if not len(idx):
+        return dict(doldu=False)
+    i0 = int(idx[0])
+    h, l = yuksek[i0:], dusuk[i0:]
+    stop = alt * (1 - BOLGE_STOP_PAY / 100)
+    hedef = giris * (1 + BOLGE_TEPKI / 100)
+    ti = np.flatnonzero(h >= hedef)
+    bi = np.flatnonzero(l < stop)
+    t = int(ti[0]) if len(ti) else None
+    b = int(bi[0]) if len(bi) else None
+    if t is not None and (b is None or t < b):
+        ilk = "tepki"
+    elif b is not None:
+        ilk = "bozuldu"
+    else:
+        ilk = "belirsiz"
+    return dict(doldu=True, giris=giris, kapanis_yuzde=(kap / giris - 1) * 100, en_yuksek_yuzde=(float(h.max()) / giris - 1) * 100,
+                en_dusuk_yuzde=(float(l.min()) / giris - 1) * 100, ilk=ilk, saat=sonra.index[i0].strftime("%H:%M"))
 
 
 def _yz(x, n=1):
@@ -2126,6 +2160,62 @@ def _grup_satiri(ad, liste):
     yuk = sum(1 for k in liste if k["sonuc"]["kapanis_yuzde"] > 0)
     ort = sum(k["sonuc"]["kapanis_yuzde"] for k in liste) / n
     return f"  {ad}: {n} hisse · kapanış üstte {yuk}/{n} · ort {_yz(ort)}%"
+
+
+def _bolge_eki(b):
+    if not b:
+        return ""
+    if not b["doldu"]:
+        return " · bölgeye inmedi"
+    ad = {"tepki": "tepki aldı", "bozuldu": "bozuldu", "belirsiz": "belirsiz"}[b["ilk"]]
+    return f" · bölgede {b['saat']} (giriş {_t(b['giris'])}): gün sonu {_yz(b['kapanis_yuzde'])}% · {ad}"
+
+
+def _bolge_grup(ad, liste):
+    d = [k for k in liste if k["sonuc"].get("bolge") and k["sonuc"]["bolge"]["doldu"]]
+    if not liste:
+        return None
+    t = sum(1 for k in d if k["sonuc"]["bolge"]["ilk"] == "tepki")
+    b = sum(1 for k in d if k["sonuc"]["bolge"]["ilk"] == "bozuldu")
+    return f"  {ad}: {len(liste)} sinyal · bölgeye inen {len(d)} · tepki önce {t} · bozulma önce {b}"
+
+
+def bolge_satirlari(olcumlu):
+    """Raporun 'destek bölgesine göre' bölümü (giriş = bölge üstü). Ölçüm yoksa boş liste."""
+    vals = [k for k in olcumlu if k["sonuc"].get("bolge") is not None]
+    if not vals:
+        return []
+    d = [k for k in vals if k["sonuc"]["bolge"]["doldu"]]
+    sat = ["", ("🎯 DESTEK BÖLGESİNE GÖRE (giriş = bölgenin üstü, stop = bölge altı -%" + f"{BOLGE_STOP_PAY:g}, tepki = +%{BOLGE_TEPKI:g})").replace(".", ","),
+           f"Fiyat bölgeye inen: {len(d)}/{len(vals)} (%{len(d) * 100 // len(vals)})"]
+    if d:
+        n = len(d)
+        yuk = sum(1 for k in d if k["sonuc"]["bolge"]["kapanis_yuzde"] > 0)
+        ort = sum(k["sonuc"]["bolge"]["kapanis_yuzde"] for k in d) / n
+        oy = sum(k["sonuc"]["bolge"]["en_yuksek_yuzde"] for k in d) / n
+        od = sum(k["sonuc"]["bolge"]["en_dusuk_yuzde"] for k in d) / n
+        t = sum(1 for k in d if k["sonuc"]["bolge"]["ilk"] == "tepki")
+        b = sum(1 for k in d if k["sonuc"]["bolge"]["ilk"] == "bozuldu")
+        sat += [f"İnenlerde gün sonu girişin üstünde: {yuk}/{n} · ort {_yz(ort)}%",
+                f"Ortalama: girişten sonra en yüksek {_yz(oy)}% · en düşük {_yz(od)}%",
+                f"Önce tepki (+%{BOLGE_TEPKI:g}): {t} · önce bozulma: {b} · ikisi de olmadı: {n - t - b}"]
+    sat.append("Puana göre:")
+    for ad, f in (("puan 5 ve üstü", lambda k: k["puan"] >= 5), ("puan 3-4", lambda k: 3 <= k["puan"] <= 4), ("puan 1-2", lambda k: k["puan"] <= 2)):
+        x = _bolge_grup(ad, [k for k in vals if f(k)])
+        if x:
+            sat.append(x)
+    sat.append("Saate göre:")
+    for ad, f in (("10:00-12:00", lambda k: k["saat"] < "12:00"), ("12:00-15:00", lambda k: "12:00" <= k["saat"] < "15:00"),
+                  ("15:00 sonrası", lambda k: k["saat"] >= "15:00")):
+        x = _bolge_grup(ad, [k for k in vals if f(k)])
+        if x:
+            sat.append(x)
+    sat.append("Teyide göre:")
+    for ad, f in (("teyitli", lambda k: bool(k["teyit"])), ("teyitsiz", lambda k: not k["teyit"])):
+        x = _bolge_grup(ad, [k for k in vals if f(k)])
+        if x:
+            sat.append(x)
+    return sat
 
 
 def rapor_metni(olcumlu, gun_etiket, hisse_listesi_yaz=True, eksik=0):
@@ -2159,6 +2249,12 @@ def rapor_metni(olcumlu, gun_etiket, hisse_listesi_yaz=True, eksik=0):
         x = _grup_satiri(ad, [k for k in olcumlu if f(k)])
         if x:
             sat.append(x)
+    sat.append("Saate göre (kurallar gün içinde değişmiş olabilir):")
+    for ad, f in (("10:00-12:00", lambda k: k["saat"] < "12:00"), ("12:00-15:00", lambda k: "12:00" <= k["saat"] < "15:00"),
+                  ("15:00 sonrası", lambda k: k["saat"] >= "15:00")):
+        x = _grup_satiri(ad, [k for k in olcumlu if f(k)])
+        if x:
+            sat.append(x)
     sat.append("Araca göre:")
     for ad, f in (("2+ araç üst üste", lambda k: len(k["araclar"]) >= 2), ("tek araç", lambda k: len(k["araclar"]) < 2),
                   ("〰️ EMA200 tetikli", lambda k: "ema" in k["bagimsiz"]), ("🌊 NW tetikli", lambda k: "nw" in k["bagimsiz"]),
@@ -2166,6 +2262,7 @@ def rapor_metni(olcumlu, gun_etiket, hisse_listesi_yaz=True, eksik=0):
         x = _grup_satiri(ad, [k for k in olcumlu if f(k)])
         if x:
             sat.append(x)
+    sat += bolge_satirlari(olcumlu)
     if hisse_listesi_yaz:
         sat.append("")
         sat.append("Hisse hisse (puana göre):")
@@ -2175,11 +2272,12 @@ def rapor_metni(olcumlu, gun_etiket, hisse_listesi_yaz=True, eksik=0):
             ik = "🟢" if r["kapanis_yuzde"] > 0 else "🔴"
             sat.append(f"{i}. {ik} {k['sembol']} {k['saat']} (puan {k['puan']}): {_t(k['fiyat'])} → {_t(r['kapanis'])} "
                        f"({_yz(r['kapanis_yuzde'])}%) · yüksek {_yz(r['en_yuksek_yuzde'])}% · düşük {_yz(r['en_dusuk_yuzde'])}%"
-                       + (" ⛔destek bozuldu" if r["destek_bozuldu"] else ""))
+                       + (" ⛔destek bozuldu" if r["destek_bozuldu"] else "")
+                       + (_bolge_eki(r.get("bolge"))))
         if len(sirali) > RAPOR_MAX_SATIR:
             sat.append(f"... ve {len(sirali) - RAPOR_MAX_SATIR} hisse daha (listede gösterilmedi)")
     sat.append("")
-    sat.append("Not: stop/hedef kullanılmadı; yalnızca sinyal fiyatına göre. Gün sonu fiyatı = son 5 dakikalık mum.")
+    sat.append("Not: üstteki bölüm ilk mesajdaki fiyata göre, 🎯 bölümü destek bölgesine göre. Gün sonu fiyatı = son 5 dakikalık mum.")
     return sat
 
 
@@ -2210,7 +2308,7 @@ def rapor_calistir(hedef=None, gonder=True):
         gunler = [hedef or bugun]
     for gun in gunler:
         ilk = [k for k in sd["kayitlar"] if k["gun"] == gun and k["n"] == 1]
-        bekleyen = [k for k in ilk if k.get("sonuc") is None or not k["sonuc"].get("tam_gun")]
+        bekleyen = [k for k in ilk if k.get("sonuc") is None or not k["sonuc"].get("tam_gun") or "bolge" not in k["sonuc"]]
         if bekleyen:
             gun_tarih = pd.Timestamp(gun).date()
             veri = bes_dk_gun(sorted({k["sembol"] for k in bekleyen}), gun_tarih)
