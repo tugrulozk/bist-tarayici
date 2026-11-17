@@ -2024,6 +2024,7 @@ def tara_calistir():
 # ---------- sinyal kaydı ve gün sonu raporu ----------
 SINYAL_DOSYASI = os.path.join("durum_destek", "sinyaller.json")
 SINYAL_SAKLAMA_GUN = 120   # kayıtlar bu kadar gün saklanır (toplu başarı özeti için)
+KURAL_SURUMU = "v2-18Kas"   # kuralları değiştirdiğinde bunu da değiştir: rapor sinyalleri sürüme göre ayırır (eski kayıtlar 'eski' sayılır)
 BOLGE_TEPKI = 1.0          # bölge girişi için 'tepki' eşiği: girişten en az bu kadar % yükselme
 BOLGE_STOP_PAY = 0.3       # bölge girişi için stop: destek bölgesinin altından bu kadar % aşağısı (fitil payı)
 RAPOR_MAX_SATIR = 40       # raporda hisse hisse listelenecek en fazla satır
@@ -2055,7 +2056,7 @@ def sinyal_ekle(sd, a, n, zaman):
     ana = a.get("ana")
     t = pd.Timestamp.fromtimestamp(zaman, tz="Europe/Istanbul")
     sd["kayitlar"].append(dict(
-        gun=f"{t:%Y-%m-%d}", saat=f"{t:%H:%M}", zaman=zaman, sembol=a["sembol"], n=n, fiyat=a["fiyat"], puan=a["puan"],
+        gun=f"{t:%Y-%m-%d}", saat=f"{t:%H:%M}", zaman=zaman, sembol=a["sembol"], n=n, fiyat=a["fiyat"], puan=a["puan"], surum=KURAL_SURUMU,
         destek_alt=ana["alt"] if ana else None, destek_ust=ana["ust"] if ana else None,
         araclar=list(ana["araclar"]) if ana else [], teyit=list(a["teyit"]["anahtar"]) if a.get("teyit") else [],
         bagimsiz=list(a.get("bagimsiz", [])), sonuc=None))
@@ -2094,6 +2095,43 @@ def bes_dk_gun(semboller, gun, parca=40):
             except Exception:
                 pass
     return sonuc
+
+
+def endeks_5dk(gun):
+    """BIST100 (XU100) 5 dakikalık veri: dict(gun=o günün mumları, onceki=dünkü son kapanış ya da None). Alınamazsa None."""
+    d = None
+    for deneme in range(2):
+        try:
+            d = yf.Ticker("XU100.IS").history(period="5d", interval="5m", auto_adjust=False)
+        except Exception:
+            d = None
+        if d is not None and not d.empty:
+            break
+        time.sleep(1.5)
+    if d is None or d.empty:
+        return None
+    d = d[["Open", "Close"]].dropna()
+    if d.empty:
+        return None
+    if d.index.tz is None:
+        d.index = d.index.tz_localize("UTC")
+    d.index = d.index.tz_convert("Europe/Istanbul")
+    gunler = np.array(d.index.date)
+    bugun, once = d[gunler == gun], d[gunler < gun]
+    if bugun.empty:
+        return None
+    return dict(gun=bugun, onceki=float(once["Close"].iloc[-1]) if len(once) else None)
+
+
+def endeks_getirisi(e, k):
+    """Sinyalden sonraki ilk 5 dk sınırından gün sonuna BIST100 yüzde değişimi; veri yoksa None."""
+    if not e:
+        return None
+    t = pd.Timestamp(k["zaman"], unit="s", tz="UTC").tz_convert("Europe/Istanbul").floor("5min")
+    yol = e["gun"][e["gun"].index >= t]
+    if yol.empty:
+        return None
+    return (float(yol["Close"].iloc[-1]) / float(yol["Open"].iloc[0]) - 1) * 100
 
 
 def sinyal_sonucu(k, d):
@@ -2218,7 +2256,7 @@ def bolge_satirlari(olcumlu):
     return sat
 
 
-def rapor_metni(olcumlu, gun_etiket, hisse_listesi_yaz=True, eksik=0):
+def rapor_metni(olcumlu, gun_etiket, hisse_listesi_yaz=True, eksik=0, endeks=None):
     """olcumlu: sonucu hesaplanmış ilk sinyaller. Telegram'a gidecek metin satırları (liste)."""
     n = len(olcumlu)
     if n == 0:
@@ -2233,6 +2271,15 @@ def rapor_metni(olcumlu, gun_etiket, hisse_listesi_yaz=True, eksik=0):
            f"Gün sonu fiyatı sinyal fiyatının üstünde: {yuk}/{n} (%{yuk * 100 // n})",
            f"Ortalama: gün sonu {_yz(ort_k)}% · sinyalden sonra en yüksek {_yz(ort_y)}% · en düşük {_yz(ort_d)}%",
            f"Destek bölgesinin altına inen: {boz} hisse"]
+    if endeks and endeks.get("onceki"):
+        eg = (float(endeks["gun"]["Close"].iloc[-1]) / endeks["onceki"] - 1) * 100
+        sat.append(f"📉 BIST100 bugün: {_yz(eg, 2)}% (dünkü kapanışa göre)")
+    ev = [k for k in olcumlu if "endeks_yuzde" in k["sonuc"]]
+    if ev:
+        fark = [k["sonuc"]["kapanis_yuzde"] - k["sonuc"]["endeks_yuzde"] for k in ev]
+        ortg = sum(k["sonuc"]["endeks_yuzde"] for k in ev) / len(ev)
+        sat.append(f"🆚 Aynı saatlerde BIST100 ort {_yz(ortg)}% · hisse − endeks farkı ort {_yz(sum(fark) / len(fark))}% · "
+                   f"endeksi geçen {sum(1 for x in fark if x > 0)}/{len(ev)}")
     if eksik:
         sat.append(f"⚠️ {eksik} sinyal için fiyat verisi alınamadı, hesaba katılmadı")
     if not all(k["sonuc"]["tam_gun"] for k in olcumlu):
@@ -2255,6 +2302,13 @@ def rapor_metni(olcumlu, gun_etiket, hisse_listesi_yaz=True, eksik=0):
         x = _grup_satiri(ad, [k for k in olcumlu if f(k)])
         if x:
             sat.append(x)
+    surumler = sorted({k.get("surum", "eski") for k in olcumlu})
+    if len(surumler) > 1:
+        sat.append("Kural sürümüne göre:")
+        for sv in surumler:
+            x = _grup_satiri(sv, [k for k in olcumlu if k.get("surum", "eski") == sv])
+            if x:
+                sat.append(x)
     sat.append("Araca göre:")
     for ad, f in (("2+ araç üst üste", lambda k: len(k["araclar"]) >= 2), ("tek araç", lambda k: len(k["araclar"]) < 2),
                   ("〰️ EMA200 tetikli", lambda k: "ema" in k["bagimsiz"]), ("🌊 NW tetikli", lambda k: "nw" in k["bagimsiz"]),
@@ -2318,13 +2372,21 @@ def rapor_calistir(hedef=None, gonder=True):
                     r = sinyal_sonucu(k, d)
                     if r:
                         k["sonuc"] = r
+        endeks = None
+        if hedef != "toplu" and ilk:
+            endeks = endeks_5dk(pd.Timestamp(gun).date())
+            for k in ilk:
+                if k.get("sonuc"):
+                    ey = endeks_getirisi(endeks, k)
+                    if ey is not None:
+                        k["sonuc"]["endeks_yuzde"] = ey
         if hedef != "toplu":
             olcumlu = [k for k in ilk if k.get("sonuc")]
             etiket = pd.Timestamp(gun).strftime("%d.%m.%Y")
             if not ilk:
                 metin = [f"📊 GÜN SONU RAPORU – {etiket}", "Bu gün için kayıtlı sinyal yok (bot çalışmadı ya da hiç mesaj atılmadı)."]
             else:
-                metin = rapor_metni(olcumlu, etiket, True, eksik=len(ilk) - len(olcumlu))
+                metin = rapor_metni(olcumlu, etiket, True, eksik=len(ilk) - len(olcumlu), endeks=endeks)
             print("\n".join(metin))
             if gonder:
                 telegram_parcali(metin)
