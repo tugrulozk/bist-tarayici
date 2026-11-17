@@ -46,6 +46,8 @@ TREND_EN_AZ_TEMAS = 3    # çizgi için en az temas
 TREND_MIN_GUN = 8        # çizgiyi belirleyen iki dip arası en az bu kadar mum
 DUSEN_MIN_GUN = 30       # düşen çizginin çıktığı zirve en az bu kadar mum eski olmalı (genel yön sayılması için)
 EMA_UZUNLUK = 200        # üstel hareketli ortalama periyodu (günlük)
+TREND_SARTI = True       # True: NW/SMC/yatay/trend/hacim destekleri yalnız günlük trend yukarıysa mesaj üretir (EMA200 muaf)
+TREND_EMA = 50           # trend ölçümü: fiyat bu günlük EMA'nın üstünde ve EMA yükseliyorsa trend yukarı (ya da kırılmamış yükselen trend çizgisi varsa)
 EMA_YAKLASMA = 1.5       # fiyat EMA'nın üstünde ve en fazla bu kadar % uzaktaysa "yaklaşıyor"
 EMA_DOKUNDU_MAX = 3.0    # bugün EMA'ya değmiş olsa bile fiyat şimdi EMA'nın bu kadar %'den fazla üstündeyse "dokundu" sayılmaz (çoktan uzaklaşmış)
 EMA_YUKARIDAN_GUN = 10   # "yukarıdan geliyor" kontrolü için bakılan mum sayısı
@@ -301,9 +303,8 @@ def ozet_yazdir(df, fiyat, yatay, trendler, dt, eb, dugumler, bloklar, nb):
     parca = []
     for r in yatay:
         parca.append(("Yatay destek", r["alt"], r["ust"]))
-    if not dt:                                           # genel yön aşağıyken yükselen trend desteği sayılmaz
-        for r in trendler:
-            parca.append(("Yükselen trend", r["deger"] * 0.995, r["deger"] * 1.005))
+    for r in trendler:                                   # uzun vadeli düşen çizgi olsa da kırılmamış yükselen çizgi geçerli
+        parca.append(("Yükselen trend", r["deger"] * 0.995, r["deger"] * 1.005))
     if eb:
         parca.append(("EMA200", eb["deger"] * 0.995, eb["deger"] * 1.005))
     for x in dugumler:
@@ -369,6 +370,25 @@ def yukselen_trendler(df, fiyat=None):
             continue
         kalan.append(r)
     return sorted(kalan, key=lambda r: r["mesafe"])
+
+
+def trend_yukari(df, fiyat, cizgiler=None, dusen=False):
+    """Günlük trend yukarı mı? İki yoldan biri yeter:
+    1) fiyat günlük EMA50'nin üstünde ve EMA50 5 gün öncesine göre yükseliyor,
+    2) kapanışla kırılmamış bir yükselen trend çizgisi var (ve düşen trend çizgisi yok).
+    Dönüş: dict(yukari, ema_yol, cizgi_yol, ema50, cizgi)."""
+    ema_yol = False
+    ema50 = None
+    if df is not None and len(df) >= TREND_EMA + 10:
+        kap = bugunlu_kapanis(df, fiyat)
+        e = ema_hesapla(kap, TREND_EMA)
+        ema50 = float(e[-1])
+        ema_yol = bool(fiyat > ema50 and ema50 > float(e[-6]))
+    if cizgiler is None:
+        cizgiler = [] if dusen else yukselen_trendler(df, fiyat)
+    cizgi = cizgiler[0] if (cizgiler and not dusen) else None
+    return dict(yukari=bool(ema_yol or cizgi), ema_yol=ema_yol, cizgi_yol=bool(cizgi), ema50=ema50,
+                cizgi=cizgi["deger"] if cizgi else None)
 
 
 def dusen_trend(df, fiyat=None):
@@ -864,10 +884,13 @@ def seviye_yazdir(sembol):
               f"son temas {r['son_temas_gun']} gün önce  fiyata uzaklık %{r['mesafe']:.1f}")
     trendler = [r for r in yukselen_trendler(df, fiyat) if r["mesafe"] <= MAX_UZAKLIK]
     dt = dusen_trend(df, fiyat)
+    ty = trend_yukari(df, fiyat, yukselen_trendler(df, fiyat), False)
+    print(f"  günlük trend (destek şartı): {'YUKARI' if ty['yukari'] else 'yukarı değil'}  "
+          f"(EMA{TREND_EMA} yolu: {'evet' if ty['ema_yol'] else 'hayır'}, yükselen çizgi yolu: {'evet' if ty['cizgi_yol'] else 'hayır'})")
     if dt:
         print(f"  genel yön: AŞAĞI  (düşen trend çizgisi bugün {dt['deger']:.2f}, başlangıç {dt['baslangic']}, "
               f"temas {dt['temas']}; fiyat çizginin %{dt['mesafe']:.1f} altında)")
-        print("  -- yükselen trend çizgileri (ELENDİ: genel yön aşağı, bildirilmez) --")
+        print("  -- yükselen trend çizgileri (kısa vadeli trend olarak GEÇERLİ) --")
     else:
         print("  genel yön: aşağı değil (kırılmamış düşen trend çizgisi bulunamadı)")
         print("  -- yükselen trend çizgileri --")
@@ -1412,8 +1435,10 @@ def aday_puani(df, fiyat=None, bugun_alt=None, d4=None):
     esik += ADAY_PAYI
     gb = gelis_bilgi(df, fiyat, bugun_alt)
     parca = [("Yatay destek", r["alt"], r["ust"]) for r in yatay_destekler(df, fiyat)]
-    if not dusen_trend(df, fiyat):
-        parca += [("Yükselen trend", r["deger"] * 0.995, r["deger"] * 1.005) for r in yukselen_trendler(df, fiyat)]
+    dusen = False                         # uzun vadeli düşen çizgi olsa bile kırılmamış yükselen çizgi (kısa vadeli trend) geçerli sayılır
+    cizgiler = yukselen_trendler(df, fiyat)
+    parca += [("Yükselen trend", r["deger"] * 0.995, r["deger"] * 1.005) for r in cizgiler]
+    ty_ok = trend_yukari(df, fiyat, cizgiler, dusen)["yukari"] or not TREND_SARTI
     eb = ema200_bilgi(df, fiyat, bugun_alt)
     ema_tetik = False
     if eb:
@@ -1424,12 +1449,12 @@ def aday_puani(df, fiyat=None, bugun_alt=None, d4=None):
     nw_dokundu = False
     if d4:
         parca += [("SMC mavi blok", b["alt"], b["ust"]) for b in d4["bloklar"]]
-        nw_sinyal = d4.get("nb_durum") == "sinyal"
-        nw_dokundu = d4.get("nb_durum") in ("sinyal", "değdi")
+        nw_sinyal = d4.get("nb_durum") == "sinyal" and ty_ok
+        nw_dokundu = d4.get("nb_durum") in ("sinyal", "değdi") and ty_ok
         if d4.get("nb_alt"):
             parca.append(("NW alt bant", d4["nb_alt"] * 0.995, d4["nb_alt"] * 1.005))
     # yön filtresi: fiyat yukarıdan inerek gelmiyorsa o araç aday sayılmaz (NW'nin değdi/sinyal durumu hariç)
-    parca = [p for p in parca if (p[0] == "NW alt bant" and nw_dokundu) or gelis_uygun(gb, p[1], p[2])]
+    parca = [p for p in parca if (p[0] == "EMA200" or ty_ok) and ((p[0] == "NW alt bant" and nw_dokundu) or gelis_uygun(gb, p[1], p[2]))]
     yakin = [g for g in kesisim_bolgeleri(parca, fiyat, esik) if g["yakin"]]
     puan = (max(len(g["araclar"]) for g in yakin) if yakin else 0) + (1 if ema_tetik else 0) + (1 if nw_sinyal else 0)
     return puan, bool(yakin) or ema_tetik or nw_sinyal
@@ -1519,7 +1544,10 @@ def analiz(sembol, df, fiyat=None, bugun_alt=None):
     esik, atr = yakinlik_esigi(df)
     yatay = [r for r in yatay_destekler(df, fiyat) if r["mesafe"] <= MAX_UZAKLIK]
     dt = dusen_trend(df, fiyat)
-    trendler = [] if dt else [r for r in yukselen_trendler(df, fiyat) if r["mesafe"] <= MAX_UZAKLIK]
+    tum_cizgiler = yukselen_trendler(df, fiyat)       # düşen uzun vadeli çizgi olsa da kırılmamış yükselen çizgi (kısa vadeli trend) geçerli
+    trendler = [r for r in tum_cizgiler if r["mesafe"] <= MAX_UZAKLIK]
+    ty = trend_yukari(df, fiyat, tum_cizgiler, False)
+    ty_ok = ty["yukari"] or not TREND_SARTI
     eb = ema200_bilgi(df, fiyat, bugun_alt)
     ham = ham_veriler(sembol)
     hmum, _ = hacim_mumlari(df, ham)
@@ -1532,10 +1560,12 @@ def analiz(sembol, df, fiyat=None, bugun_alt=None):
     nb = nw_bilgi(dfn, fiyat) if dfn is not None and len(dfn) >= 100 else None
 
     gb = gelis_bilgi(df, fiyat, bugun_alt)
-    nw_dokundu = bool(nb) and nb["durum"] in ("sinyal", "değdi")
+    nw_dokundu = bool(nb) and nb["durum"] in ("sinyal", "değdi") and ty_ok
     parcalar = []      # (ad, alt, ust, mesafe, metin); yalnız fiyatın altında/içinde olanlar, fiyat yukarıdan inerek gelmişse
     def ekle(ad, alt, ust, mesafe, metin, yon_atla=False):
         # yön filtresi: aşağıdan yukarı gelen fiyat için o seviye direnç olur, destek değil -> alınmaz (NW değdi/sinyal hariç)
+        if ad != "EMA200" and not ty_ok:                 # trend şartı: yukarı değilse EMA200 dışındaki destekler alınmaz
+            return
         if alt <= fiyat and (yon_atla or gelis_uygun(gb, alt, ust)):
             parcalar.append((ad, alt, ust, mesafe, metin))
     for r in yatay:
@@ -1599,7 +1629,7 @@ def analiz(sembol, df, fiyat=None, bugun_alt=None):
                 tetik=bool(yakin_parca) or ema_tetik or nw_tetik, puan=puan,
                 nw_tetik=nw_tetik, ema_tetik=ema_tetik, smc_tetik=smc_tetik, teyit=teyit,
                 kesisim=kes, destek_alti=destek_alti(yakin_parca),
-                gosterilen=gosterilen, ana=ana, en_yakin_mesafe=en_yakin, bagimsiz=bagimsiz, dokundu=dokundu, kademe=kademe, _bugun_alt=bugun_alt)
+                gosterilen=gosterilen, ana=ana, en_yakin_mesafe=en_yakin, bagimsiz=bagimsiz, trend=ty, dokundu=dokundu, kademe=kademe, _bugun_alt=bugun_alt)
 
 
 KISA = {"Yatay destek": "yatay", "Yükselen trend": "trend", "EMA200": "EMA200", "NW alt bant": "NW alt bant",
@@ -1655,8 +1685,19 @@ def mesaj_olustur(a, guncelleme=None):
     diger = [p for p in a.get("gosterilen", []) if not (ana and p[1] <= ana["ust"] and p[2] >= ana["alt"])]
     if diger:
         satirlar.append("Diğer yakın yerler: " + " · ".join(_kisa_parca(p, a) for p in diger[:4]))
-    if a["dt"]:
+    ty = a.get("trend")
+    dt_metin = f"uzun vade AŞAĞI (düşen çizgi {_t(a['dt']['deger'])}) · kısa vade " if a["dt"] else ""
+    if a["dt"] and not (ty and ty["yukari"]):
         satirlar.append(f"Genel yön: AŞAĞI (düşen çizgi {_t(a['dt']['deger'])})")
+    elif ty and ty["yukari"]:
+        nedenler = []
+        if ty["ema_yol"]:
+            nedenler.append(f"fiyat EMA{TREND_EMA} ({_t(ty['ema50'])}) üstünde ve yükseliyor")
+        if ty["cizgi_yol"]:
+            nedenler.append(f"yükselen trend çizgisi {_t(ty['cizgi'])} kırılmadı")
+        satirlar.append("📈 " + (("Genel yön: " + dt_metin) if dt_metin else "") + "trend yukarı: " + "; ".join(nedenler))
+    elif ty:
+        satirlar.append("⚠️ trend yukarı değil (yalnız EMA200 muaf geçti)")
     else:
         satirlar.append("Genel yön: aşağı değil")
     return "\n".join(satirlar)
