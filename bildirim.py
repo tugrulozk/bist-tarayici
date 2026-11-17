@@ -1171,6 +1171,7 @@ def gonder(bolumler, simdi, onek="", ek_satir=""):
 
 
 # ------------------------------------------------------- sinyal kaydı ve gün sonu raporu
+GERI_TEST_PAY = 0.5   # geri test: fiyat kırılan seviyenin en fazla bu kadar % üstüne indiyse 'geri test yaptı' sayılır
 GECMIS_SINIR = 600   # geçmişte en fazla bu kadar değerlendirilmiş sinyal tutulur
 
 
@@ -1257,6 +1258,39 @@ def veri_cek_15dk(sembol):
     return df
 
 
+def endeks_verisi():
+    """BIST100 (XU100) 15 dakikalık mumlar; alınamazsa None."""
+    return veri_cek_15dk("XU100")
+
+
+def _bas_zamani(k, tarih):
+    h, m = (int(x) for x in k["saat"].split(":"))
+    dak = -(-(h * 60 + m) // 15) * 15
+    return pd.Timestamp(tarih.year, tarih.month, tarih.day, tz=TR) + pd.Timedelta(minutes=dak)
+
+
+def endeks_getirisi(df_e, k, tarih):
+    """Sinyalden sonraki ilk 15 dk sınırından gün sonuna BIST100 yüzde değişimi; veri yoksa None."""
+    if df_e is None:
+        return None
+    gunluk = np.array(df_e.index.date) == tarih
+    yol = df_e[(df_e.index >= _bas_zamani(k, tarih)) & gunluk]
+    if yol.empty:
+        return None
+    return (float(yol["Close"].iloc[-1]) / float(yol["Open"].iloc[0]) - 1) * 100
+
+
+def endeks_gunluk(df_e, tarih):
+    """BIST100'ün o günkü değişimi (dünkü son 15 dk kapanışına göre, bugünkü son kapanış); veri yoksa None."""
+    if df_e is None:
+        return None
+    gunler = np.array(df_e.index.date)
+    bugun, once = df_e[gunler == tarih], df_e[gunler < tarih]
+    if bugun.empty or once.empty:
+        return None
+    return (float(bugun["Close"].iloc[-1]) / float(once["Close"].iloc[-1]) - 1) * 100
+
+
 def degerlendir(k, df15, tarih):
     """Sinyalden SONRAKİ 15 dakikalık mumlara bakar (sinyal saatini bir sonraki 15 dk sınırına yuvarlar).
     Stop/hedef kullanılmaz. en yüksek / en düşük / kapanış: sinyal fiyatına göre yüzde (sinyalden günün sonuna kadar).
@@ -1283,6 +1317,19 @@ def degerlendir(k, df15, tarih):
         ek.update(seviye=float(seviye), kap_seviye=(kap / seviye - 1) * 100,
                   seviye_alt_saat=None if alt_kap.empty else f"{alt_kap.index[0]:%H:%M}",
                   seviye_fitil_saat=None if fitil.empty else f"{fitil.index[0]:%H:%M}")
+        # geri test: sinyal seviyeden uzaktayken fiyat seviyenin %GERI_TEST_PAY üstüne kadar döndü mü, orada tuttu mu
+        giris_gt = float(seviye) * (1 + GERI_TEST_PAY / 100)
+        if giris <= giris_gt:
+            ek.update(geri="yakin")                      # sinyal zaten seviyeye çok yakın: ayrı bir geri test beklenemezdi
+        else:
+            dene = yol[yol["Low"] <= giris_gt]
+            if dene.empty:
+                ek.update(geri="yok")
+            else:
+                sonra = yol[yol.index >= dene.index[0]]
+                tuttu = bool((sonra["Close"] >= seviye).all())
+                ek.update(geri="tuttu" if tuttu else "kirildi", geri_saat=f"{dene.index[0]:%H:%M}",
+                          geri_kap=(kap / giris_gt - 1) * 100)
     return dict(
         **ek, sonuc="tamam",
         yuk=(float(yol["High"].max()) / giris - 1) * 100,
@@ -1303,7 +1350,11 @@ def sonuc_metni(k, d):
     else:
         durum = f"✅ gün içinde kırılım seviyesinin ({sv}) altına inmedi"
     yon = "üstünde" if d["kap_seviye"] >= 0 else "altında"
-    return f"{durum}\nGün sonu seviyenin %{sayi(abs(d['kap_seviye']), 1)} {yon}\n"
+    gt = {"yok": f"🔁 Geri test yapmadı (seviyenin %{sayi(GERI_TEST_PAY, 1)} üstüne inmedi)",
+          "yakin": "🔁 Sinyal zaten seviyeye yakındı",
+          "tuttu": f"🔁 {d.get('geri_saat')} mumunda seviyeye geri döndü ve tuttu",
+          "kirildi": f"🔁 {d.get('geri_saat')} mumunda seviyeye geri döndü, sonra altına kapandı"}.get(d.get("geri"))
+    return f"{durum}\nGün sonu seviyenin %{sayi(abs(d['kap_seviye']), 1)} {yon}\n" + (gt + "\n" if gt else "")
 
 
 def rapor_blogu(k, d):
@@ -1369,6 +1420,18 @@ def genel_toplam(gecmis):
         satir = ozet_satiri(ad, [k for k in rg_var if k["rg_ok"] == secim])
         if satir:
             satirlar.append(satir)
+    al = [k["alfa"] for k in gecmis if "alfa" in k and k["tur"] != "x"]
+    if al:
+        satirlar.append(f"🆚 Hisse − BIST100 (bildirilenler): {len(al)} sinyal · ort %{sayi(sum(al) / len(al), 1, True)} · "
+                        f"endeksi geçen {sum(1 for x in al if x > 0)}/{len(al)}")
+    gt = [k for k in gecmis if k.get("geri") in ("yok", "tuttu", "kirildi") and k["tur"] != "x"]
+    if gt:
+        t = [k for k in gt if k["geri"] == "tuttu"]
+        satirlar.append(f"🔁 Geri test (bildirilenler, {len(gt)} sinyal): döndü ve tuttu {len(t)} · döndü, altına kapandı "
+                        f"{sum(1 for k in gt if k['geri'] == 'kirildi')} · dönmedi {sum(1 for k in gt if k['geri'] == 'yok')}")
+        if t:
+            satirlar.append(f"   Tutanlarda: sinyal anında ort %{sayi(sum(k['kap'] for k in t) / len(t), 1, True)} · "
+                            f"geri testte ort %{sayi(sum(k['geri_kap'] for k in t) / len(t), 1, True)}")
     if sum(1 for k in gecmis if k.get("sonuc") != "bos") < 30:
         satirlar.append("Örnek sayısı az; kesin yorum için erken.")
     return "\n".join(satirlar)
@@ -1396,7 +1459,35 @@ def kapanis_ozeti(sonuclar):
         if v:
             satirlar.append(f"{ad} ({len(v)}): artıda kapanan {sum(1 for x in v if x > 0)}/{len(v)} · "
                             f"ort. kapanış %{sayi(ort(v), 1, True)}")
+    al = [d["alfa"] for _, d in liste if "alfa" in d]
+    if al:
+        satirlar.append(f"🆚 Hisse − BIST100 (aynı saatlerde): ort %{sayi(ort(al), 1, True)} · endeksi geçen {sum(1 for x in al if x > 0)}/{len(al)}")
+    satirlar += geri_test_satirlari([(k, d) for k, d in liste if "geri" in d])
     return "\n".join(satirlar)
+
+
+def geri_test_satirlari(liste):
+    """liste: [(k, d)]. Geri test bekleyerek girmek ile sinyal anında girmeyi karşılaştırır (gün sonu getirileri)."""
+    yok = [d for _, d in liste if d["geri"] == "yok"]
+    yakin = [d for _, d in liste if d["geri"] == "yakin"]
+    tuttu = [d for _, d in liste if d["geri"] == "tuttu"]
+    kir = [d for _, d in liste if d["geri"] == "kirildi"]
+    uzak = len(yok) + len(tuttu) + len(kir)
+    if not uzak:
+        return []
+    ort = lambda v: sum(v) / len(v)
+    sat = [f"🔁 Geri test (seviyenin %{sayi(GERI_TEST_PAY, 1)} üstü): sinyal seviyeden uzakta gelen {uzak} sinyalin "
+           f"{len(tuttu) + len(kir)}'i geri döndü (tuttu {len(tuttu)} · altına kapandı {len(kir)}), {len(yok)}'i dönmedi"
+           + (f" · {len(yakin)} sinyal zaten seviyeye yakındı" if yakin else "")]
+    if tuttu:
+        sat.append(f"   Geri dönüp tutanlar: sinyal anında girseydin ort %{sayi(ort([d['kap'] for d in tuttu]), 1, True)} · "
+                   f"geri testte girseydin ort %{sayi(ort([d['geri_kap'] for d in tuttu]), 1, True)}")
+    if kir:
+        sat.append(f"   Geri dönüp altına kapananlar: sinyal anında ort %{sayi(ort([d['kap'] for d in kir]), 1, True)} · "
+                   f"geri testte ort %{sayi(ort([d['geri_kap'] for d in kir]), 1, True)}")
+    if yok:
+        sat.append(f"   Geri dönmeyenler (geri test bekleseydin kaçırırdın): ort kapanış %{sayi(ort([d['kap'] for d in yok]), 1, True)}")
+    return sat
 
 
 def rapor_calistir(simdi, bugun):
@@ -1409,10 +1500,16 @@ def rapor_calistir(simdi, bugun):
     semboller = sorted({k["sembol"] for k in kayitlar})
     with ThreadPoolExecutor(max_workers=4) as havuz:
         veriler = dict(zip(semboller, havuz.map(veri_cek_15dk, semboller)))
+    df_e = endeks_verisi()
     sonuclar = []
     for k in sorted(kayitlar, key=lambda x: x["saat"]):
         df = veriler.get(k["sembol"])
         d = degerlendir(k, df, bugun) if df is not None else dict(sonuc="bos")
+        if d["sonuc"] != "bos":
+            e = endeks_getirisi(df_e, k, bugun)
+            if e is not None:
+                d["endeks"] = e
+                d["alfa"] = d["kap"] - e
         sonuclar.append((k, d))
 
     gecmise = []
@@ -1429,6 +1526,12 @@ def rapor_calistir(simdi, bugun):
                 kayit[alan] = round(d[alan], 2)
         if "seviye" in d:
             kayit["seviye_alt"] = bool(d["seviye_alt_saat"])
+            if d.get("geri"):
+                kayit["geri"] = d["geri"]
+                if "geri_kap" in d:
+                    kayit["geri_kap"] = round(d["geri_kap"], 2)
+        if "alfa" in d:
+            kayit["alfa"] = round(d["alfa"], 2)
         gecmise.append(kayit)
     gecmis_yaz(str(bugun), gecmise)
 
@@ -1441,6 +1544,9 @@ def rapor_calistir(simdi, bugun):
             bolumler.append((tur, ad, bloklar))
     ozet = (f"Bugün {sum(1 for k, _ in sonuclar if k['tur'] != 'x')} sinyal "
             f"(+ {sum(1 for k, _ in sonuclar if k['tur'] == 'x')} elenen kırılım)")
+    eg = endeks_gunluk(df_e, bugun)
+    if eg is not None:
+        ozet += f"\n📉 BIST100 bugün: %{sayi(eg, 2, True)} (dünkü kapanışa göre)"
     kap_oz = kapanis_ozeti(sonuclar)
     if kap_oz:
         ozet += "\n" + kap_oz
