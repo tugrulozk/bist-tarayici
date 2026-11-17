@@ -23,7 +23,7 @@ Sabit kurallar:
 - deneme   : seans saati ve tekrar kontrolü yok, o an eşleşen herkesi bildirir
 - baglanti : sadece Telegram'a deneme mesajı yollar
 - rapor    : gün sonu raporu; bugün bildirilen sinyallerin sonradan 15 dakikalık mumlarla değerlendirmesi
-             (en yüksek / en düşük / kapanış, stopa mı hedefe mi önce değdi), akşam seans bittikten sonra çalışır
+             (en yüksek / en düşük / kapanış, kırdığı seviyenin altına geri düştü mü), akşam seans bittikten sonra çalışır
 """
 import datetime as dt
 import json
@@ -1181,6 +1181,8 @@ def kayit_yap(tur, r, simdi):
         ek = dict(ust_cizgi=r.get("ust_cizgi") is not None, teyit=r["teyit"], sikisma=r.get("sikisma"))
         if tur in ("g", "h", "x"):
             ek["tmax"] = TEYIT_TOPLAM      # teyit kaç üzerinden (eski 4'lü kayıtlarla karışmasın)
+        if tur in ("g", "h", "x"):
+            ek["kirilan"] = r["cizgi"]     # kırılan çizginin değeri (rapor: kırdığı yerin altına geri düştü mü)
         if tur == "x":
             ek["isaret"] = r["isaret"]
         if tur == "e":
@@ -1257,8 +1259,10 @@ def veri_cek_15dk(sembol):
 
 def degerlendir(k, df15, tarih):
     """Sinyalden SONRAKİ 15 dakikalık mumlara bakar (sinyal saatini bir sonraki 15 dk sınırına yuvarlar).
-    sonuc: hedef / stop / belirsiz (aynı mumda ikisi de) / yok (ikisine de değmedi) / bos (mum verisi yok).
-    en yüksek / en düşük / kapanış, sinyal fiyatına göre yüzdedir ve sinyalden sonra günün sonuna kadardır."""
+    Stop/hedef kullanılmaz. en yüksek / en düşük / kapanış: sinyal fiyatına göre yüzde (sinyalden günün sonuna kadar).
+    Kırılım sinyallerinde (g, h, x) ayrıca kırılan çizginin değerine göre: gün sonu seviyenin üstünde mi, mumlardan biri
+    kapanışla seviyenin altına indi mi (seviye_alt_saat), fitille deldi mi (seviye_fitil_saat).
+    sonuc: bos (mum verisi yok) ya da tamam."""
     h, m = (int(x) for x in k["saat"].split(":"))
     dak = -(-(h * 60 + m) // 15) * 15
     bas = pd.Timestamp(tarih.year, tarih.month, tarih.day, tz=TR) + pd.Timedelta(minutes=dak)
@@ -1266,43 +1270,40 @@ def degerlendir(k, df15, tarih):
     yol = df15[(df15.index >= bas) & gunluk]
     if yol.empty:
         return dict(sonuc="bos")
-    sonuc, olay = "yok", None
-    for zaman, satir in yol.iterrows():
-        stop_deydi = bool(satir["Low"] <= k["stop"])
-        hedef_deydi = k["hedef"] is not None and bool(satir["High"] >= k["hedef"])
-        if stop_deydi and hedef_deydi:
-            sonuc, olay = "belirsiz", zaman
-            break
-        if stop_deydi:
-            sonuc, olay = "stop", zaman
-            break
-        if hedef_deydi:
-            sonuc, olay = "hedef", zaman
-            break
     giris = k["fiyat"]
     ek = {}
     if k.get("cizgi"):
         asan = yol[yol["High"] >= k["cizgi"]]
         ek = dict(kirdi=not asan.empty, kirdi_saat=None if asan.empty else f"{asan.index[0]:%H:%M}")
+    kap = float(yol["Close"].iloc[-1])
+    if k["tur"] in ("g", "h", "x"):
+        seviye = k.get("kirilan") or k["stop"] / (1 - STOP_ALTI / 100.0)   # eski kayıtlarda çizgi stoptan geri hesaplanır
+        alt_kap = yol[yol["Close"] < seviye]
+        fitil = yol[yol["Low"] < seviye]
+        ek.update(seviye=float(seviye), kap_seviye=(kap / seviye - 1) * 100,
+                  seviye_alt_saat=None if alt_kap.empty else f"{alt_kap.index[0]:%H:%M}",
+                  seviye_fitil_saat=None if fitil.empty else f"{fitil.index[0]:%H:%M}")
     return dict(
-        **ek, sonuc=sonuc, olay=None if olay is None else f"{olay:%H:%M}",
+        **ek, sonuc="tamam",
         yuk=(float(yol["High"].max()) / giris - 1) * 100,
         dus=(float(yol["Low"].min()) / giris - 1) * 100,
-        kap=(float(yol["Close"].iloc[-1]) / giris - 1) * 100,
+        kap=(kap / giris - 1) * 100,
     )
 
 
 def sonuc_metni(k, d):
-    hedef_ad = "ilk hedefe" if k["tur"] in ("g", "h", "x", "e") else "hedefe"
-    if d["sonuc"] == "hedef":
-        return f"🎯 {d['olay']} mumunda {hedef_ad} ({sayi(k['hedef'])}) değdi"
-    if d["sonuc"] == "stop":
-        return f"🛑 {d['olay']} mumunda stopa ({sayi(k['stop'])}) değdi"
-    if d["sonuc"] == "belirsiz":
-        return f"❓ {d['olay']} mumunda hem stop hem hedef var, sıra belli değil"
-    if k["hedef"] is None:
-        return "⏳ stopa değmedi (hedef tanımlı değildi)"
-    return "⏳ stopa da hedefe de değmedi"
+    """Kırılım sinyallerinde: kırdığı seviyenin üstünde mi kaldı, altına geri düştü mü. Diğer türlerde boş."""
+    if "seviye" not in d:
+        return ""
+    sv = sayi(d["seviye"])
+    if d["seviye_alt_saat"]:
+        durum = f"↩️ {d['seviye_alt_saat']} mumunda kapanışla kırılım seviyesinin ({sv}) altına indi"
+    elif d["seviye_fitil_saat"]:
+        durum = f"〰️ {d['seviye_fitil_saat']} mumunda seviyeyi ({sv}) fitille deldi, kapanışla altına inmedi"
+    else:
+        durum = f"✅ gün içinde kırılım seviyesinin ({sv}) altına inmedi"
+    yon = "üstünde" if d["kap_seviye"] >= 0 else "altında"
+    return f"{durum}\nGün sonu seviyenin %{sayi(abs(d['kap_seviye']), 1)} {yon}\n"
 
 
 def rapor_blogu(k, d):
@@ -1313,7 +1314,8 @@ def rapor_blogu(k, d):
             return baslik + "\nmum verisi alınamadı\n"
         return (baslik + "\n"
                 f"en yüksek %{sayi(d['yuk'], 1, True)} · en düşük %{sayi(d['dus'], 1, True)} · "
-                f"kapanış %{sayi(d['kap'], 1, True)}\n")
+                f"kapanış %{sayi(d['kap'], 1, True)}\n"
+                f"{sonuc_metni(k, d)}")
     if d["sonuc"] == "bos":
         return baslik + "\n" + "Sinyalden sonra mum verisi alınamadı\n"
     cizgi = ""
@@ -1324,7 +1326,7 @@ def rapor_blogu(k, d):
             f"en yüksek %{sayi(d['yuk'], 1, True)} · en düşük %{sayi(d['dus'], 1, True)} · "
             f"kapanış %{sayi(d['kap'], 1, True)}\n"
             f"{cizgi}"
-            f"{sonuc_metni(k, d)}\n")
+            f"{sonuc_metni(k, d)}")
 
 
 def ozet_satiri(etiket, grup):
@@ -1333,12 +1335,13 @@ def ozet_satiri(etiket, grup):
     if not grup:
         return None
     n = len(grup)
-    say = lambda ad: sum(1 for k in grup if k["sonuc"] == ad)
     ort = lambda alan: sum(k[alan] for k in grup) / n
     kd = [k for k in grup if "kirdi" in k]
     kirdi = f" · çizgiye ulaşan {sum(1 for k in kd if k['kirdi'])}/{len(kd)}" if kd else ""
-    return (f"{etiket} {n} sinyal · 🎯 {say('hedef')} · 🛑 {say('stop')} · ❓ {say('belirsiz')} · "
-            f"⏳ {say('yok')}{kirdi}\n   ort. en yüksek %{sayi(ort('yuk'), 1, True)} · "
+    sv = [k for k in grup if "seviye_alt" in k]
+    sevtxt = f" · kırdığı seviyenin altına kapanışla inen {sum(1 for k in sv if k['seviye_alt'])}/{len(sv)}" if sv else ""
+    return (f"{etiket} {n} sinyal · artıda kapanan {sum(1 for k in grup if k['kap'] > 0)}/{n}"
+            f"{sevtxt}{kirdi}\n   ort. en yüksek %{sayi(ort('yuk'), 1, True)} · "
             f"ort. en düşük %{sayi(ort('dus'), 1, True)} · ort. kapanış %{sayi(ort('kap'), 1, True)}")
 
 
@@ -1372,7 +1375,7 @@ def genel_toplam(gecmis):
 
 
 def kapanis_ozeti(sonuclar):
-    """Gün sonu raporunun üst özetine eklenen kapanış satırları (hedef tanımsız sinyalleri de kapanışa göre sayar)."""
+    """Gün sonu raporunun üst özetine eklenen kapanış satırları."""
     liste = [(k, d) for k, d in sonuclar if d["sonuc"] != "bos" and k["tur"] != "x"]
     if not liste:
         return ""
@@ -1388,8 +1391,8 @@ def kapanis_ozeti(sonuclar):
     kap = [d["kap"] for _, d in liste]
     satirlar = [f"📉 Kapanışta artıda: {sum(1 for x in kap if x > 0)}/{len(kap)} · ort. kapanış %{sayi(ort(kap), 1, True)} · "
                 f"medyan %{sayi(medyan(kap), 1, True)}"]
-    for sonuc, ad in (("yok", "⏳ Hedefe/stopa değmeyenlerde"), ("stop", "🛑 Stopa değenlerde")):
-        v = [d["kap"] for _, d in liste if d["sonuc"] == sonuc]
+    for ad, secim in (("↩️ Kırdığı seviyenin altına kapanışla inenlerde", True), ("✅ Seviyenin üstünde kalanlarda", False)):
+        v = [d["kap"] for _, d in liste if "seviye" in d and bool(d["seviye_alt_saat"]) == secim]
         if v:
             satirlar.append(f"{ad} ({len(v)}): artıda kapanan {sum(1 for x in v if x > 0)}/{len(v)} · "
                             f"ort. kapanış %{sayi(ort(v), 1, True)}")
@@ -1424,6 +1427,8 @@ def rapor_calistir(simdi, bugun):
         for alan in ("yuk", "dus", "kap"):
             if alan in d:
                 kayit[alan] = round(d[alan], 2)
+        if "seviye" in d:
+            kayit["seviye_alt"] = bool(d["seviye_alt_saat"])
         gecmise.append(kayit)
     gecmis_yaz(str(bugun), gecmise)
 
@@ -1434,18 +1439,16 @@ def rapor_calistir(simdi, bugun):
         bloklar = [(k["sembol"], rapor_blogu(k, d)) for k, d in sonuclar if k["tur"] == tur]
         if bloklar:
             bolumler.append((tur, ad, bloklar))
-    degerli = [d for k, d in sonuclar if d["sonuc"] != "bos" and k["tur"] != "x"]
-    say = lambda ad: sum(1 for d in degerli if d["sonuc"] == ad)
     ozet = (f"Bugün {sum(1 for k, _ in sonuclar if k['tur'] != 'x')} sinyal "
-            f"(+ {sum(1 for k, _ in sonuclar if k['tur'] == 'x')} elenen kırılım): 🎯 {say('hedef')} hedefe · 🛑 {say('stop')} stopa · "
-            f"❓ {say('belirsiz')} belirsiz · ⏳ {say('yok')} hiçbirine değmedi")
+            f"(+ {sum(1 for k, _ in sonuclar if k['tur'] == 'x')} elenen kırılım)")
     kap_oz = kapanis_ozeti(sonuclar)
     if kap_oz:
         ozet += "\n" + kap_oz
     alt = (genel_toplam(gecmis_oku()) + "\n\n"
            "ℹ️ Değerlendirme, sinyalden sonraki ilk 15 dk sınırından günün sonuna kadarki 15 dakikalık "
            "mumlarla yapıldı. Sinyal fiyatı gecikmeli veriden geldiği için gerçek girişin biraz farklı "
-           "olabilir. Aynı mumda hem stop hem hedef varsa sıra bilinemez (❓).")
+           "olabilir. Stop/hedef kullanılmadı: kırılım sinyallerinde kırılan çizginin değerine göre bakıldı "
+           "(↩️ = bir 15 dakikalık mum kapanışla seviyenin altına indi).")
     ok = True
     for metin, _ in mesaj_parcalari(bolumler, simdi, ek_satir=ozet, alt=alt,
                                     baslik=f"📊 Gün sonu raporu · {bugun:%d.%m.%Y}"):
