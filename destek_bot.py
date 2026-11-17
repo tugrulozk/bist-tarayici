@@ -46,7 +46,8 @@ TREND_EN_AZ_TEMAS = 3    # çizgi için en az temas
 TREND_MIN_GUN = 8        # çizgiyi belirleyen iki dip arası en az bu kadar mum
 DUSEN_MIN_GUN = 30       # düşen çizginin çıktığı zirve en az bu kadar mum eski olmalı (genel yön sayılması için)
 EMA_UZUNLUK = 200        # üstel hareketli ortalama periyodu (günlük)
-EMA_YAKLASMA = 2.0       # fiyat EMA'nın üstünde ve en fazla bu kadar % uzaktaysa "yaklaşıyor"
+EMA_YAKLASMA = 1.5       # fiyat EMA'nın üstünde ve en fazla bu kadar % uzaktaysa "yaklaşıyor"
+EMA_DOKUNDU_MAX = 3.0    # bugün EMA'ya değmiş olsa bile fiyat şimdi EMA'nın bu kadar %'den fazla üstündeyse "dokundu" sayılmaz (çoktan uzaklaşmış)
 EMA_YUKARIDAN_GUN = 10   # "yukarıdan geliyor" kontrolü için bakılan mum sayısı
 EMA_YUKARIDAN_FARK = 2.0 # son mumların en yüksek kapanışı fiyattan en az bu kadar % yukarıdaysa "yukarıdan geliyor"
 SMC_IC_BOYUT = 5         # LuxAlgo SMC iç yapı pivot uzunluğu (sabit 5)
@@ -67,7 +68,8 @@ HACIM_BOLGE_ORAN = 0.7   # düğüm bölgesi: tepe dilimin hacminin en az %70'i 
 HACIM_MAX_DUGUM = 3      # en fazla kaç düğüm gösterilir (fiyata en yakın olanlar)
 ATR_UZUNLUK = 14         # günlük ATR uzunluğu (yaklaşma mesafesi için oynaklık ölçüsü)
 ATR_KAT = 1.0            # yaklaşma eşiği = ATR% x bu kat (hisse oynaksa eşik geniş, sakinse dar)
-YAKIN_MIN = 1.0          # yaklaşma eşiği en az %1
+YAKIN_SABIT = 1.5        # yaklaşma eşiği: sabit %1,5 (None yazılırsa eski ATR'ye bağlı eşik kullanılır)
+YAKIN_MIN = 1.0          # (ATR eşiği kullanılırsa) yaklaşma eşiği en az %1
 YAKIN_MAX = 4.0          # yaklaşma eşiği en çok %4
 KESISIM_TOL = 0.003      # iki bölge arası bu orandan yakınsa (%0,3) kesişiyor sayılır
 
@@ -264,6 +266,8 @@ def yakinlik_esigi(df):
     """(yaklaşma eşiği %, ATR %). Eşik = ATR% x ATR_KAT, YAKIN_MIN ile YAKIN_MAX arasına sıkıştırılır.
     ATR hesaplanamazsa eşik %2 (eski sabit değer)."""
     a = atr_yuzde(df)
+    if YAKIN_SABIT:
+        return float(YAKIN_SABIT), a
     if a is None:
         return 2.0, None
     return float(min(max(ATR_KAT * a, YAKIN_MIN), YAKIN_MAX)), a
@@ -470,7 +474,7 @@ def ema200_bilgi(df, fiyat=None, bugun_alt=None):
     onceki_zirve = float(kap[-1 - EMA_YUKARIDAN_GUN:-1].max())
     yukaridan = onceki_zirve >= fiyat * (1 + EMA_YUKARIDAN_FARK / 100)
     dun_ustunde = kap[-2] > ema[-2]
-    if bugun_alt <= deger * 1.001 and dun_ustunde and fiyat >= deger * 0.99:
+    if bugun_alt <= deger * 1.001 and dun_ustunde and fiyat >= deger * 0.99 and mesafe <= EMA_DOKUNDU_MAX:
         durum = "dokundu"
     elif 0 <= mesafe <= EMA_YAKLASMA and yukaridan:
         durum = "yaklaşıyor"
@@ -944,22 +948,21 @@ def seviye_yazdir(sembol):
 
 # ===================== CANLI MOD (tara) =====================
 MAX_ADAY = 40            # bir turda en fazla kaç hisse ayrıntılı analize girer
-MAX_MESAJ = 30           # bir turda en fazla kaç Telegram mesajı (yalnız taşkın koruması; gerçek tetiklemeyi sınırlamaz)
-ADAY_PAYI = 1.5          # hızlı elemede eşiğe eklenen pay (%), aday kaçırmamak için
+MAX_MESAJ = 12           # bir turda en fazla kaç Telegram mesajı (taşkın koruması); fazlası en güçlüden başlayarak sonraki turda gelir
+ADAY_PAYI = 0.5          # hızlı elemede eşiğe eklenen pay (%), aday kaçırmamak için
 CEVRIM_SN = 300          # iki tarama turu arası hedef süre (saniye)
 ROT_ADET = 25            # her turda kaç hissenin 4 saatlik seviyeleri (SMC, NW) yenilenir
-TEKRAR_BAKMA_SN = 1800   # ayrıntılı analizde tetiklemeyen hisseye bu süre bir daha bakılmaz
+TEKRAR_BAKMA_SN = 240    # ayrıntılı analizde tetiklemeyen hisseye bu süre bir daha bakılmaz (yaklaşan hisse kaçmasın diye kısa)
 DURUM_DOSYASI = os.path.join("durum_destek", "durum.json")
 RSI_UZUNLUK = 14
 MFI_UZUNLUK = 14
 BB_UZUNLUK = 20
 BB_CARPAN = 2.0
 MFI_KULLAN = True        # AÇIK (kullanıcı kararı): ASELS'te TradingView ile ~8 puan fark çıktı (bot 56,9, TradingView 65,0); hacim verisi incelenecek, mesajlarda 'yaklaşık' diye işaretlenir.
-MAX_MESAJ_HISSE = 3      # aynı hisse için günde en fazla kaç mesaj (ilk + güncellemeler)
-GUNCELLEME_ARASI = 1800  # aynı hisse için iki mesaj arası en az süre (sn)
-YAKLASMA_ORAN = 0.5      # güncelleme: en yakın desteğe uzaklık önceki mesajdakinin bu katına inerse
-YAKLASMA_MIN_FARK = 0.3  # ... ve en az bu kadar puan (%) azalmışsa
-TEKRAR_ANALIZ_SN = 3600  # mesaj atılmış hisse, hâlâ desteğe yakınsa bu sürede bir yeni teyit/tetik için yeniden incelenir
+MAX_MESAJ_HISSE = 4      # aynı destek için en fazla kaç mesaj: ilk + 3 güncelleme (bkz. KADEMELER)
+MAX_MESAJ_GUN = 8        # aynı hisse için günde en fazla kaç mesaj (destek bozulup alttaki yeni desteğe yaklaşırsa yeni mesaj gelir)
+KADEMELER = (1.5, 1.0, 0.5)   # ilk mesaj %1,5'te; sonra her %0,5 yaklaşmada güncelleme; en sonda destek/gösterge değince son mesaj
+YENI_DESTEK_ARA_SN = 600 # destek bozulmuş hissede alttaki yeni destek için en sık bu aralıkla bakılır
 RSI_ASIRI = 30.0
 MFI_ASIRI = 20.0
 UYUMSUZLUK_PENCERE = 60  # uyumsuzluk için bakılan son mum sayısı (4 saatlik)
@@ -1494,6 +1497,21 @@ def destek_alti(yakin_parca):
     return None
 
 
+def kademe_hesapla(mesafe, dokundu):
+    """Desteğe yakınlık kademesi: -1 yok, 0 = %1,5 içinde (ilk mesaj), 1 = %1,0 içinde, 2 = %0,5 içinde, 3 = değdi/içinde (son mesaj)."""
+    if dokundu:
+        return 3
+    if mesafe is None or mesafe > KADEMELER[0]:
+        return -1
+    if mesafe <= 0:
+        return 3
+    if mesafe <= KADEMELER[2]:
+        return 2
+    if mesafe <= KADEMELER[1]:
+        return 1
+    return 0
+
+
 def analiz(sembol, df, fiyat=None, bugun_alt=None):
     """2. aşama: tüm araçlarla ayrıntılı analiz. Dönüş: mesaj için gereken her şey (sözlük)."""
     if fiyat is None or bugun_alt is None:
@@ -1572,6 +1590,8 @@ def analiz(sembol, df, fiyat=None, bugun_alt=None):
         p0 = min(gosterilen, key=lambda p: p[3])
         ana = dict(alt=p0[1], ust=p0[2], araclar=[p0[0]], mesafe=p0[3])
     en_yakin = min((p[3] for p in gosterilen), default=None)
+    dokundu = any(bugun_alt <= p[2] * 1.001 for p in gosterilen) or (ana is not None and ana["mesafe"] == 0)
+    kademe = kademe_hesapla(ana["mesafe"] if ana else en_yakin, dokundu and bool(gosterilen))
     bagimsiz = [k for k, v in (("ema", ema_tetik), ("nw", nw_tetik), ("smc", smc_tetik)) if v]
     puan = (kes[0] if kes else 0) + (1 if ema_tetik else 0) + (1 if nw_tetik else 0) + (len(teyit["satirlar"]) if teyit else 0)
     return dict(sembol=sembol, fiyat=fiyat, esik=esik, atr=atr, dt=dt, eb=eb, nb=nb, parcalar=parcalar,
@@ -1579,7 +1599,7 @@ def analiz(sembol, df, fiyat=None, bugun_alt=None):
                 tetik=bool(yakin_parca) or ema_tetik or nw_tetik, puan=puan,
                 nw_tetik=nw_tetik, ema_tetik=ema_tetik, smc_tetik=smc_tetik, teyit=teyit,
                 kesisim=kes, destek_alti=destek_alti(yakin_parca),
-                gosterilen=gosterilen, ana=ana, en_yakin_mesafe=en_yakin, bagimsiz=bagimsiz)
+                gosterilen=gosterilen, ana=ana, en_yakin_mesafe=en_yakin, bagimsiz=bagimsiz, dokundu=dokundu, kademe=kademe, _bugun_alt=bugun_alt)
 
 
 KISA = {"Yatay destek": "yatay", "Yükselen trend": "trend", "EMA200": "EMA200", "NW alt bant": "NW alt bant",
@@ -1606,9 +1626,11 @@ def mesaj_olustur(a, guncelleme=None):
     guncelleme: None (ilk mesaj) ya da dict(n=2, degisim=[...]) (aynı hisse için güncelleme)."""
     ik = bagimsiz_ikonlar(a)
     son = f"{_t(a['fiyat'])} (puan {a['puan']})" + (f" {ik}" if ik else "")
-    if guncelleme:
-        satirlar = [f"↗️ GÜNCELLEME {guncelleme['n']}/{MAX_MESAJ_HISSE} – {a['sembol']} {son}",
-                    "Değişiklik: " + " · ".join(guncelleme["degisim"])]
+    if guncelleme and guncelleme.get("yeni"):
+        satirlar = [f"🔻 YENİ DESTEK (öncekiyle ilgili bozuldu) – {a['sembol']} {son}"]
+    elif guncelleme:
+        bas = "🏁 SON MESAJ (değdi)" if a.get("kademe") == 3 else f"↗️ GÜNCELLEME {guncelleme['n']}/{MAX_MESAJ_HISSE}"
+        satirlar = [f"{bas} – {a['sembol']} {son}", "Değişiklik: " + " · ".join(guncelleme["degisim"])]
     else:
         satirlar = [f"📍 {a['sembol']} {son}"]
     ana = a.get("ana")
@@ -1653,33 +1675,56 @@ def kayit_al(durum):
     return k
 
 
-def kayit_yaz(kayit, a, zaman, onceki=None, n=None):
+def kayit_yaz(kayit, a, zaman, onceki=None, n=None, yeni_bolge=False):
+    """n: toplam mesaj, nb: bu destek için mesaj sayısı, kademe: ulaşılan en yakın kademe (geri düşmez)."""
     onceki = onceki or {}
     ana = a.get("ana")
     yeni_teyit = a["teyit"]["anahtar"] if a.get("teyit") else []
+    if n is not None:
+        n_top = nb = n
+    elif yeni_bolge:
+        n_top, nb = onceki.get("n", 0) + 1, 1
+    else:
+        n_top, nb = onceki.get("n", 0) + 1, onceki.get("nb", onceki.get("n", 0)) + 1
+    kademe = a.get("kademe", -1)
+    if not yeni_bolge and onceki:
+        kademe = max(kademe, onceki.get("kademe", -1))
+    eski_t, eski_b = ([], []) if yeni_bolge else (onceki.get("teyit", []), onceki.get("bagimsiz", []))
     kayit[a["sembol"]] = dict(
-        n=n if n is not None else onceki.get("n", 0) + 1, zaman=zaman, mesafe=a.get("en_yakin_mesafe"),
+        n=n_top, nb=nb, zaman=zaman, mesafe=a.get("en_yakin_mesafe"), kademe=kademe, puan=a["puan"],
         ana_mesafe=ana["mesafe"] if ana else None, destek_alt=ana["alt"] if ana else None, destek_ust=ana["ust"] if ana else None,
-        teyit=sorted(set(onceki.get("teyit", [])) | set(yeni_teyit)),
-        bagimsiz=sorted(set(onceki.get("bagimsiz", [])) | set(a.get("bagimsiz", []))))
+        araclar=list(ana["araclar"]) if ana else [],
+        teyit=sorted(set(eski_t) | set(yeni_teyit)),
+        bagimsiz=sorted(set(eski_b) | set(a.get("bagimsiz", []))))
 
 
 def guncelleme_degisimleri(k, a):
-    """Önceki mesaja göre ne değişti? Boş liste = güncelleme gerekmez."""
+    """Önceki mesaja göre ne değişti? Yaklaşma (kademe) ve mesajda değişen diğer kriterler: yeni teyit, yeni tetik, puan, ana destekteki yeni araç."""
     d = []
-    onceki, simdi = k.get("mesafe"), a.get("en_yakin_mesafe")
-    if onceki is not None and simdi is not None and onceki > 0:
-        if simdi == 0:
-            d.append("fiyat desteğin içine girdi")
-        elif simdi <= onceki * YAKLASMA_ORAN and onceki - simdi >= YAKLASMA_MIN_FARK:
-            d.append(f"fiyat desteğe yaklaştı: %{_t(onceki, 1)} → %{_t(simdi, 1)}")
+    onceki = k.get("ana_mesafe")
+    ana = a.get("ana")
+    simdi = ana["mesafe"] if ana else a.get("en_yakin_mesafe")
+    if a.get("kademe") == 3:
+        deger = [IKON.get(p[0], "•") + " " + KISA.get(p[0], p[0]) for p in a.get("gosterilen", []) if a["fiyat"] and p[2] * 1.001 >= _bugun_alt_ham(a)]
+        d.append("desteğe/göstergeye değdi" + (": " + " · ".join(deger[:3]) if deger else ""))
+    elif onceki is not None and simdi is not None:
+        d.append(f"fiyat desteğe yaklaştı: %{_t(onceki, 1)} → %{_t(simdi, 1)}")
     yeni_t = [x for x in (a["teyit"]["anahtar"] if a.get("teyit") else []) if x not in k.get("teyit", [])]
     if yeni_t:
         d.append("yeni teyit: " + ", ".join(TEYIT_AD.get(x, x) for x in yeni_t))
     yeni_b = [x for x in a.get("bagimsiz", []) if x not in k.get("bagimsiz", [])]
     if yeni_b:
         d.append("yeni tetik: " + " ".join(BAG_AD.get(x, x) for x in yeni_b))
+    yeni_arac = [x for x in (ana["araclar"] if ana else []) if x not in k.get("araclar", [])] if k.get("araclar") else []
+    if yeni_arac:
+        d.append("ana destekte yeni araç: " + " · ".join(f"{IKON.get(x, '•')} {KISA.get(x, x)}" for x in yeni_arac))
+    if k.get("puan") is not None and a["puan"] != k["puan"]:
+        d.append(f"puan {k['puan']} → {a['puan']}")
     return d
+
+
+def _bugun_alt_ham(a):
+    return a.get("_bugun_alt", float("inf"))
 
 
 def tara_calistir():
@@ -1781,8 +1826,6 @@ def tara_calistir():
                     if aday:
                         adaylar.append((puan, s))
                     continue
-                if simdi_t - max(k["zaman"], bakildi.get(s, 0)) < GUNCELLEME_ARASI:
-                    continue
                 if k.get("eski"):                                # eski biçimden devralınan: bir kez sessiz başlangıç analizi
                     try:
                         puan, aday = aday_puani(gunluk[s], f, alt_bugun, dort.get(s))
@@ -1791,16 +1834,23 @@ def tara_calistir():
                     if aday:
                         adaylar.append((puan, s))
                     continue
-                if k["n"] >= MAX_MESAJ_HISSE or k.get("destek_ust") is None or k.get("destek_alt") is None:
+                if k.get("destek_ust") is None or k.get("destek_alt") is None or k["n"] >= MAX_MESAJ_GUN:
                     continue
-                if f < k["destek_alt"]:                          # fiyat desteğin altına inmiş: güncelleme yok
+                if f < k["destek_alt"]:                          # destek bozulmuş: alttaki yeni desteğe yaklaşıyor mu? (seyrek bakılır)
+                    if simdi_t - bakildi.get(s, 0) >= YENI_DESTEK_ARA_SN:
+                        try:
+                            puan, aday = aday_puani(gunluk[s], f, alt_bugun, dort.get(s))
+                        except Exception:
+                            continue
+                        if aday:
+                            adaylar.append((puan, s))
+                    continue
+                if k.get("nb", k["n"]) >= MAX_MESAJ_HISSE:       # bu destek için mesaj hakkı doldu
                     continue
                 d = 0.0 if f <= k["destek_ust"] else (f / k["destek_ust"] - 1) * 100
-                am = k.get("ana_mesafe")
-                yaklasti = am is not None and am > 0 and d <= am * YAKLASMA_ORAN
-                periyodik = simdi_t - max(k["zaman"], bakildi.get(s, 0)) >= TEKRAR_ANALIZ_SN and d <= 5.0
-                if yaklasti or periyodik:
-                    adaylar.append((0, s))
+                kd = k.get("kademe", kademe_hesapla(k.get("ana_mesafe"), False))
+                if kademe_hesapla(d, alt_bugun <= k["destek_ust"] * 1.001 and d <= KADEMELER[0]) > kd:
+                    adaylar.append((0, s))                       # bir kademe daha yaklaştı (ya da değdi): ayrıntılı analiz
             adaylar.sort(reverse=True)
             n_aday = len(adaylar)
             # 3) ayrıntılı analiz
@@ -1821,28 +1871,27 @@ def tara_calistir():
                     sonuclar.append(a)
                 elif k.get("eski"):                              # sessiz başlangıç: mevcut durumu kaydet, mesaj atma
                     kayit_yaz(kayit, a, time.time(), None, n=1)
-                else:
-                    dg = guncelleme_degisimleri(k, a)
-                    if dg:
-                        a["_guncelleme"] = dict(n=k["n"] + 1, degisim=dg)
+                elif f < k["destek_alt"]:                        # eski destek bozulmuş: alttaki yeni destek tetiklediyse yeni mesaj
+                    ana = a.get("ana")
+                    if ana and ana["ust"] < k["destek_alt"] * 0.99 and k["n"] < MAX_MESAJ_GUN:
+                        a["_guncelleme"] = dict(n=1, degisim=[f"önceki destek {_t(k['destek_alt'])} altına inildi"], yeni=True)
                         sonuclar.append(a)
+                elif a["kademe"] > k.get("kademe", kademe_hesapla(k.get("ana_mesafe"), False)) and k.get("nb", k["n"]) < MAX_MESAJ_HISSE:
+                    dg = guncelleme_degisimleri(k, a)
+                    a["_guncelleme"] = dict(n=k.get("nb", k["n"]) + 1, degisim=dg)
+                    sonuclar.append(a)
             sonuclar.sort(key=lambda a: -a["puan"])
             # 4) gönder
             gonderilen = 0
             n_guncelleme = 0
             gonderilecek = sonuclar[:MAX_MESAJ]
-            if len(gonderilecek) >= 3:                       # çok mesaj gelecekse önce tek satırlık sıralı özet
-                ozet = [f"📋 Tur özeti ({simdi:%H:%M}): {len(gonderilecek)} mesaj, en güçlüden başlayarak"]
-                for i, a in enumerate(gonderilecek, 1):
-                    ik = bagimsiz_ikonlar(a)
-                    ozet.append(f"{i}. {a['sembol']} (puan {a['puan']})" + (f" {ik}" if ik else "") + (" ↗️ güncelleme" if a.get("_guncelleme") else ""))
-                ozet.append(SIMGE_ACIKLAMA)
-                telegram_gonder("\n".join(ozet))
-                time.sleep(0.6)
+            for a in sonuclar[MAX_MESAJ:]:                   # tavan dışında kalanlar: sonraki turda yeniden bakılsın
+                bakildi.pop(a["sembol"], None)
             for a in gonderilecek:
                 if telegram_gonder(mesaj_olustur(a, a.get("_guncelleme"))):
-                    kayit_yaz(kayit, a, time.time(), kayit.get(a["sembol"]))
-                    sinyal_ekle(sinyaller, a, a["_guncelleme"]["n"] if a.get("_guncelleme") else 1, time.time())
+                    yeni_bolge = bool(a.get("_guncelleme") and a["_guncelleme"].get("yeni"))
+                    kayit_yaz(kayit, a, time.time(), kayit.get(a["sembol"]), yeni_bolge=yeni_bolge)
+                    sinyal_ekle(sinyaller, a, 1 if yeni_bolge or not a.get("_guncelleme") else a["_guncelleme"]["n"], time.time())
                     sinyal_yaz(sinyaller)
                     gonderilen += 1
                     n_guncelleme += 1 if a.get("_guncelleme") else 0
