@@ -47,6 +47,7 @@ TREND_MIN_GUN = 8        # çizgiyi belirleyen iki dip arası en az bu kadar mum
 DUSEN_MIN_GUN = 30       # düşen çizginin çıktığı zirve en az bu kadar mum eski olmalı (genel yön sayılması için)
 EMA_UZUNLUK = 200        # üstel hareketli ortalama periyodu (günlük)
 TREND_SARTI = True       # True: NW/SMC/yatay/trend/hacim destekleri yalnız günlük trend yukarıysa mesaj üretir (EMA200 muaf)
+TREND_CIZGI_YAKIN = 8.0   # yükselen çizgi yolu: fiyat çizgiden en fazla bu kadar % yukarıdaysa çizgi 'işliyor' sayılır (çok uzaktaki çizgi trend kanıtı değil)
 TREND_EMA = 50           # trend ölçümü: fiyat bu günlük EMA'nın üstünde ve EMA yükseliyorsa trend yukarı (ya da kırılmamış yükselen trend çizgisi varsa)
 EMA_YAKLASMA = 1.5       # fiyat EMA'nın üstünde ve en fazla bu kadar % uzaktaysa "yaklaşıyor"
 EMA_DOKUNDU_MAX = 3.0    # bugün EMA'ya değmiş olsa bile fiyat şimdi EMA'nın bu kadar %'den fazla üstündeyse "dokundu" sayılmaz (çoktan uzaklaşmış)
@@ -386,7 +387,8 @@ def trend_yukari(df, fiyat, cizgiler=None, dusen=False):
         ema_yol = bool(fiyat > ema50 and ema50 > float(e[-6]))
     if cizgiler is None:
         cizgiler = [] if dusen else yukselen_trendler(df, fiyat)
-    cizgi = cizgiler[0] if (cizgiler and not dusen) else None
+    yakin = [r for r in cizgiler if r.get("mesafe", 0) <= TREND_CIZGI_YAKIN]
+    cizgi = yakin[0] if (yakin and not dusen) else None
     return dict(yukari=bool(ema_yol or cizgi), ema_yol=ema_yol, cizgi_yol=bool(cizgi), ema50=ema50,
                 cizgi=cizgi["deger"] if cizgi else None)
 
@@ -980,6 +982,10 @@ DURUM_DOSYASI = os.path.join("durum_destek", "durum.json")
 RSI_UZUNLUK = 14
 MFI_UZUNLUK = 14
 BB_UZUNLUK = 20
+WT_KULLAN = True         # WaveTrend (LazyBear WT_CROSS 10 21) yukarı kesişim teyidi
+WT_N1, WT_N2, WT_SMA = 10, 21, 4
+WT_ASIRI_SATIM = -53     # kesişim bu değerin altındaysa mesajda 'aşırı satımda' denir (şart değil)
+WT_SON_MUM = 3           # son kaç 4 saatlik mumda kesişim aranır
 BB_CARPAN = 2.0
 MFI_KULLAN = True        # AÇIK (kullanıcı kararı): ASELS'te TradingView ile ~8 puan fark çıktı (bot 56,9, TradingView 65,0); hacim verisi incelenecek, mesajlarda 'yaklaşık' diye işaretlenir.
 MAX_MESAJ_HISSE = 4      # aynı destek için en fazla kaç mesaj: ilk + 3 güncelleme (bkz. KADEMELER)
@@ -1180,6 +1186,49 @@ def rsi_serisi(c, n=RSI_UZUNLUK):
     return cikti
 
 
+def _ema_ilk(x, n):
+    """Pine ta.ema gibi: ilk değerden başlayan üstel ortalama."""
+    x = np.asarray(x, dtype=float)
+    a = 2.0 / (n + 1)
+    o = np.empty(len(x))
+    o[0] = x[0]
+    for i in range(1, len(x)):
+        o[i] = a * x[i] + (1 - a) * o[i - 1]
+    return o
+
+
+def wavetrend(h, l, c, n1=WT_N1, n2=WT_N2, sma=WT_SMA):
+    """LazyBear WaveTrend: (wt1, wt2). wt1 = ema(ci, n2), wt2 = sma(wt1, 4). Veri kısaysa (None, None)."""
+    h, l, c = (np.asarray(x, dtype=float) for x in (h, l, c))
+    if len(c) < n1 + n2 + sma + 10:
+        return None, None
+    ap = (h + l + c) / 3
+    esa = _ema_ilk(ap, n1)
+    d = _ema_ilk(np.abs(ap - esa), n1)
+    ci = (ap - esa) / (0.015 * np.where(d == 0, np.nan, d))
+    ci = np.nan_to_num(ci, nan=0.0)
+    wt1 = _ema_ilk(ci, n2)
+    wt2 = np.full(len(wt1), np.nan)
+    for i in range(sma - 1, len(wt1)):
+        wt2[i] = wt1[i - sma + 1:i + 1].mean()
+    return wt1, wt2
+
+
+def wt_yukari_kesisim(h, l, c, son=WT_SON_MUM):
+    """Son 'son' mumda WT1'in WT2'yi aşağıdan yukarı kestiği ve kesişimde WT1 < 0 olduğu en yeni mum.
+    Dönüş: (kaç mum önce, wt1 değeri) ya da None."""
+    wt1, wt2 = wavetrend(h, l, c)
+    if wt1 is None:
+        return None
+    for k in range(son):
+        i = len(wt1) - 1 - k
+        if i < 1 or np.isnan(wt2[i - 1]):
+            continue
+        if wt1[i] > wt2[i] and wt1[i - 1] <= wt2[i - 1] and wt1[i] < 0:
+            return k, float(wt1[i])
+    return None
+
+
 def mfi_serisi(h, l, c, v, n=MFI_UZUNLUK):
     """Money Flow Index (tipik fiyat = (H+L+C)/3). Veri kısaysa None."""
     h, l, c, v = (np.asarray(x, dtype=float) for x in (h, l, c, v))
@@ -1342,6 +1391,11 @@ def teyit_hesapla(df4, simdi, nb=None):
             ekle("bb", "Bollinger alt banda değdi")
     if nb and nb.get("durum") == "sinyal":
         ekle("nw_sinyal", "NW ▲ sinyali (son 3 mumda)")
+    if WT_KULLAN:
+        wk = wt_yukari_kesisim(h, l, c)
+        if wk:
+            k, w = wk
+            ekle("wt", "WaveTrend ↑ (" + ("son mum" if k == 0 else f"{k} mum önce") + (", aşırı satımda" if w < WT_ASIRI_SATIM else ", sıfırın altında") + ")")
     parcalar = []
     if rsi_son is not None:
         parcalar.append(f"RSI {_t(rsi_son, 1)}")
@@ -1635,7 +1689,7 @@ def analiz(sembol, df, fiyat=None, bugun_alt=None):
 KISA = {"Yatay destek": "yatay", "Yükselen trend": "trend", "EMA200": "EMA200", "NW alt bant": "NW alt bant",
         "SMC mavi blok": "SMC blok", "Hacim düğümü": "hacim"}
 TEYIT_AD = {"yutan": "yutan boğa", "rsi_uyumsuzluk": "RSI uyumsuzluk", "mfi_uyumsuzluk": "MFI uyumsuzluk",
-            "rsi_asiri": "RSI aşırı satım", "mfi_asiri": "MFI aşırı satım", "bb": "Bollinger", "nw_sinyal": "NW ▲ sinyali"}
+            "rsi_asiri": "RSI aşırı satım", "mfi_asiri": "MFI aşırı satım", "bb": "Bollinger", "nw_sinyal": "NW ▲ sinyali", "wt": "WaveTrend ↑"}
 BAG_AD = {"ema": "〰️ EMA200", "nw": "🌊 NW", "smc": "🟦 SMC"}
 
 
