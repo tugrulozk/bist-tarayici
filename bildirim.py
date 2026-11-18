@@ -109,7 +109,17 @@ ASIRI_EN_AZ_TEYIT = 2    # 3 dönüş teyidinden (🟢 🔒 📊) en az kaçı
 TABAN_ESIGI = -9.5       # günlük değişim bunun altındaysa tabana oturmuş sayılır, hariç tutulur
 STOP_ATR = 1.5           # örnek stop: fiyat - 1,5 x ATR
 # ---- Giriş sınırı ve 4 saatlik direnç (mesajdaki ek bilgiler)
-KURAL_SURUMU = "k2-18Kas"   # kuralları ya da mum ızgarasını değiştirdiğinde bunu da değiştir: rapor sinyalleri sürüme göre ayırır (eski kayıtlar "eski" sayılır)
+ENDEKS_FILTRE = True    # BIST100 günlük değişimi ENDEKS_ESIK ve altındaysa 🚀/🔸 bildirilmez; "elenen" olarak kaydedilir (eleme=endeks), raporda ayrıca ölçülür
+ENDEKS_ESIK = -1.0      # % (dünkü kapanışa göre, tarama anında)
+# Özellik eşikleri (yalnızca rapor gruplaması için; filtre değildir)
+RVOL_ESIK = 1.5         # kırılım mumunun hacmi / aynı saat dilimindeki son 20 mumun medyanı
+KAP_KONUM_ESIK = 0.75   # kırılım mumunda kapanışın mum aralığındaki konumu (0 = dip, 1 = tepe)
+GOVDE_ATR_ESIK = 1.0    # kırılım mumunun gövdesi / ATR14
+GENISLIK_ESIK = 0.5     # taranan hisselerin günlük değişimi pozitif olanların oranı
+TEYIT_ADLARI = (("🟢", "yeşil mum"), ("🔒", "dip korundu"), ("📊", "hacim"), ("📈", "KAMA üstü"), ("🔵", "MACD"), ("🌊", "WaveTrend"))
+GUNLUK_DEG = {}         # sembol -> günlük değişim (%); analiz() doldurur
+BAGLAM = {}             # tarama anının bağlamı: endeks (BIST100 günlük %), genislik (0-1); main() doldurur
+KURAL_SURUMU = "k3-18Kas"   # kuralları ya da mum ızgarasını değiştirdiğinde bunu da değiştir: rapor sinyalleri sürüme göre ayırır (eski kayıtlar "eski" sayılır)
 GIRIS_MIN_RG = 1.5   # "en fazla bu fiyata kadar gir" sınırı için istenen en düşük risk/getiri (kazanç ≥ risk x bu)
 DIRENC_PERIYOT = "6mo"  # 4 saatlik düşen çizgi direnci için saatlik mum geçmişi (yalnızca sinyal veren hisselere çekilir)
 # app.py'deki "Gelişmiş ayarlar" varsayılanları
@@ -655,6 +665,31 @@ def sikisma_orani(df, geri):
     return float(kisa.mean() / uzun.mean())
 
 
+def kirilim_ozellikleri(df, geri):
+    """Kırılım mumunun kalitesi ve hacmi (yalnızca kayıt/rapor için, filtre değil). geri: kırılım mumu kaç mum önce (0 = aktif mum).
+    rvol: mum hacmi / aynı saat dilimindeki son 20 mumun medyanı; kapkonum: (kapanış - dip) / (tepe - dip);
+    govde_atr: |kapanış - açılış| / ATR14; ustfitil: üst fitilin mum aralığına oranı."""
+    oz = {}
+    try:
+        i = len(df) - 1 - int(geri or 0)
+        m = df.iloc[i]
+        aralik = float(m["High"] - m["Low"])
+        if aralik > 0:
+            oz["kapkonum"] = round(float((m["Close"] - m["Low"]) / aralik), 2)
+            oz["ustfitil"] = round(float((m["High"] - max(m["Open"], m["Close"])) / aralik), 2)
+        atr = atr_hesapla(df).iloc[i]
+        if atr and not np.isnan(atr) and atr > 0:
+            oz["govde_atr"] = round(float(abs(m["Close"] - m["Open"]) / atr), 2)
+        slot = df.index[i].hour * 60 + df.index[i].minute
+        onceki = df.iloc[:i]
+        ayni = onceki[(onceki.index.hour * 60 + onceki.index.minute) == slot]["Volume"].tail(20)
+        if len(ayni) >= 8 and float(ayni.median()) > 0:
+            oz["rvol"] = round(float(m["Volume"]) / float(ayni.median()), 2)
+    except Exception:
+        pass
+    return oz
+
+
 def guclu_kirilim(df, sembol, tr):
     """Kırılım olmuş. Hacim + en az MIN_TEYIT teyit varsa 🚀 (guclu); hacimsiz ama 5/6 varsa 🔸 (hacimsiz);
     teyit yetmiyorsa kademe "elenen" (bildirilmez, gün sonu raporunda ayrıca ölçülür)."""
@@ -689,6 +724,7 @@ def guclu_kirilim(df, sembol, tr):
         sikisma=sikisma_orani(df, tr.get("kirilim_geri")) if SIKISMA_GOSTER else None,
         nokta_i=tr.get("nokta_i"), nokta_j=tr.get("nokta_j"),
         kirilim_geri=tr.get("kirilim_geri"), kirilim_zaman=tr.get("kirilim_zaman"),
+        ozellik=kirilim_ozellikleri(df, tr.get("kirilim_geri")),
         **stop_hedef(float(df["Close"].iloc[-1]), float(tr["cizgi"]), tr["tepe"], tr["dip"]),
     )
 
@@ -908,6 +944,10 @@ def analiz(sembol, bugun):
     if df.index[-1].date() != bugun:
         return "bugun_yok", None, None   # tatil günü ya da bugün hiç işlem görmemiş hisse
     ds = SAATLIK.get(sembol, df)         # 4s modunda likidite ve hareketsiz saat ölçümü saatlik tablodan
+    try:
+        GUNLUK_DEG[sembol] = float(gunluk_degisim(df))
+    except Exception:
+        pass
     LIKIDITE[sembol] = gunluk_islem_tutari(ds, bugun)
     DONUK[sembol] = donuk_orani(ds, bugun)
     if sembol in RETEST_IZLE:            # bu hissenin bugün bildirilmiş kırılımı var: retest oldu mu
@@ -1192,6 +1232,20 @@ def kayit_yap(tur, r, simdi):
             ek["cizgi"] = r["cizgi"]
     else:
         ek = dict(puan=r["puan"], teyit=r["teyit"])
+    if tur in ("g", "h", "x"):
+        ek["isaret"] = r.get("isaret", "")
+        oz = dict(r.get("ozellik") or {})
+        if r.get("gunluk") is not None:
+            oz["gun"] = round(float(r["gunluk"]), 2)               # hissenin o anki günlük değişimi
+            if BAGLAM.get("endeks") is not None:
+                oz["alfa_gun"] = round(float(r["gunluk"]) - BAGLAM["endeks"], 2)   # hisse - endeks (gün içi, sinyal anında)
+        if oz:
+            ek["oz"] = oz
+        bag = {a: round(v, 2) for a, v in (("endeks", BAGLAM.get("endeks")), ("genislik", BAGLAM.get("genislik"))) if v is not None}
+        if bag:
+            ek["bag"] = bag
+        if r.get("eleme"):
+            ek["eleme"] = r["eleme"]
     rg = rg_hesapla(r["fiyat"], r["stop"], hedef)
     if rg is not None:
         ek["rg_ok"] = bool(rg >= GIRIS_MIN_RG)
@@ -1398,6 +1452,57 @@ def ozet_satiri(etiket, grup):
             f"ort. en düşük %{sayi(ort('dus'), 1, True)} · ort. kapanış %{sayi(ort('kap'), 1, True)}")
 
 
+def kisa_grup(ad, grup):
+    """Tek satırlık özet: sinyal sayısı, artıda kapanan, ort. kapanış, kırdığı seviyenin altına inen, endeksi geçen."""
+    g = [k for k in grup if k.get("sonuc") != "bos" and "kap" in k]
+    if len(g) < 3:
+        return None
+    n = len(g)
+    sv = [k for k in g if "seviye_alt" in k]
+    al = [k["alfa"] for k in g if "alfa" in k]
+    ek = (f" · seviye altı {sum(1 for k in sv if k['seviye_alt'])}/{len(sv)}" if sv else "") + \
+         (f" · endeksi geçen {sum(1 for x in al if x > 0)}/{len(al)}" if al else "")
+    return f"  {ad}: {n} · artıda {sum(1 for k in g if k['kap'] > 0)}/{n} · ort. kapanış %{sayi(sum(k['kap'] for k in g) / n, 1, True)}{ek}"
+
+
+def ozellik_satirlari(gecmis):
+    """Kırılımların (bildirilen + elenen) özelliklere göre karşılaştırması. Hepsi bilgi amaçlıdır; kural değildir."""
+    kir = [k for k in gecmis if k["tur"] in ("g", "h", "x")]
+    out = []
+
+    def blok(baslik, ciftler):
+        satir = [kisa_grup(ad, [k for k in kir if f(k)]) for ad, f in ciftler]
+        satir = [x for x in satir if x]
+        if satir:
+            out.append(baslik)
+            out.extend(satir)
+
+    blok("⏰ Saate göre (🚀🔸🚫 hepsi):", (("10:00-12:00", lambda k: k["saat"] < "12:00"),
+                                         ("12:00-15:00", lambda k: "12:00" <= k["saat"] < "15:00"),
+                                         ("15:00 sonrası", lambda k: k["saat"] >= "15:00")))
+    oz = lambda k, a: (k.get("oz") or {}).get(a)
+    blok("🔬 Özelliğe göre (bildirilen + elenen):", (
+        (f"hacim ≥ {RVOL_ESIK:g}x (saatine göre)", lambda k: oz(k, "rvol") is not None and oz(k, "rvol") >= RVOL_ESIK),
+        (f"hacim < {RVOL_ESIK:g}x", lambda k: oz(k, "rvol") is not None and oz(k, "rvol") < RVOL_ESIK),
+        ("hisse endeksten güçlü (gün içi)", lambda k: oz(k, "alfa_gun") is not None and oz(k, "alfa_gun") > 0),
+        ("hisse endeksten zayıf", lambda k: oz(k, "alfa_gun") is not None and oz(k, "alfa_gun") <= 0),
+        (f"kapanış mum üst %{int((1 - KAP_KONUM_ESIK) * 100)}'inde", lambda k: oz(k, "kapkonum") is not None and oz(k, "kapkonum") >= KAP_KONUM_ESIK),
+        ("kapanış mumun altında/ortasında", lambda k: oz(k, "kapkonum") is not None and oz(k, "kapkonum") < KAP_KONUM_ESIK),
+        (f"gövde ≥ {GOVDE_ATR_ESIK:g} ATR", lambda k: oz(k, "govde_atr") is not None and oz(k, "govde_atr") >= GOVDE_ATR_ESIK),
+        (f"gövde < {GOVDE_ATR_ESIK:g} ATR", lambda k: oz(k, "govde_atr") is not None and oz(k, "govde_atr") < GOVDE_ATR_ESIK),
+        (f"piyasa genişliği ≥ %{int(GENISLIK_ESIK * 100)}", lambda k: (k.get("bag") or {}).get("genislik") is not None and k["bag"]["genislik"] >= GENISLIK_ESIK),
+        (f"piyasa genişliği < %{int(GENISLIK_ESIK * 100)}", lambda k: (k.get("bag") or {}).get("genislik") is not None and k["bag"]["genislik"] < GENISLIK_ESIK),
+        ("endeks gün içi ≥ 0", lambda k: (k.get("bag") or {}).get("endeks") is not None and k["bag"]["endeks"] >= 0),
+        ("endeks gün içi < 0", lambda k: (k.get("bag") or {}).get("endeks") is not None and k["bag"]["endeks"] < 0)))
+    ciftler = []
+    for simge, ad in TEYIT_ADLARI:
+        ciftler.append((f"{simge} {ad} VAR", lambda k, s=simge: bool(k.get("isaret")) and s in k["isaret"]))
+        ciftler.append((f"{simge} {ad} yok", lambda k, s=simge: bool(k.get("isaret")) and s not in k["isaret"]))
+    blok("✔️ Tek tek teyit (hangisi işe yarıyor):", ciftler)
+    blok("🌐 Endeks filtresi:", ((f"endeks nedeniyle elenen (BIST100 ≤ %{ENDEKS_ESIK:g})", lambda k: k.get("eleme") == "endeks"),))
+    return out
+
+
 def genel_toplam(gecmis):
     gunler = {k["tarih"] for k in gecmis}
     satirlar = [f"📈 Genel toplam ({len(gunler)} işlem günü)"]
@@ -1528,7 +1633,7 @@ def rapor_calistir(simdi, bugun):
     for k, d in sonuclar:
         kayit = dict(tarih=str(bugun), tur=k["tur"], sembol=k["sembol"], saat=k["saat"],
                      sonuc=d["sonuc"], teyit=k.get("teyit"))
-        for alan in ("ust_cizgi", "puan", "rg_ok", "tmax", "surum"):
+        for alan in ("ust_cizgi", "puan", "rg_ok", "tmax", "surum", "isaret", "oz", "bag", "eleme"):
             if alan in k:
                 kayit[alan] = k[alan]
         if "kirdi" in d:
@@ -1571,6 +1676,21 @@ def rapor_calistir(simdi, bugun):
     for metin, _ in mesaj_parcalari(bolumler, simdi, ek_satir=ozet, alt=alt,
                                     baslik=f"📊 Gün sonu raporu · {bugun:%d.%m.%Y}"):
         ok = telegram_gonder(metin) and ok
+    # Özellik analizi: uzun olduğu için ayrı mesaj(lar)la (Telegram 4096 karakter sınırı)
+    try:
+        oz_satirlar = ozellik_satirlari(gecmis_oku())
+        if oz_satirlar:
+            parca, uzunluk = [], 0
+            for satir in ["🔬 KIRILIM ÖZELLİK ANALİZİ (bilgi amaçlı; örnek az olabilir, şans eseri farklar çıkar)"] + oz_satirlar:
+                if uzunluk + len(satir) > 3500:
+                    telegram_gonder("\n".join(parca))
+                    parca, uzunluk = [], 0
+                parca.append(satir)
+                uzunluk += len(satir) + 1
+            if parca:
+                telegram_gonder("\n".join(parca))
+    except Exception as e:
+        print(f"Özellik analizi gönderilemedi ({type(e).__name__}: {e})")
     if not ok:
         print("Rapor mesajı gönderilemedi.")
         sys.exit(1)
@@ -1750,6 +1870,18 @@ def main(mod=None):
             if as_r:
                 asiri_liste.append(as_r)
     print("Sayım:", sayac)
+    # Tarama anının bağlamı: BIST100 günlük değişimi ve piyasa genişliği (kayıt + endeks filtresi için)
+    BAGLAM.clear()
+    try:
+        e_gun = endeks_gunluk(endeks_verisi(), bugun)
+        if e_gun is not None:
+            BAGLAM["endeks"] = float(e_gun)
+    except Exception as e:
+        print(f"BIST100 anlık değişimi alınamadı ({type(e).__name__}: {e})")
+    degs = [v for v in GUNLUK_DEG.values() if v == v]
+    if len(degs) >= 50:
+        BAGLAM["genislik"] = sum(1 for v in degs if v > 0) / len(degs)
+    print("Bağlam:", {a: round(v, 2) for a, v in BAGLAM.items()})
 
     if sayac["veri_yok"] > 0.5 * len(semboller):
         print("Hisselerin yarısından fazlasının verisi alınamadı (Yahoo erişim sorunu olabilir).")
@@ -1757,6 +1889,11 @@ def main(mod=None):
 
     if mod == "bildirim" and RETEST_GOSTER:
         retest_isle(simdi, bugun)
+    if ENDEKS_FILTRE and BAGLAM.get("endeks") is not None and BAGLAM["endeks"] <= ENDEKS_ESIK:
+        for r in trend_liste:
+            if r.get("kademe") in ("guclu", "hacimsiz"):
+                r["kademe"] = "elenen"          # bildirilmez; elenen olarak kaydedilir, raporda "endeks nedeniyle elenen" ayrı ölçülür
+                r["eleme"] = "endeks"
     trend_liste.sort(key=siralama_anahtari)
     elenenler = [r for r in trend_liste if r["kademe"] == "elenen"]     # sadece rapor icin kaydedilir
     trend_liste = [r for r in trend_liste if r["kademe"] != "elenen"]
