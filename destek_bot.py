@@ -48,6 +48,12 @@ DUSEN_MIN_GUN = 30       # düşen çizginin çıktığı zirve en az bu kadar m
 EMA_UZUNLUK = 200        # üstel hareketli ortalama periyodu (günlük)
 TREND_SARTI = True       # True: NW/SMC/yatay/trend/hacim destekleri yalnız günlük trend yukarıysa mesaj üretir (EMA200 muaf)
 TREND_CIZGI_YAKIN = 8.0   # yükselen çizgi yolu: fiyat çizgiden en fazla bu kadar % yukarıdaysa çizgi 'işliyor' sayılır (çok uzaktaki çizgi trend kanıtı değil)
+KIRIK_PENCERE = 60        # kısa vadeli çizgi kırılımı: son kaç günlük mum incelenir
+KIRIK_MIN_GUN = 8         # çizgiyi belirleyen iki dip arası en az bu kadar mum
+KIRIK_MAX_GUN = 40        # çizginin kırılıncaya kadar en fazla süresi (daha uzunu zaten 'uzun vadeli' çizgi)
+KIRIK_MIN_EGIM = 0.50     # mum başına en az bu kadar % eğim (dik kısa vadeli yükseliş)
+KIRIK_MIN_YUKSELIS = 8.0  # çizgi boyunca fiyat en az bu kadar % yükselmiş olmalı (gerçek bir yükseliş bacağı)
+KIRIK_SON_GUN = 5         # kırılma son kaç mum içinde olduysa 'yeni kırıldı' sayılır
 TREND_MIKRO_EGIM = 0.30    # mikro trend (10-44 mumluk kısa çizgi): mum başına en az bu kadar % eğim
 TREND_MIKRO_EMA = 10       # mikro trend ayrıca fiyatın bu günlük EMA'nın üstünde ve EMA'nın yükselir olmasını ister (son günlerde düşüş varsa kısa vade yukarı sayılmaz)
 TREND_MIN_UZUNLUK = 45    # trend etiketi için yükselen çizginin en az bu kadar günlük mum süren olması (kısa sıçrama çizgisi büyük düşüş içinde trend sayılmaz)
@@ -376,6 +382,46 @@ def yukselen_trendler(df, fiyat=None):
             continue
         kalan.append(r)
     return sorted(kalan, key=lambda r: r["mesafe"])
+
+
+def kisa_cizgi_kirildi(df, fiyat=None):
+    """Kısa vadeli yükselen çizgi yeni kırıldı mı? İki dipten (KIRIK_MIN_GUN-KIRIK_MAX_GUN mum arayla) geçen dik (mum başına en az
+    %KIRIK_MIN_EGIM) bir çizgi, kırılana kadar kapanışla tutmuş (%1 tolerans), çizgi boyunca fiyat en az %KIRIK_MIN_YUKSELIS yükselmiş,
+    ilk kapanışla kırılma son KIRIK_SON_GUN mumda ve fiyat hâlâ çizginin altındaysa o çizgiyi döndürür, yoksa None.
+    Dönüş: dict(deger=çizginin bugünkü değeri, gun=çizginin kırılana kadar süresi, kirilma_once=kaç mum önce kırıldı)."""
+    if df is None or len(df) < 40:
+        return None
+    df = df.tail(KIRIK_PENCERE)
+    alt = df["Low"].to_numpy(dtype=float)
+    kap = df["Close"].to_numpy(dtype=float)
+    son = len(df) - 1
+    if fiyat is None:
+        fiyat = float(kap[-1])
+    n = TREND_PIVOT_N
+    dipler = [i for i in range(n, len(df) - n) if alt[i] == alt[i - n:i + n + 1].min()]
+    for a in range(len(dipler)):
+        for b in range(a + 1, len(dipler)):
+            i, j = dipler[a], dipler[b]
+            if not (KIRIK_MIN_GUN <= j - i <= KIRIK_MAX_GUN) or alt[j] <= alt[i]:
+                continue
+            egim = (alt[j] - alt[i]) / (j - i)
+            if egim / alt[i] * 100 < KIRIK_MIN_EGIM:
+                continue
+            cizgi = alt[i] + egim * (np.arange(i, son + 1) - i)
+            alti = np.flatnonzero(kap[i:] < cizgi * (1 - TREND_KIRILIM))
+            if not len(alti):
+                continue                                      # çizgi kırılmamış
+            kb = i + int(alti[0])
+            if kb <= j or son - kb > KIRIK_SON_GUN:
+                continue                                      # ikinci dipten önce kırılmış ya da kırılma eski
+            if (alt[i:kb] < cizgi[:kb - i] * 0.97).any():
+                continue                                      # fitiller çizgiyi çok delmiş: çizgi tutmamış
+            if kap[kb - 1] / kap[i] - 1 < KIRIK_MIN_YUKSELIS / 100:
+                continue                                      # çizgi boyunca anlamlı bir yükseliş yok
+            if fiyat >= cizgi[-1]:
+                continue                                      # fiyat çizginin üstüne dönmüş
+            return dict(deger=float(cizgi[-1]), gun=int(kb - i), kirilma_once=int(son - kb))
+    return None
 
 
 def trend_yukari(df, fiyat, cizgiler=None, dusen=False):
@@ -867,6 +913,18 @@ def smc_kayit_yazdir(sembol, son=30):
     print(f"\n=== {sembol}: SMC olay kaydı  ({len(df4)} 4 saatlik mum, {df4.index[0]:%Y-%m-%d} ... {df4.index[-1]:%Y-%m-%d %H:%M}) ===")
     for satir in kayit[-son:]:
         print("  " + satir)
+    # Aktif blokların mumlarını ve komşularını TradingView ile karşılaştırmak için yaz
+    try:
+        print("\n  -- aktif blokların mumları (TradingView 4 saatlik mumuyla karşılaştır) --")
+        for b in smc_order_bloklar(df4)[:3]:
+            k = df4.index.get_loc(b["mum"])
+            print(f"  {'BOĞA' if b['tur'] == 'boga' else 'ayı'} blok {b['alt']:.2f}-{b['ust']:.2f}:")
+            for j in range(max(0, k - 1), min(len(df4), k + 3)):
+                r = df4.iloc[j]
+                isaret = "  <== blok mumu" if j == k else ""
+                print(f"     {df4.index[j]:%m-%d %H:%M}  A {r['Open']:.2f}  Y {r['High']:.2f}  D {r['Low']:.2f}  K {r['Close']:.2f}{isaret}")
+    except Exception as e:
+        print(f"  (mum dökümü yazılamadı: {e})")
 
 
 def ayrinti_yazdir(sembol, merkez):
@@ -903,6 +961,9 @@ def seviye_yazdir(sembol):
     trendler = [r for r in yukselen_trendler(df, fiyat) if r["mesafe"] <= MAX_UZAKLIK]
     dt = dusen_trend(df, fiyat)
     ty = trend_yukari(df, fiyat, yukselen_trendler(df, fiyat), False)
+    kk = kisa_cizgi_kirildi(df, fiyat)
+    print("  kısa vadeli yükselen çizgi: " + (f"KIRILDI ({kk['gun']} günlük çizgi, {kk['kirilma_once']} mum önce; çizginin bugünkü değeri {kk['deger']:.2f}) -> destek mesajı üretilmez"
+                                           if kk else "yeni kırılma yok"))
     print(f"  günlük trend (destek şartı): {'YUKARI' if ty['yukari'] else 'yukarı değil'}  "
           f"(EMA{TREND_EMA} yolu: {'evet' if ty['ema_yol'] else 'hayır'}, yükselen çizgi yolu: {'evet' if ty['cizgi_yol'] else 'hayır'})")
     if dt:
@@ -1501,6 +1562,8 @@ def aday_puani(df, fiyat=None, bugun_alt=None, d4=None):
         fiyat = float(df["Close"].iloc[-1])
     if bugun_alt is None:
         bugun_alt = float(df["Low"].iloc[-1])
+    if kisa_cizgi_kirildi(df, fiyat):                     # kısa vadeli yükselen çizgi yeni kırıldı: destek mesajı yok
+        return 0, False
     esik, _ = yakinlik_esigi(df)
     esik += ADAY_PAYI
     gb = gelis_bilgi(df, fiyat, bugun_alt)
@@ -1617,7 +1680,8 @@ def analiz(sembol, df, fiyat=None, bugun_alt=None):
     tum_cizgiler = yukselen_trendler(df, fiyat)       # düşen uzun vadeli çizgi olsa da kırılmamış yükselen çizgi (kısa vadeli trend) geçerli
     trendler = [r for r in tum_cizgiler if r["mesafe"] <= MAX_UZAKLIK]
     ty = trend_yukari(df, fiyat, tum_cizgiler, False)
-    ty_ok = ty["yukari"] or not TREND_SARTI
+    kirik = kisa_cizgi_kirildi(df, fiyat)             # kısa vadeli yükselen çizgi yeni kırıldıysa hiçbir destek mesajı üretilmez
+    ty_ok = (ty["yukari"] or not TREND_SARTI) and not kirik
     eb = ema200_bilgi(df, fiyat, bugun_alt)
     ham = ham_veriler(sembol)
     hmum, _ = hacim_mumlari(df, ham)
@@ -1634,7 +1698,7 @@ def analiz(sembol, df, fiyat=None, bugun_alt=None):
     parcalar = []      # (ad, alt, ust, mesafe, metin); yalnız fiyatın altında/içinde olanlar, fiyat yukarıdan inerek gelmişse
     def ekle(ad, alt, ust, mesafe, metin, yon_atla=False):
         # yön filtresi: aşağıdan yukarı gelen fiyat için o seviye direnç olur, destek değil -> alınmaz (NW değdi/sinyal hariç)
-        if ad != "EMA200" and not ty_ok:                 # trend şartı: yukarı değilse EMA200 dışındaki destekler alınmaz
+        if kirik or (ad != "EMA200" and not ty_ok):      # kısa çizgi kırıldıysa hiçbiri; trend yukarı değilse EMA200 dışındakiler alınmaz
             return
         if alt <= fiyat and (yon_atla or gelis_uygun(gb, alt, ust)):
             parcalar.append((ad, alt, ust, mesafe, metin))
@@ -1674,7 +1738,7 @@ def analiz(sembol, df, fiyat=None, bugun_alt=None):
     gruplar = kesisim_bolgeleri([(p[0], p[1], p[2]) for p in parcalar], fiyat, esik)
     yakin_gruplar = [g for g in gruplar if g["yakin"]]
     yakin_parca = sorted([p for p in parcalar if p[3] <= esik], key=lambda p: p[3])
-    ema_tetik = bool(eb) and (eb["durum"] == "dokundu" or (eb["durum"] == "yaklaşıyor" and any(p[0] == "EMA200" for p in parcalar)))
+    ema_tetik = bool(eb) and not kirik and (eb["durum"] == "dokundu" or (eb["durum"] == "yaklaşıyor" and any(p[0] == "EMA200" for p in parcalar)))
     nw_tetik = bool(nb) and (nw_dokundu or (nb["durum"] == "yaklaşıyor" and any(p[0] == "NW alt bant" for p in parcalar)))
     teyit = teyit_hesapla(df4, _simdi(), nb)
     smc_tetik = any(p[0] == "SMC mavi blok" for p in yakin_parca)
@@ -1699,7 +1763,7 @@ def analiz(sembol, df, fiyat=None, bugun_alt=None):
                 tetik=bool(yakin_parca) or ema_tetik or nw_tetik, puan=puan,
                 nw_tetik=nw_tetik, ema_tetik=ema_tetik, smc_tetik=smc_tetik, teyit=teyit,
                 kesisim=kes, destek_alti=destek_alti(yakin_parca),
-                gosterilen=gosterilen, ana=ana, en_yakin_mesafe=en_yakin, bagimsiz=bagimsiz, trend=ty, dokundu=dokundu, kademe=kademe, _bugun_alt=bugun_alt)
+                gosterilen=gosterilen, ana=ana, en_yakin_mesafe=en_yakin, bagimsiz=bagimsiz, trend=ty, kisa_kirik=kirik, dokundu=dokundu, kademe=kademe, _bugun_alt=bugun_alt)
 
 
 KISA = {"Yatay destek": "yatay", "Yükselen trend": "trend", "EMA200": "EMA200", "NW alt bant": "NW alt bant",
@@ -2041,7 +2105,7 @@ def tara_calistir():
 # ---------- sinyal kaydı ve gün sonu raporu ----------
 SINYAL_DOSYASI = os.path.join("durum_destek", "sinyaller.json")
 SINYAL_SAKLAMA_GUN = 120   # kayıtlar bu kadar gün saklanır (toplu başarı özeti için)
-KURAL_SURUMU = "v2d-18Kas"   # kuralları değiştirdiğinde bunu da değiştir: rapor sinyalleri sürüme göre ayırır (eski kayıtlar 'eski' sayılır)
+KURAL_SURUMU = "v2e-18Kas"   # kuralları değiştirdiğinde bunu da değiştir: rapor sinyalleri sürüme göre ayırır (eski kayıtlar 'eski' sayılır)
 BOLGE_TEPKI = 1.0          # bölge girişi için 'tepki' eşiği: girişten en az bu kadar % yükselme
 BOLGE_STOP_PAY = 0.3       # bölge girişi için stop: destek bölgesinin altından bu kadar % aşağısı (fitil payı)
 RAPOR_MAX_SATIR = 40       # raporda hisse hisse listelenecek en fazla satır
