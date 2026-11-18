@@ -4,7 +4,7 @@ app.py'den bağımsız çalışır, app.py'ye dokunmaz. GitHub Actions tarafınd
 seans saatlerinde 15 dakikada bir çalıştırılır.
 
 Sabit kurallar:
-- Mum: ZAMAN_DILIMI="4s" (varsayılan) ise 4 saatlik mum (09:40-13:40, 13:40-17:40, 17:40-kapanış; son ~60 gün 15 dakikalık veriden,
+- Mum: ZAMAN_DILIMI="4s" (varsayılan) ise 4 saatlik mum (TradingView ızgarası: 10:00-12:00, 12:00-16:00, 16:00-kapanış; son ~60 gün 15 dakikalık veriden,
   eskisi saatlik veriden); "1s" ise eski saatlik mum (15 dakikalık veriden tam saatlere). Aktif (kapanmamış) mum dahil, 5 dakikada bir taranır
 - Düşen trend çizgisi kırılımı (🚀): en az 3 temas, eğim %3, temas yakınlığı %0,5
 - Kırılım: kapanmış mum çizginin en az %0,2 üstünde kapanmış ya da aktif mum %0,5 üstünde, ve fiyat hâlâ çizgi üstünde
@@ -505,19 +505,19 @@ def _ohlcv_topla(m, anahtar):
 
 
 def dort_saatlik_yeni(m):
-    """15 dakikalık mumlardan TradingView'daki gibi 4 saatlik mumlar: 09:40-13:40, 13:40-17:40, 17:40-kapanış.
-    (15 dakikalık mumlar 13:40 ve 17:40 sınırına tam oturmadığı için sınırdaki mum, başlangıç saatine göre bir yana atanır: en fazla 5 dakikalık kayma.)"""
+    """15 dakikalık mumlardan TradingView'daki gibi 4 saatlik mumlar: 08:00-12:00 (seans 10:00'da açılır), 12:00-16:00, 16:00-kapanış.
+    (Kullanıcının TradingView'da gördüğü 18 Kasım ilk mumu bu ızgarayla uyuştu; eski 09:40/13:40/17:40 ızgarası tutmadı.)"""
     idx = m.index
     dk = idx.hour * 60 + idx.minute
-    bas = np.where(dk < 13 * 60 + 40, 9 * 60 + 40, np.where(dk < 17 * 60 + 40, 13 * 60 + 40, 17 * 60 + 40))
+    bas = np.where(dk < 12 * 60, 8 * 60, np.where(dk < 16 * 60, 12 * 60, 16 * 60))
     return _ohlcv_topla(m, idx.tz_localize(None).normalize() + pd.to_timedelta(bas, unit="m"))
 
 
 def dort_saatlik_eski(h):
-    """Saatlik mumlardan yaklaşık 4 saatlik mumlar (10:00-14:00, 14:00-18:00, 18:00 kapanış): yalnızca 15 dakikalık verinin
-    öncesindeki eski dönem için; saatlik veri 13:40 ve 17:40'ı ayıramaz."""
+    """Saatlik mumlardan 4 saatlik mumlar (08:00-12:00, 12:00-16:00, 16:00-kapanış; TradingView ızgarası): yalnızca 15 dakikalık
+    verinin öncesindeki eski dönem için. Saatlik mumlar bu sınırlara tam oturur."""
     idx = h.index
-    blok = np.where(idx.hour < 14, 10, np.where(idx.hour < 18, 14, 18))
+    blok = np.where(idx.hour < 12, 8, np.where(idx.hour < 16, 12, 16))
     return _ohlcv_topla(h, idx.tz_localize(None).normalize() + pd.to_timedelta(blok, unit="h"))
 
 
@@ -538,17 +538,18 @@ def gecmis_saatlik(sembol):
 def aktif_hacim_tahmini(df):
     """Kapanmamış 4 saatlik mumun hacmi henüz eksik olduğundan 'hacim ortalamanın üstünde mi' ölçümü hep düşük çıkar.
     Bu yüzden son mumun hacmi, geçen süreye göre (en fazla HACIM_TAHMIN_MAX kat) büyütülür. Kaba bir tahmindir.
-    17:40 mumu çok kısa (kapanış seansı) olduğu için büyütülmez."""
+    Mumların gerçek işlem süresi: 10:00-12:00 (120 dk), 12:00-16:00 (240 dk), 16:00-18:10 (130 dk)."""
     simdi = dt.datetime.now(TR)
     son = df.index[-1]
     bas = son.hour * 60 + son.minute
-    if son.date() != simdi.date() or bas >= 17 * 60 + 40:
+    if son.date() != simdi.date():
         return df
-    gecen = simdi.hour * 60 + simdi.minute - bas
-    if 0 < gecen < 240:
+    sure = 120 if bas < 12 * 60 else (240 if bas < 16 * 60 else 130)
+    gecen = simdi.hour * 60 + simdi.minute - max(bas, 10 * 60)
+    if 0 < gecen < sure:
         df = df.copy()
         df["Volume"] = df["Volume"].astype("float64")   # int64 sütuna ondalık yazılamaz (TypeError)
-        df.iloc[-1, df.columns.get_loc("Volume")] = float(df["Volume"].iloc[-1]) * min(HACIM_TAHMIN_MAX, 240.0 / gecen)
+        df.iloc[-1, df.columns.get_loc("Volume")] = float(df["Volume"].iloc[-1]) * min(HACIM_TAHMIN_MAX, float(sure) / gecen)
     return df
 
 
