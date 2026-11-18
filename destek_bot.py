@@ -2281,6 +2281,15 @@ def _bolge_grup(ad, liste):
     return f"  {ad}: {len(liste)} sinyal · bölgeye inen {len(d)} · tepki önce {t} · bozulma önce {b}"
 
 
+ARAC_GRUPLARI = (
+    ("📐 ana destekte yükselen trend çizgisi VAR", lambda k: "Yükselen trend" in k.get("araclar", [])),
+    ("   yükselen trend çizgisi YOK", lambda k: "Yükselen trend" not in k.get("araclar", [])),
+    ("📐 yalnız yükselen trend (tek araç)", lambda k: k.get("araclar", []) == ["Yükselen trend"]),
+    ("🧱 yatay destek var", lambda k: "Yatay destek" in k.get("araclar", [])),
+    ("📦 hacim düğümü var", lambda k: "Hacim düğümü" in k.get("araclar", [])),
+)   # 'ana destek' = mesajda gösterilen bölgedeki araçlar; iki gün sonra "sadece yükselen trend desteklerini kovalayalım mı" kararı için
+
+
 def bolge_satirlari(olcumlu):
     """Raporun 'destek bölgesine göre' bölümü (giriş = bölge üstü). Ölçüm yoksa boş liste."""
     vals = [k for k in olcumlu if k["sonuc"].get("bolge") is not None]
@@ -2313,6 +2322,11 @@ def bolge_satirlari(olcumlu):
             sat.append(x)
     sat.append("Teyide göre:")
     for ad, f in (("teyitli", lambda k: bool(k["teyit"])), ("teyitsiz", lambda k: not k["teyit"])):
+        x = _bolge_grup(ad, [k for k in vals if f(k)])
+        if x:
+            sat.append(x)
+    sat.append("Destek türüne göre:")
+    for ad, f in ARAC_GRUPLARI:
         x = _bolge_grup(ad, [k for k in vals if f(k)])
         if x:
             sat.append(x)
@@ -2375,7 +2389,7 @@ def rapor_metni(olcumlu, gun_etiket, hisse_listesi_yaz=True, eksik=0, endeks=Non
     sat.append("Araca göre:")
     for ad, f in (("2+ araç üst üste", lambda k: len(k["araclar"]) >= 2), ("tek araç", lambda k: len(k["araclar"]) < 2),
                   ("〰️ EMA200 tetikli", lambda k: "ema" in k["bagimsiz"]), ("🌊 NW tetikli", lambda k: "nw" in k["bagimsiz"]),
-                  ("🟦 SMC tetikli", lambda k: "smc" in k["bagimsiz"])):
+                  ("🟦 SMC tetikli", lambda k: "smc" in k["bagimsiz"])) + ARAC_GRUPLARI:
         x = _grup_satiri(ad, [k for k in olcumlu if f(k)])
         if x:
             sat.append(x)
