@@ -886,7 +886,7 @@ def smc_order_bloklar(df4, ic=SMC_IC_BOYUT, swing=SMC_SWING_BOYUT, atr_uz=SMC_AT
 
 def smc_kayit_yazdir(sembol, son=30):
     """Hata ayıklama: iç yapı kırılımlarının ve order block oluşum/silinme olaylarının son kayıtları."""
-    df4 = veri_cek_4saat(sembol)
+    df4 = veri_cek_4saat(sembol, veri_cek_gunluk(sembol))   # canlı yoldaki gibi: günün son mumu resmi kapanışla düzeltilir
     if df4 is None:
         print(f"{sembol}: 4 saatlik veri alınamadı")
         return
