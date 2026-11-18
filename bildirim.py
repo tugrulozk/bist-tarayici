@@ -109,6 +109,7 @@ ASIRI_EN_AZ_TEYIT = 2    # 3 dönüş teyidinden (🟢 🔒 📊) en az kaçı
 TABAN_ESIGI = -9.5       # günlük değişim bunun altındaysa tabana oturmuş sayılır, hariç tutulur
 STOP_ATR = 1.5           # örnek stop: fiyat - 1,5 x ATR
 # ---- Giriş sınırı ve 4 saatlik direnç (mesajdaki ek bilgiler)
+KURAL_SURUMU = "k2-18Kas"   # kuralları ya da mum ızgarasını değiştirdiğinde bunu da değiştir: rapor sinyalleri sürüme göre ayırır (eski kayıtlar "eski" sayılır)
 GIRIS_MIN_RG = 1.5   # "en fazla bu fiyata kadar gir" sınırı için istenen en düşük risk/getiri (kazanç ≥ risk x bu)
 DIRENC_PERIYOT = "6mo"  # 4 saatlik düşen çizgi direnci için saatlik mum geçmişi (yalnızca sinyal veren hisselere çekilir)
 # app.py'deki "Gelişmiş ayarlar" varsayılanları
@@ -1195,7 +1196,7 @@ def kayit_yap(tur, r, simdi):
     if rg is not None:
         ek["rg_ok"] = bool(rg >= GIRIS_MIN_RG)
     return dict(tur=tur, sembol=r["sembol"], saat=f"{simdi:%H:%M}", fiyat=r["fiyat"],
-                stop=r["stop"], hedef=hedef, **ek)
+                stop=r["stop"], hedef=hedef, surum=KURAL_SURUMU, **ek)
 
 
 def kayit_dosyasi():
@@ -1421,6 +1422,16 @@ def genel_toplam(gecmis):
         satir = ozet_satiri(ad, [k for k in rg_var if k["rg_ok"] == secim])
         if satir:
             satirlar.append(satir)
+    surumler = sorted({k.get("surum", "eski") for k in gecmis})
+    if len(surumler) > 1 or surumler != ["eski"]:
+        satirlar.append("Kural sürümüne göre (🚀🔸 bildirilenler):")
+        for sv in surumler:
+            satir = ozet_satiri(f"  {sv}:", [k for k in gecmis if k.get("surum", "eski") == sv and k["tur"] in ("g", "h")])
+            if satir:
+                satirlar.append(satir)
+            al_s = [k["alfa"] for k in gecmis if k.get("surum", "eski") == sv and "alfa" in k and k["tur"] in ("g", "h")]
+            if al_s:
+                satirlar.append(f"     🆚 endeksi geçen {sum(1 for x in al_s if x > 0)}/{len(al_s)} · hisse − endeks ort %{sayi(sum(al_s) / len(al_s), 1, True)}")
     al = [k["alfa"] for k in gecmis if "alfa" in k and k["tur"] != "x"]
     if al:
         satirlar.append(f"🆚 Hisse − BIST100 (bildirilenler): {len(al)} sinyal · ort %{sayi(sum(al) / len(al), 1, True)} · "
@@ -1517,7 +1528,7 @@ def rapor_calistir(simdi, bugun):
     for k, d in sonuclar:
         kayit = dict(tarih=str(bugun), tur=k["tur"], sembol=k["sembol"], saat=k["saat"],
                      sonuc=d["sonuc"], teyit=k.get("teyit"))
-        for alan in ("ust_cizgi", "puan", "rg_ok", "tmax"):
+        for alan in ("ust_cizgi", "puan", "rg_ok", "tmax", "surum"):
             if alan in k:
                 kayit[alan] = k[alan]
         if "kirdi" in d:
