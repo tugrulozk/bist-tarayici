@@ -1057,6 +1057,39 @@ def kirilim_mum_satiri(r):
     return f"Kırılım mumu: {r['kirilim_zaman']:%H:%M} ({durum})\n"
 
 
+def baglam_satirlari(r):
+    """Mesaja karar yardımcısı satırlar (bilgi; eleme yapmaz): piyasa bağlamı, hissenin endekse göre gücü, kırılım mumunun kalitesi.
+    ✅/⚠️ işaretleri henüz kanıtlanmamış eşiklere göre (RVOL_ESIK, KAP_KONUM_ESIK, GOVDE_ATR_ESIK, GENISLIK_ESIK); rapor biriktikçe doğrulanır."""
+    oz = r.get("ozellik") or {}
+    out = ""
+    e, g = BAGLAM.get("endeks"), BAGLAM.get("genislik")
+    parca = []
+    if e is not None:
+        parca.append(f"BIST100 %{sayi(e, 1, True)}")
+    if g is not None:
+        parca.append(f"{'✅' if g >= GENISLIK_ESIK else '⚠️'} yükselen hisse oranı %{int(round(g * 100))}")
+    if parca:
+        out += "🌐 " + " · ".join(parca) + "\n"
+    parca = []
+    if r.get("gunluk") is not None and e is not None:
+        fark = float(r["gunluk"]) - e
+        parca.append(f"{'✅' if fark > 0 else '⚠️'} endeksten %{sayi(abs(fark), 1)} {'güçlü' if fark > 0 else 'zayıf'}")
+    if oz.get("rvol") is not None:
+        parca.append(f"{'✅' if oz['rvol'] >= RVOL_ESIK else '⚠️'} hacim {sayi(oz['rvol'], 1)}x (saatine göre)")
+    if parca:
+        out += "💪 " + " · ".join(parca) + "\n"
+    parca = []
+    if oz.get("kapkonum") is not None:
+        parca.append(f"{'✅' if oz['kapkonum'] >= KAP_KONUM_ESIK else '⚠️'} kapanış mum aralığının %{int(round(oz['kapkonum'] * 100))}'inde")
+    if oz.get("govde_atr") is not None:
+        parca.append(f"{'✅' if oz['govde_atr'] >= GOVDE_ATR_ESIK else '⚠️'} gövde {sayi(oz['govde_atr'], 1)} ATR")
+    if oz.get("ustfitil") is not None and oz["ustfitil"] >= 0.3:
+        parca.append(f"⚠️ üst fitil %{int(round(oz['ustfitil'] * 100))}")
+    if parca:
+        out += "🕯 " + " · ".join(parca) + "\n"
+    return out
+
+
 def blok_trend(r, yildiz):
     gun = f"gün {sayi(r['gunluk'], 1, True)}%" if r["gunluk"] is not None else "gün ?"
     hac = f" · hacim {sayi(r['hacim'], 1)}x" if r["hacim"] is not None else ""
@@ -1069,6 +1102,7 @@ def blok_trend(r, yildiz):
         f"{kama_satiri(r)}"
         f"{gunluk_satiri(r)}"
         f"{sikisma_satiri(r)}"
+        f"{baglam_satirlari(r)}"
         f"{stop_hedef_satirlari(r)}"
         f"{risk_getiri_satiri(r)}"
         f"{direnc_satiri(r)}"
