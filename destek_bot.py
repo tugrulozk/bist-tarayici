@@ -569,8 +569,8 @@ def ema200_bilgi(df, fiyat=None, bugun_alt=None):
 
 
 def saatlikten_4saatlige(h):
-    """Saatlik muma dizisini 4 saatlik mumlara çevirir. BIST için mum başlangıçları 10:00, 14:00 ve
-    (varsa) 18:00 kapanış seansı mumu. Dönüş: Open/High/Low/Close/Volume sütunlu, mum başlangıç zamanı indeksli tablo."""
+    """Saatlik muma dizisini 4 saatlik mumlara çevirir. TradingView'daki gibi 4 saatlik ızgara (08:00, 12:00, 16:00):
+    BIST'te mumlar 10:00-12:00, 12:00-16:00, 16:00-kapanış. Dönüş: Open/High/Low/Close/Volume sütunlu, mum başlangıç zamanı indeksli tablo."""
     h = h.dropna(subset=["Close"]).copy()
     if h.empty:
         return None
@@ -578,7 +578,7 @@ def saatlikten_4saatlige(h):
     if getattr(idx, "tz", None) is not None:
         idx = idx.tz_convert("Europe/Istanbul")
     saat = idx.hour
-    blok = np.where(saat < 14, 10, np.where(saat < 18, 14, 18))
+    blok = np.where(saat < 12, 8, np.where(saat < 16, 12, 16))
     h["bar"] = idx.tz_localize(None).normalize() + pd.to_timedelta(blok, unit="h")
     g = h.groupby("bar").agg(Open=("Open", "first"), High=("High", "max"), Low=("Low", "min"),
                               Close=("Close", "last"), Volume=("Volume", "sum"))
@@ -586,9 +586,9 @@ def saatlikten_4saatlige(h):
 
 
 def bes_dakikadan_4saatlige(m5):
-    """5 dakikalık mumlardan TradingView'daki gibi 4 saatlik mumlar: 09:40-13:40, 13:40-17:40, 17:40-kapanış.
-    (BIST'te TradingView 4 saatlik mumlar seans başına göre hizalanıyor görünüyor; ekran görüntülerindeki
-    çok küçük son mum bunu düşündürüyor.)"""
+    """5 dakikalık mumlardan TradingView'daki gibi 4 saatlik mumlar: 08:00-12:00 (seans 10:00'da açılır), 12:00-16:00,
+    16:00-kapanış. Kullanıcının TradingView'da gördüğü ilk mum (A 458,75 Y 459,25 D 448,5 K 449,75, 18 Kasım) bu ızgarayla
+    uyuşuyor; eski 09:40/13:40/17:40 ızgarası bu mumu tutturamıyordu."""
     m5 = m5.dropna(subset=["Close"]).copy()
     if m5.empty:
         return None
@@ -596,7 +596,7 @@ def bes_dakikadan_4saatlige(m5):
     if getattr(idx, "tz", None) is not None:
         idx = idx.tz_convert("Europe/Istanbul")
     dk = idx.hour * 60 + idx.minute
-    baslangic = np.where(dk < 13 * 60 + 40, 9 * 60 + 40, np.where(dk < 17 * 60 + 40, 13 * 60 + 40, 17 * 60 + 40))
+    baslangic = np.where(dk < 12 * 60, 8 * 60, np.where(dk < 16 * 60, 12 * 60, 16 * 60))
     m5["bar"] = idx.tz_localize(None).normalize() + pd.to_timedelta(baslangic, unit="m")
     return m5.groupby("bar").agg(Open=("Open", "first"), High=("High", "max"), Low=("Low", "min"),
                                   Close=("Close", "last"), Volume=("Volume", "sum"))
@@ -649,8 +649,8 @@ def _birlestir(eski, yeni):
 
 
 def _4saat_ham(sembol, ham=None):
-    """4 saatlik mumlar. Son ~2 ay 5 dakikalık veriden (TradingView'a uygun 09:40/13:40/17:40 mumları),
-    daha eskisi saatlik veriden (10:00/14:00 yaklaşık mumlar). Alınamazsa None."""
+    """4 saatlik mumlar. Son ~2 ay 5 dakikalık veriden (TradingView'a uygun 08:00/12:00/16:00 ızgarası),
+    daha eskisi saatlik veriden (aynı ızgara). Alınamazsa None."""
     saatlik, bes_dk = ham if ham is not None else ham_veriler(sembol)
     eski = saatlikten_4saatlige(saatlik) if saatlik is not None else None
     yeni = bes_dakikadan_4saatlige(bes_dk) if bes_dk is not None else None
@@ -658,10 +658,9 @@ def _4saat_ham(sembol, ham=None):
 
 
 def saatlikten_3mum(h):
-    """Saatlik mumlardan TradingView benzeri günde 3 mum (09:40, 13:40, 17:40) tahmini. Saatlik veri 13:40 ve
-    17:40'ı ayıramadığı için o kapanışlar ilgili saatlik mumun içinde 2/3 oranında ara değerle (açılış + 2/3*(kapanış-açılış))
-    tahmin edilir. Günün son mumunun kapanışı daha sonra resmi günlük kapanışla düzeltilir.
-    Amaç: Nadaraya-Watson gibi mum SAYISINA duyarlı göstergelerde eski dönemi de günde 3 mumla temsil etmek."""
+    """Saatlik mumlardan TradingView'daki gibi günde 3 mum (08:00-12:00, 12:00-16:00, 16:00-kapanış). Saatlik mumlar
+    10:00, 11:00 | 12:00-15:00 | 16:00-18:00 diye tam bölündüğü için ara değer tahmini gerekmez.
+    Günün son mumunun kapanışı daha sonra resmi günlük kapanışla düzeltilir."""
     h = h.dropna(subset=["Close"]).copy()
     if h.empty:
         return None
@@ -672,29 +671,12 @@ def saatlikten_3mum(h):
     h["saat"] = idx.hour
     satirlar = []
     for gun, g in h.groupby("gun"):
-        g = g.set_index("saat")
-        g = g[~g.index.duplicated(keep="last")]
-        def al(saatler):
-            return g[g.index.isin(saatler)]
-        a, b, c = al([10, 11, 12, 13]), al([14, 15, 16, 17]), al([17, 18])
-        if a.empty:
-            continue
-        def ara_deger(saat, onceki):
-            if saat in g.index:
-                return float(g.loc[saat, "Open"] + (2 / 3) * (g.loc[saat, "Close"] - g.loc[saat, "Open"]))
-            return onceki
-        kapanis_a = ara_deger(13, float(a["Close"].iloc[-1]))
-        satirlar.append((gun + pd.Timedelta(hours=9, minutes=40), float(a["Open"].iloc[0]), float(a["High"].max()),
-                         float(a["Low"].min()), kapanis_a, float(a["Volume"].sum())))
-        if b.empty:
-            continue
-        kapanis_b = ara_deger(17, float(b["Close"].iloc[-1]))
-        satirlar.append((gun + pd.Timedelta(hours=13, minutes=40), kapanis_a, float(b["High"].max()),
-                         float(b["Low"].min()), kapanis_b, float(b["Volume"].sum())))
-        if c.empty:
-            continue
-        satirlar.append((gun + pd.Timedelta(hours=17, minutes=40), kapanis_b, float(c["High"].max()),
-                         float(c["Low"].min()), float(c["Close"].iloc[-1]), float(c["Volume"].sum()) / 3))
+        for bas, saatler in ((8, (10, 11)), (12, (12, 13, 14, 15)), (16, (16, 17, 18))):
+            x = g[g["saat"].isin(saatler)]
+            if x.empty:
+                continue
+            satirlar.append((gun + pd.Timedelta(hours=bas), float(x["Open"].iloc[0]), float(x["High"].max()),
+                             float(x["Low"].min()), float(x["Close"].iloc[-1]), float(x["Volume"].sum())))
     if not satirlar:
         return None
     d = pd.DataFrame(satirlar, columns=["bar", "Open", "High", "Low", "Close", "Volume"]).set_index("bar")
@@ -1409,11 +1391,11 @@ def uyumsuzluk_yazdir(sembol):
 
 
 def mum_kapandi(zaman, simdi):
-    """BIST 4 saatlik mumları 09:40 / 13:40 / 17:40'ta başlar; kapanışları 13:40, 17:40, 18:10."""
+    """BIST 4 saatlik mumları 08:00 / 12:00 / 16:00 ızgarasındadır; kapanışları 12:00, 16:00, 18:10."""
     if zaman.date() < simdi.date():
         return True
     bas = zaman.hour * 60 + zaman.minute
-    kapanis = 13 * 60 + 40 if bas < 13 * 60 + 40 else (17 * 60 + 40 if bas < 17 * 60 + 40 else 18 * 60 + 10)
+    kapanis = 12 * 60 if bas < 12 * 60 else (16 * 60 if bas < 16 * 60 else 18 * 60 + 10)
     return simdi.hour * 60 + simdi.minute >= kapanis
 
 
@@ -2105,7 +2087,7 @@ def tara_calistir():
 # ---------- sinyal kaydı ve gün sonu raporu ----------
 SINYAL_DOSYASI = os.path.join("durum_destek", "sinyaller.json")
 SINYAL_SAKLAMA_GUN = 120   # kayıtlar bu kadar gün saklanır (toplu başarı özeti için)
-KURAL_SURUMU = "v2e-18Kas"   # kuralları değiştirdiğinde bunu da değiştir: rapor sinyalleri sürüme göre ayırır (eski kayıtlar 'eski' sayılır)
+KURAL_SURUMU = "v2f-18Kas"   # kuralları değiştirdiğinde bunu da değiştir: rapor sinyalleri sürüme göre ayırır (eski kayıtlar 'eski' sayılır)
 BOLGE_TEPKI = 1.0          # bölge girişi için 'tepki' eşiği: girişten en az bu kadar % yükselme
 BOLGE_STOP_PAY = 0.3       # bölge girişi için stop: destek bölgesinin altından bu kadar % aşağısı (fitil payı)
 RAPOR_MAX_SATIR = 40       # raporda hisse hisse listelenecek en fazla satır
