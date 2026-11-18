@@ -48,6 +48,7 @@ DUSEN_MIN_GUN = 30       # düşen çizginin çıktığı zirve en az bu kadar m
 EMA_UZUNLUK = 200        # üstel hareketli ortalama periyodu (günlük)
 TREND_SARTI = True       # True: NW/SMC/yatay/trend/hacim destekleri yalnız günlük trend yukarıysa mesaj üretir (EMA200 muaf)
 TREND_CIZGI_YAKIN = 8.0   # yükselen çizgi yolu: fiyat çizgiden en fazla bu kadar % yukarıdaysa çizgi 'işliyor' sayılır (çok uzaktaki çizgi trend kanıtı değil)
+TREND_MIN_EGIM = 0.10     # trend etiketi için yükselen çizginin eğimi: mum başına en az bu kadar % (daha yataysa trend değil, yatay seviyedir)
 TREND_EMA = 50           # trend ölçümü: fiyat bu günlük EMA'nın üstünde ve EMA yükseliyorsa trend yukarı (ya da kırılmamış yükselen trend çizgisi varsa)
 EMA_YAKLASMA = 1.5       # fiyat EMA'nın üstünde ve en fazla bu kadar % uzaktaysa "yaklaşıyor"
 EMA_DOKUNDU_MAX = 3.0    # bugün EMA'ya değmiş olsa bile fiyat şimdi EMA'nın bu kadar %'den fazla üstündeyse "dokundu" sayılmaz (çoktan uzaklaşmış)
@@ -363,7 +364,8 @@ def yukselen_trendler(df, fiyat=None):
             bulunanlar.append(dict(
                 deger=deger, baslangic=df.index[i].strftime("%Y-%m-%d"), uzunluk=son - i,
                 temas=len(temaslar), son_temas_gun=son - temaslar[-1],
-                mesafe=max(0.0, (fiyat / deger - 1) * 100)))
+                mesafe=max(0.0, (fiyat / deger - 1) * 100), altinda=bool(fiyat < deger),
+                egim_yuzde=float(egim / cizgi[0] * 100)))
     # bugünkü değeri birbirine %1,5'ten yakın olan çizgilerden en çok temaslıyı tut
     kalan = []
     for r in sorted(bulunanlar, key=lambda r: (r["temas"], r["uzunluk"]), reverse=True):
@@ -387,7 +389,9 @@ def trend_yukari(df, fiyat, cizgiler=None, dusen=False):
         ema_yol = bool(fiyat > ema50 and ema50 > float(e[-6]))
     if cizgiler is None:
         cizgiler = [] if dusen else yukselen_trendler(df, fiyat)
-    yakin = [r for r in cizgiler if r.get("mesafe", 0) <= TREND_CIZGI_YAKIN]
+    # trend kanıtı: fiyat çizginin ÜSTÜNDE (altında %1'e kadar tolerans 'kırılmadı' sayılsa da trend sayılmaz), çizgi yeterince eğimli
+    yakin = [r for r in cizgiler if r.get("mesafe", 0) <= TREND_CIZGI_YAKIN and not r.get("altinda")
+             and r.get("egim_yuzde", 0) >= TREND_MIN_EGIM]
     cizgi = yakin[0] if (yakin and not dusen) else None
     return dict(yukari=bool(ema_yol or cizgi), ema_yol=ema_yol, cizgi_yol=bool(cizgi), ema50=ema50,
                 cizgi=cizgi["deger"] if cizgi else None)
@@ -2024,7 +2028,7 @@ def tara_calistir():
 # ---------- sinyal kaydı ve gün sonu raporu ----------
 SINYAL_DOSYASI = os.path.join("durum_destek", "sinyaller.json")
 SINYAL_SAKLAMA_GUN = 120   # kayıtlar bu kadar gün saklanır (toplu başarı özeti için)
-KURAL_SURUMU = "v2-18Kas"   # kuralları değiştirdiğinde bunu da değiştir: rapor sinyalleri sürüme göre ayırır (eski kayıtlar 'eski' sayılır)
+KURAL_SURUMU = "v2b-18Kas"   # kuralları değiştirdiğinde bunu da değiştir: rapor sinyalleri sürüme göre ayırır (eski kayıtlar 'eski' sayılır)
 BOLGE_TEPKI = 1.0          # bölge girişi için 'tepki' eşiği: girişten en az bu kadar % yükselme
 BOLGE_STOP_PAY = 0.3       # bölge girişi için stop: destek bölgesinin altından bu kadar % aşağısı (fitil payı)
 RAPOR_MAX_SATIR = 40       # raporda hisse hisse listelenecek en fazla satır
