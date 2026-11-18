@@ -48,6 +48,9 @@ DUSEN_MIN_GUN = 30       # düşen çizginin çıktığı zirve en az bu kadar m
 EMA_UZUNLUK = 200        # üstel hareketli ortalama periyodu (günlük)
 TREND_SARTI = True       # True: NW/SMC/yatay/trend/hacim destekleri yalnız günlük trend yukarıysa mesaj üretir (EMA200 muaf)
 TREND_CIZGI_YAKIN = 8.0   # yükselen çizgi yolu: fiyat çizgiden en fazla bu kadar % yukarıdaysa çizgi 'işliyor' sayılır (çok uzaktaki çizgi trend kanıtı değil)
+TREND_MIKRO_EGIM = 0.30    # mikro trend (10-44 mumluk kısa çizgi): mum başına en az bu kadar % eğim
+TREND_MIKRO_EMA = 10       # mikro trend ayrıca fiyatın bu günlük EMA'nın üstünde ve EMA'nın yükselir olmasını ister (son günlerde düşüş varsa kısa vade yukarı sayılmaz)
+TREND_MIN_UZUNLUK = 45    # trend etiketi için yükselen çizginin en az bu kadar günlük mum süren olması (kısa sıçrama çizgisi büyük düşüş içinde trend sayılmaz)
 TREND_MIN_EGIM = 0.10     # trend etiketi için yükselen çizginin eğimi: mum başına en az bu kadar % (daha yataysa trend değil, yatay seviyedir)
 TREND_EMA = 50           # trend ölçümü: fiyat bu günlük EMA'nın üstünde ve EMA yükseliyorsa trend yukarı (ya da kırılmamış yükselen trend çizgisi varsa)
 EMA_YAKLASMA = 1.5       # fiyat EMA'nın üstünde ve en fazla bu kadar % uzaktaysa "yaklaşıyor"
@@ -391,10 +394,19 @@ def trend_yukari(df, fiyat, cizgiler=None, dusen=False):
         cizgiler = [] if dusen else yukselen_trendler(df, fiyat)
     # trend kanıtı: fiyat çizginin ÜSTÜNDE (altında %1'e kadar tolerans 'kırılmadı' sayılsa da trend sayılmaz), çizgi yeterince eğimli
     yakin = [r for r in cizgiler if r.get("mesafe", 0) <= TREND_CIZGI_YAKIN and not r.get("altinda")
-             and r.get("egim_yuzde", 0) >= TREND_MIN_EGIM]
+             and r.get("egim_yuzde", 0) >= TREND_MIN_EGIM and r.get("uzunluk", 0) >= TREND_MIN_UZUNLUK]
     cizgi = yakin[0] if (yakin and not dusen) else None
+    mikro = False
+    if cizgi is None and not dusen and df is not None and len(df) >= TREND_MIKRO_EMA + 10:
+        # kısa (mikro) trend: 10-44 mumluk, dik, kırılmamış çizgi + kısa vade momentum (fiyat EMA10 üstünde ve EMA10 yükseliyor)
+        kisa = [r for r in cizgiler if r.get("mesafe", 0) <= TREND_CIZGI_YAKIN and not r.get("altinda")
+                and r.get("egim_yuzde", 0) >= TREND_MIKRO_EGIM and r.get("uzunluk", 0) < TREND_MIN_UZUNLUK]
+        if kisa:
+            e10 = ema_hesapla(bugunlu_kapanis(df, fiyat), TREND_MIKRO_EMA)
+            if fiyat > float(e10[-1]) and float(e10[-1]) > float(e10[-4]):
+                cizgi, mikro = kisa[0], True
     return dict(yukari=bool(ema_yol or cizgi), ema_yol=ema_yol, cizgi_yol=bool(cizgi), ema50=ema50,
-                cizgi=cizgi["deger"] if cizgi else None)
+                cizgi=cizgi["deger"] if cizgi else None, mikro=mikro, cizgi_gun=cizgi["uzunluk"] if cizgi else None)
 
 
 def dusen_trend(df, fiyat=None):
@@ -1752,7 +1764,8 @@ def mesaj_olustur(a, guncelleme=None):
         if ty["ema_yol"]:
             nedenler.append(f"fiyat EMA{TREND_EMA} ({_t(ty['ema50'])}) üstünde ve yükseliyor")
         if ty["cizgi_yol"]:
-            nedenler.append(f"yükselen trend çizgisi {_t(ty['cizgi'])} kırılmadı")
+            nedenler.append(f"yükselen trend çizgisi {_t(ty['cizgi'])} kırılmadı"
+                            + (f" (mikro trend, {ty['cizgi_gun']} günlük; fiyat EMA{TREND_MIKRO_EMA} üstünde)" if ty.get("mikro") else ""))
         satirlar.append("📈 " + (("Genel yön: " + dt_metin) if dt_metin else "") + "trend yukarı: " + "; ".join(nedenler))
     elif ty:
         satirlar.append("⚠️ trend yukarı değil (yalnız EMA200 muaf geçti)")
@@ -2028,7 +2041,7 @@ def tara_calistir():
 # ---------- sinyal kaydı ve gün sonu raporu ----------
 SINYAL_DOSYASI = os.path.join("durum_destek", "sinyaller.json")
 SINYAL_SAKLAMA_GUN = 120   # kayıtlar bu kadar gün saklanır (toplu başarı özeti için)
-KURAL_SURUMU = "v2b-18Kas"   # kuralları değiştirdiğinde bunu da değiştir: rapor sinyalleri sürüme göre ayırır (eski kayıtlar 'eski' sayılır)
+KURAL_SURUMU = "v2d-18Kas"   # kuralları değiştirdiğinde bunu da değiştir: rapor sinyalleri sürüme göre ayırır (eski kayıtlar 'eski' sayılır)
 BOLGE_TEPKI = 1.0          # bölge girişi için 'tepki' eşiği: girişten en az bu kadar % yükselme
 BOLGE_STOP_PAY = 0.3       # bölge girişi için stop: destek bölgesinin altından bu kadar % aşağısı (fitil payı)
 RAPOR_MAX_SATIR = 40       # raporda hisse hisse listelenecek en fazla satır
