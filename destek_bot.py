@@ -1652,6 +1652,91 @@ def kademe_hesapla(mesafe, dokundu):
     return 0
 
 
+def _tamam_gunler(df, bugun):
+    """Bugünden önceki tamamlanmış günlük mumlar."""
+    idx = pd.DatetimeIndex(df.index)
+    if idx.tz is not None:
+        idx = idx.tz_localize(None)
+    return df[idx.normalize() < pd.Timestamp(bugun)], idx
+
+
+def destek_ozellikleri(df, df4, fiyat, ana, simdi):
+    """Yaklaşma biçimi ve bölge özellikleri (kayıt + mesaj bilgisi; filtre değil).
+    geri_cekilme: son 20 günün zirvesinden %; kirmizi_seri: art arda düşüşle kapanan gün; dusus_3g: fiyat / 3 gün önceki kapanış;
+    gap: bugünkü açılış / dünkü kapanış; hacim_yaklasma: son 3 kapanmış 4s mumun hacmi / öncesindeki 30 mumun ortalaması;
+    bolge_genislik: bölge üst/alt %; temas_n: son 120 günde bölgenin kaç ayrı kez test edildiği; son_tepki: son testten sonra 5 günde en yüksek %."""
+    oz = {}
+    try:
+        gecmis, idx_tum = _tamam_gunler(df, simdi.date())
+        if len(gecmis) >= 25:
+            c = gecmis["Close"].to_numpy(dtype=float)
+            h = gecmis["High"].to_numpy(dtype=float)
+            oz["geri_cekilme"] = round((fiyat / float(h[-20:].max()) - 1) * 100, 1)
+            seri = 0
+            for i in range(len(c) - 1, 0, -1):
+                if c[i] < c[i - 1]:
+                    seri += 1
+                else:
+                    break
+            oz["kirmizi_seri"] = seri
+            oz["dusus_3g"] = round((fiyat / float(c[-3]) - 1) * 100, 1)
+            bugun_satir = df[idx_tum.normalize() == pd.Timestamp(simdi.date())]
+            if len(bugun_satir):
+                oz["gap"] = round((float(bugun_satir["Open"].iloc[0]) / float(c[-1]) - 1) * 100, 1)
+            if ana:
+                alt, ust = float(ana["alt"]), float(ana["ust"])
+                oz["bolge_genislik"] = round((ust / alt - 1) * 100, 1)
+                g = gecmis.iloc[-120:-2]
+                dus, yuk = g["Low"].to_numpy(dtype=float), g["High"].to_numpy(dtype=float)
+                temas_gunleri = [i for i in range(len(g)) if dus[i] <= ust * 1.002 and yuk[i] >= alt]
+                olaylar = []
+                for i in temas_gunleri:
+                    if olaylar and i - olaylar[-1][-1] <= 2:
+                        olaylar[-1].append(i)
+                    else:
+                        olaylar.append([i])
+                oz["temas_n"] = len(olaylar)
+                if olaylar:
+                    son_i = olaylar[-1][-1]
+                    sonra = yuk[son_i + 1:son_i + 6]
+                    if len(sonra):
+                        oz["son_tepki"] = round((float(sonra.max()) / ust - 1) * 100, 1)
+        if df4 is not None and len(df4) >= 40:
+            v = df4["Volume"].to_numpy(dtype=float)
+            if not mum_kapandi(df4.index[-1], simdi):
+                v = v[:-1]
+            if len(v) >= 33 and v[-33:-3].mean() > 0:
+                oz["hacim_yaklasma"] = round(float(v[-3:].mean() / v[-33:-3].mean()), 2)
+    except Exception as e:
+        print(f"  özellik hesabı hatası ({type(e).__name__}: {str(e)[:60]})")
+    return oz
+
+
+def piyasa_baglami(fiyatlar, gunluk, simdi, tur):
+    """BAGLAM: genişlik (her tur, eldeki anlık fiyatlardan) ve BIST100 gün içi değişimi (3 turda bir)."""
+    try:
+        artan = toplam = 0
+        for sem, (f, _) in fiyatlar.items():
+            d = gunluk.get(sem)
+            if d is None:
+                continue
+            gecmis, _ = _tamam_gunler(d, simdi.date())
+            if len(gecmis):
+                toplam += 1
+                artan += 1 if f > float(gecmis["Close"].iloc[-1]) else 0
+        if toplam >= 50:
+            BAGLAM["genislik"] = artan / toplam
+    except Exception as e:
+        print(f"  genişlik hesabı hatası ({type(e).__name__})")
+    if tur % 3 == 1:
+        try:
+            e = endeks_5dk(simdi.date())
+            if e and e.get("onceki"):
+                BAGLAM["endeks"] = (float(e["gun"]["Close"].iloc[-1]) / e["onceki"] - 1) * 100
+        except Exception as ex:
+            print(f"  BIST100 değişimi alınamadı ({type(ex).__name__})")
+
+
 def analiz(sembol, df, fiyat=None, bugun_alt=None):
     """2. aşama: tüm araçlarla ayrıntılı analiz. Dönüş: mesaj için gereken her şey (sözlük)."""
     if fiyat is None or bugun_alt is None:
@@ -1745,7 +1830,8 @@ def analiz(sembol, df, fiyat=None, bugun_alt=None):
                 tetik=bool(yakin_parca) or ema_tetik or nw_tetik, puan=puan,
                 nw_tetik=nw_tetik, ema_tetik=ema_tetik, smc_tetik=smc_tetik, teyit=teyit,
                 kesisim=kes, destek_alti=destek_alti(yakin_parca),
-                gosterilen=gosterilen, ana=ana, en_yakin_mesafe=en_yakin, bagimsiz=bagimsiz, trend=ty, kisa_kirik=kirik, dokundu=dokundu, kademe=kademe, _bugun_alt=bugun_alt)
+                gosterilen=gosterilen, ana=ana, en_yakin_mesafe=en_yakin, bagimsiz=bagimsiz, trend=ty, kisa_kirik=kirik, dokundu=dokundu, kademe=kademe, _bugun_alt=bugun_alt,
+                oz=destek_ozellikleri(df, df4, fiyat, ana, _simdi()))
 
 
 KISA = {"Yatay destek": "yatay", "Yükselen trend": "trend", "EMA200": "EMA200", "NW alt bant": "NW alt bant",
@@ -1765,6 +1851,47 @@ def _kisa_parca(p, a):
         ek = ", " + {"sinyal": "▲ sinyali", "değdi": "değdi", "yaklaşıyor": "yaklaşıyor"}[a["nb"]["durum"]]
     konum = "içinde" if m == 0 else f"%{_t(m, 1)} üstünde"
     return f"{IKON.get(ad, '•')} {KISA.get(ad, ad)} {yer} ({konum}{ek})"
+
+
+def baglam_satirlari(a):
+    """Karar yardımcısı bilgi satırları (eleme yapmaz). ⚠️ eşikleri henüz doğrulanmadı."""
+    oz = a.get("oz") or {}
+    out = []
+    parca = []
+    if BAGLAM.get("endeks") is not None:
+        parca.append(f"BIST100 %{_t(BAGLAM['endeks'], 1)}")
+    if BAGLAM.get("genislik") is not None:
+        g = BAGLAM["genislik"]
+        parca.append(f"{'✅' if g >= GENISLIK_ESIK else '⚠️'} yükselen hisse oranı %{int(round(g * 100))}")
+    if parca:
+        out.append("🌐 " + " · ".join(parca))
+    parca = []
+    if oz.get("geri_cekilme") is not None:
+        parca.append(f"20 günlük zirveden %{_t(oz['geri_cekilme'], 1)}")
+    if oz.get("kirmizi_seri"):
+        parca.append(f"{'⚠️ ' if oz['kirmizi_seri'] >= KIRMIZI_SERI else ''}{oz['kirmizi_seri']} gün üst üste düşüş")
+    if oz.get("dusus_3g") is not None:
+        parca.append(f"{'⚠️ ' if oz['dusus_3g'] <= HIZLI_DUSUS else ''}3 günde %{_t(oz['dusus_3g'], 1)}")
+    if oz.get("gap") is not None and abs(oz["gap"]) >= 1.0:
+        parca.append(f"bugün {'aşağı' if oz['gap'] < 0 else 'yukarı'} gap %{_t(abs(oz['gap']), 1)}")
+    if oz.get("hacim_yaklasma") is not None:
+        parca.append(f"düşerken hacim {_t(oz['hacim_yaklasma'], 1)}x ({'artıyor' if oz['hacim_yaklasma'] >= 1.2 else 'sönüyor' if oz['hacim_yaklasma'] < 0.8 else 'normal'})")
+    if parca:
+        out.append("📉 Yaklaşma: " + " · ".join(parca))
+    parca = []
+    if oz.get("bolge_genislik") is not None:
+        parca.append(f"{'⚠️ ' if oz['bolge_genislik'] >= GENIS_BOLGE else ''}bölge genişliği %{_t(oz['bolge_genislik'], 1)}")
+    if oz.get("temas_n") is not None:
+        if oz["temas_n"] == 0:
+            parca.append("son 120 günde ilk test")
+        else:
+            t = f"son 120 günde {oz['temas_n']} kez test edildi"
+            if oz.get("son_tepki") is not None:
+                t += f" (sonuncusundan sonra 5 günde %{_t(oz['son_tepki'], 1)} tepki)"
+            parca.append(t)
+    if parca:
+        out.append("🧱 Bölge geçmişi: " + " · ".join(parca))
+    return out
 
 
 def mesaj_olustur(a, guncelleme=None):
@@ -1817,6 +1944,7 @@ def mesaj_olustur(a, guncelleme=None):
         satirlar.append("⚠️ trend yukarı değil (yalnız EMA200 muaf geçti)")
     else:
         satirlar.append("Genel yön: aşağı değil")
+    satirlar += baglam_satirlari(a)
     return "\n".join(satirlar)
 
 
@@ -1883,6 +2011,52 @@ def guncelleme_degisimleri(k, a):
 
 def _bugun_alt_ham(a):
     return a.get("_bugun_alt", float("inf"))
+
+
+TAKIP_MUMLAR = ((8 * 60, 12 * 60, 12 * 60 + 3), (12 * 60, 16 * 60, 16 * 60 + 3), (16 * 60, 18 * 60 + 10, 18 * 60 + 16))   # (mum başlangıcı, kapanışı, kontrol zamanı) dakika
+
+
+def takip_kontrol(kayit, gunluk, sinyaller, simdi):
+    """Bölgeye girilmiş desteklerde ilk anlamlı 4 saatlik mum kapanışına bakar: bölge üstünde kapandıysa 🔄 tuttu, altında kapandıysa
+    ⛔ bozuldu mesajı atar (bir kez). Bölge içinde kapanırsa sonraki mumu bekler. Kapanış mesajı yatırım tavsiyesi değildir."""
+    dk = simdi.hour * 60 + simdi.minute
+    for sem, k in list(kayit.items()):
+        if k.get("eski") or k.get("takip") or not k.get("girdi") or k.get("destek_ust") is None or k.get("destek_alt") is None:
+            continue
+        t_girdi = pd.Timestamp.fromtimestamp(k["girdi"], tz="Europe/Istanbul")
+        t_dk = t_girdi.hour * 60 + t_girdi.minute
+        for bas, son, kontrol in TAKIP_MUMLAR:
+            if son <= t_dk or son <= k.get("takip_bakilan", 0):
+                continue                                   # girişten önce biten ya da zaten bakılmış mum
+            if dk < kontrol:
+                break
+            try:
+                df4 = veri_cek_4saat(sem, gunluk.get(sem))
+                zaman = pd.Timestamp(simdi.date()) + pd.Timedelta(minutes=bas)
+                if df4 is None or zaman not in df4.index:
+                    break                                  # veri gelmedi: sonraki turda yeniden denenir
+                kap = float(df4.loc[zaman, "Close"])
+            except Exception as e:
+                print(f"  {sem}: takip verisi hatası ({type(e).__name__})")
+                break
+            k["takip_bakilan"] = son
+            alt, ust = float(k["destek_alt"]), float(k["destek_ust"])
+            if kap >= ust:
+                sonuc, metin = "tuttu", (f"🔄 DESTEK TUTTU – {sem}\n4 saatlik mum ({max(bas, 600) // 60:02d}:{max(bas, 600) % 60:02d}–{son // 60:02d}:{son % 60:02d}) {_t(kap)} seviyesinde "
+                                         f"kapandı: bölgenin ({_t(alt)}-{_t(ust)}) üstünde.\n⛔ {_t(alt)} altı hâlâ bozulma seviyesi. Bu bir tutma teyididir, yükseliş garantisi değildir.")
+            elif kap < alt:
+                sonuc, metin = "bozuldu", (f"⛔ DESTEK BOZULDU – {sem}\n4 saatlik mum ({max(bas, 600) // 60:02d}:{max(bas, 600) % 60:02d}–{son // 60:02d}:{son % 60:02d}) {_t(kap)} seviyesinde "
+                                           f"kapandı: bölgenin ({_t(alt)}-{_t(ust)}) altında.")
+            else:
+                continue                                   # bölge içinde kapandı: karar vermez, sonraki mum
+            if telegram_gonder(metin):
+                k["takip"] = sonuc
+                for rec in reversed(sinyaller["kayitlar"]):
+                    if rec.get("sembol") == sem and rec.get("gun") == f"{simdi:%Y-%m-%d}" and rec.get("n") == 1:
+                        rec["takip"] = dict(sonuc=sonuc, saat=f"{simdi:%H:%M}", kapanis=round(kap, 2))
+                        break
+                sinyal_yaz(sinyaller)
+            break
 
 
 def tara_calistir():
@@ -1964,8 +2138,13 @@ def tara_calistir():
                 print(f"[{simdi:%H:%M}] hazırlık: 4 saatlik seviyeler {len(dort)}/{len(kuyruk)}")
                 time.sleep(2)
                 continue
+            if not zorla and ACILIS_BEKLE_DK > 0 and simdi.hour * 60 + simdi.minute < 10 * 60 + ACILIS_BEKLE_DK:
+                print(f"[{simdi:%H:%M}] açılış gürültüsü beklemesi (10:{ACILIS_BEKLE_DK:02d}'a kadar mesaj yok)")
+                time.sleep(60)
+                continue
             # 2) güncel fiyatlar ve hızlı eleme
             fiyatlar = anlik_fiyatlar(kuyruk)
+            piyasa_baglami(fiyatlar, gunluk, simdi, tur)
             simdi_t = time.time()
             adaylar = []
             for s in kuyruk:
@@ -1973,6 +2152,8 @@ def tara_calistir():
                     continue
                 f, alt_bugun = fiyatlar[s]
                 k = kayit.get(s)
+                if k is not None and k.get("destek_ust") is not None and not k.get("girdi") and f <= k["destek_ust"] * 1.001:
+                    k["girdi"] = time.time()                     # fiyat destek bölgesine girdi (🔄/⛔ takip mesajı için)
                 if k is None:                                    # henüz mesaj atılmamış hisse: hızlı eleme
                     if simdi_t - bakildi.get(s, 0) < TEKRAR_BAKMA_SN or s in donuk_elenen:
                         continue
@@ -2057,6 +2238,12 @@ def tara_calistir():
                     time.sleep(0.6)
                 else:
                     bakildi.pop(a["sembol"], None)           # gönderilemedi: sonraki turda yeniden denensin
+            if TAKIP_GOSTER:
+                try:
+                    takip_kontrol(kayit, gunluk, sinyaller, simdi)
+                    durum_yaz(durum)
+                except Exception as e:
+                    print(f"takip kontrolü hatası ({type(e).__name__}: {str(e)[:80]})")
             if tur % 5 == 0:
                 dort_yaz(dort)
             print(f"[{simdi:%H:%M}] tur {tur}: fiyat {len(fiyatlar)}/{len(kuyruk)}, aday {n_aday}, tetik {len(sonuclar)}, "
@@ -2087,7 +2274,14 @@ def tara_calistir():
 # ---------- sinyal kaydı ve gün sonu raporu ----------
 SINYAL_DOSYASI = os.path.join("durum_destek", "sinyaller.json")
 SINYAL_SAKLAMA_GUN = 120   # kayıtlar bu kadar gün saklanır (toplu başarı özeti için)
-KURAL_SURUMU = "v2f-18Kas"   # kuralları değiştirdiğinde bunu da değiştir: rapor sinyalleri sürüme göre ayırır (eski kayıtlar 'eski' sayılır)
+ACILIS_BEKLE_DK = 30        # seans 10:00'da açılır; bu kadar dakika geçmeden yeni mesaj atılmaz (açılış gürültüsü). 0 = kapalı
+TAKIP_GOSTER = True         # 🔄 destek tuttu / ⛔ destek bozuldu takip mesajı (bölgeye girildikten sonra ilk anlamlı 4 saatlik mum kapanışında)
+GENISLIK_ESIK = 0.5         # mesajda ✅/⚠️ için: taranan hisselerin günlük artıda olanlarının oranı
+HIZLI_DUSUS = -5.0          # son 3 günde bu kadar % ya da daha fazla düşüş "hızlı düşüş" sayılır (⚠️, rapor grubu)
+KIRMIZI_SERI = 3            # art arda bu kadar kırmızı gün (⚠️, rapor grubu)
+GENIS_BOLGE = 3.0           # bölge genişliği % olarak bundan büyükse ⚠️ (rapor grubu)
+BAGLAM = {}                 # endeks: BIST100 gün içi %, genislik: artıda hisse oranı (0-1); tara_calistir() günceller
+KURAL_SURUMU = "v3-18Kas"   # kuralları değiştirdiğinde bunu da değiştir: rapor sinyalleri sürüme göre ayırır (eski kayıtlar 'eski' sayılır)
 BOLGE_TEPKI = 1.0          # bölge girişi için 'tepki' eşiği: girişten en az bu kadar % yükselme
 BOLGE_STOP_PAY = 0.3       # bölge girişi için stop: destek bölgesinin altından bu kadar % aşağısı (fitil payı)
 RAPOR_MAX_SATIR = 40       # raporda hisse hisse listelenecek en fazla satır
@@ -2122,7 +2316,8 @@ def sinyal_ekle(sd, a, n, zaman):
         gun=f"{t:%Y-%m-%d}", saat=f"{t:%H:%M}", zaman=zaman, sembol=a["sembol"], n=n, fiyat=a["fiyat"], puan=a["puan"], surum=KURAL_SURUMU,
         destek_alt=ana["alt"] if ana else None, destek_ust=ana["ust"] if ana else None,
         araclar=list(ana["araclar"]) if ana else [], teyit=list(a["teyit"]["anahtar"]) if a.get("teyit") else [],
-        bagimsiz=list(a.get("bagimsiz", [])), sonuc=None))
+        bagimsiz=list(a.get("bagimsiz", [])), sonuc=None,
+        oz=dict(a.get("oz") or {}), bag={x: round(v, 2) for x, v in BAGLAM.items()}))
 
 
 def bes_dk_gun(semboller, gun, parca=40):
@@ -2325,6 +2520,30 @@ def bolge_satirlari(olcumlu):
         x = _bolge_grup(ad, [k for k in vals if f(k)])
         if x:
             sat.append(x)
+    oz_ = lambda k, a: (k.get("oz") or {}).get(a)
+    bag_ = lambda k, a: (k.get("bag") or {}).get(a)
+    sat.append("Yaklaşma ve bölge özelliğine göre:")
+    for ad, f in ((f"hızlı düşüş (3 günde ≤ %{HIZLI_DUSUS:g})", lambda k: oz_(k, "dusus_3g") is not None and oz_(k, "dusus_3g") <= HIZLI_DUSUS),
+                  ("yavaş/yatay yaklaşma", lambda k: oz_(k, "dusus_3g") is not None and oz_(k, "dusus_3g") > HIZLI_DUSUS),
+                  (f"{KIRMIZI_SERI}+ gün üst üste düşüş", lambda k: (oz_(k, "kirmizi_seri") or 0) >= KIRMIZI_SERI),
+                  ("kısa düşüş serisi", lambda k: oz_(k, "kirmizi_seri") is not None and oz_(k, "kirmizi_seri") < KIRMIZI_SERI),
+                  ("bugün aşağı gap ≥ %1", lambda k: oz_(k, "gap") is not None and oz_(k, "gap") <= -1.0),
+                  ("gap yok", lambda k: oz_(k, "gap") is not None and oz_(k, "gap") > -1.0),
+                  ("inerken hacim artıyor (≥1,2x)", lambda k: oz_(k, "hacim_yaklasma") is not None and oz_(k, "hacim_yaklasma") >= 1.2),
+                  ("inerken hacim sönüyor (<1,2x)", lambda k: oz_(k, "hacim_yaklasma") is not None and oz_(k, "hacim_yaklasma") < 1.2),
+                  (f"geniş bölge (≥ %{GENIS_BOLGE:g})", lambda k: oz_(k, "bolge_genislik") is not None and oz_(k, "bolge_genislik") >= GENIS_BOLGE),
+                  ("dar bölge", lambda k: oz_(k, "bolge_genislik") is not None and oz_(k, "bolge_genislik") < GENIS_BOLGE),
+                  ("bölgede ilk test", lambda k: oz_(k, "temas_n") == 0),
+                  ("bölge daha önce test edilmiş", lambda k: (oz_(k, "temas_n") or 0) >= 1),
+                  (f"piyasa genişliği ≥ %{int(GENISLIK_ESIK * 100)}", lambda k: bag_(k, "genislik") is not None and bag_(k, "genislik") >= GENISLIK_ESIK),
+                  (f"piyasa genişliği < %{int(GENISLIK_ESIK * 100)}", lambda k: bag_(k, "genislik") is not None and bag_(k, "genislik") < GENISLIK_ESIK)):
+        x = _bolge_grup(ad, [k for k in vals if f(k)])
+        if x:
+            sat.append(x)
+    tk = [k for k in vals if k.get("takip")]
+    if tk:
+        sat.append(f"🔄 Takip mesajı: tuttu {sum(1 for k in tk if k['takip']['sonuc'] == 'tuttu')} · bozuldu {sum(1 for k in tk if k['takip']['sonuc'] == 'bozuldu')} · "
+                   f"bölgede kalıp karar vermeyen {sum(1 for k in vals if k['sonuc'].get('bolge') and k['sonuc']['bolge']['doldu'] and not k.get('takip'))}")
     sat.append("Destek türüne göre:")
     for ad, f in ARAC_GRUPLARI:
         x = _bolge_grup(ad, [k for k in vals if f(k)])
