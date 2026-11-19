@@ -1681,8 +1681,17 @@ def destek_ozellikleri(df, df4, fiyat, ana, simdi):
             oz["kirmizi_seri"] = seri
             oz["dusus_3g"] = round((fiyat / float(c[-3]) - 1) * 100, 1)
             bugun_satir = df[idx_tum.normalize() == pd.Timestamp(simdi.date())]
-            if len(bugun_satir):
-                oz["gap"] = round((float(bugun_satir["Open"].iloc[0]) / float(c[-1]) - 1) * 100, 1)
+            acilis = float(bugun_satir["Open"].iloc[0]) if len(bugun_satir) else None
+            if acilis is None and df4 is not None and len(df4):
+                # günlük veride bugünün satırı çoğu zaman yok: bugünün ilk 4 saatlik mumunun açılışı (seans açılışı) kullanılır
+                i4 = pd.DatetimeIndex(df4.index)
+                if i4.tz is not None:
+                    i4 = i4.tz_localize(None)
+                b4 = df4[i4.normalize() == pd.Timestamp(simdi.date())]
+                if len(b4):
+                    acilis = float(b4["Open"].iloc[0])
+            if acilis is not None:
+                oz["gap"] = round((acilis / float(c[-1]) - 1) * 100, 1)
             if ana:
                 alt, ust = float(ana["alt"]), float(ana["ust"])
                 oz["bolge_genislik"] = round((ust / alt - 1) * 100, 1)
@@ -1695,9 +1704,14 @@ def destek_ozellikleri(df, df4, fiyat, ana, simdi):
                         olaylar[-1].append(i)
                     else:
                         olaylar.append([i])
-                oz["temas_n"] = len(olaylar)
-                if olaylar:
-                    son_i = olaylar[-1][-1]
+                oz["temas_n"] = len(olaylar)                  # eski tanım (gevşek): rapor artık test_n kullanır
+                kg = g["Close"].to_numpy(dtype=float)
+                # bağımsız test: bölgeye gelmeden önceki gün kapanış bölgenin en az %1 üstündeydi (yani yukarıdan gelip denedi);
+                # bölgenin oluştuğu/içinde dolaşılan günler sayılmaz
+                bagimsiz = [o for o in olaylar if o[0] >= 1 and kg[o[0] - 1] > ust * 1.01]
+                oz["test_n"] = len(bagimsiz)
+                if bagimsiz:
+                    son_i = bagimsiz[-1][-1]
                     sonra = yuk[son_i + 1:son_i + 6]
                     if len(sonra):
                         oz["son_tepki"] = round((float(sonra.max()) / ust - 1) * 100, 1)
@@ -1881,11 +1895,11 @@ def baglam_satirlari(a):
     parca = []
     if oz.get("bolge_genislik") is not None:
         parca.append(f"{'⚠️ ' if oz['bolge_genislik'] >= GENIS_BOLGE else ''}bölge genişliği %{_t(oz['bolge_genislik'], 1)}")
-    if oz.get("temas_n") is not None:
-        if oz["temas_n"] == 0:
+    if oz.get("test_n") is not None:
+        if oz["test_n"] == 0:
             parca.append("son 120 günde ilk test")
         else:
-            t = f"son 120 günde {oz['temas_n']} kez test edildi"
+            t = f"son 120 günde {oz['test_n']} kez test edildi"
             if oz.get("son_tepki") is not None:
                 t += f" (sonuncusundan sonra 5 günde %{_t(oz['son_tepki'], 1)} tepki)"
             parca.append(t)
@@ -2533,8 +2547,8 @@ def bolge_satirlari(olcumlu):
                   ("inerken hacim sönüyor (<1,2x)", lambda k: oz_(k, "hacim_yaklasma") is not None and oz_(k, "hacim_yaklasma") < 1.2),
                   (f"geniş bölge (≥ %{GENIS_BOLGE:g})", lambda k: oz_(k, "bolge_genislik") is not None and oz_(k, "bolge_genislik") >= GENIS_BOLGE),
                   ("dar bölge", lambda k: oz_(k, "bolge_genislik") is not None and oz_(k, "bolge_genislik") < GENIS_BOLGE),
-                  ("bölgede ilk test", lambda k: oz_(k, "temas_n") == 0),
-                  ("bölge daha önce test edilmiş", lambda k: (oz_(k, "temas_n") or 0) >= 1),
+                  ("bölgede ilk test", lambda k: oz_(k, "test_n") == 0),
+                  ("bölge daha önce test edilmiş", lambda k: (oz_(k, "test_n") or 0) >= 1),
                   (f"piyasa genişliği ≥ %{int(GENISLIK_ESIK * 100)}", lambda k: bag_(k, "genislik") is not None and bag_(k, "genislik") >= GENISLIK_ESIK),
                   (f"piyasa genişliği < %{int(GENISLIK_ESIK * 100)}", lambda k: bag_(k, "genislik") is not None and bag_(k, "genislik") < GENISLIK_ESIK)):
         x = _bolge_grup(ad, [k for k in vals if f(k)])
@@ -2549,6 +2563,38 @@ def bolge_satirlari(olcumlu):
         x = _bolge_grup(ad, [k for k in vals if f(k)])
         if x:
             sat.append(x)
+    return sat
+
+
+def takip_getiri_satirlari(olcumlu):
+    """Takip mesajına göre ölçüm (stop/hedef kullanmaz): 🔄 tuttu / ⛔ bozuldu kararı anındaki 4 saatlik kapanıştan gün sonuna getiri.
+    'Tutma oranı' = tuttu / (tuttu + bozuldu). Yükselen trend gibi dar bölgeler için bölge-stop ölçüsünden daha adil bir ikinci ölçüdür."""
+    tk = [k for k in olcumlu if k.get("takip") and k["sonuc"].get("kapanis") is not None and k["takip"].get("kapanis")]
+    if not tk:
+        return []
+    def getiri(k):
+        return (float(k["sonuc"]["kapanis"]) / float(k["takip"]["kapanis"]) - 1) * 100
+    def satir(ad, liste):
+        t = [k for k in liste if k["takip"]["sonuc"] == "tuttu"]
+        b = [k for k in liste if k["takip"]["sonuc"] == "bozuldu"]
+        if not t and not b:
+            return None
+        oran = f"%{len(t) * 100 // (len(t) + len(b))}"
+        ek = []
+        if t:
+            ek.append(f"tuttu sonrası ort {_yz(sum(getiri(k) for k in t) / len(t))}% (artıda {sum(1 for k in t if getiri(k) > 0)}/{len(t)})")
+        if b:
+            ek.append(f"bozuldu sonrası ort {_yz(sum(getiri(k) for k in b) / len(b))}%")
+        return f"  {ad}: tuttu {len(t)} · bozuldu {len(b)} · tutma oranı {oran} · " + " · ".join(ek)
+    sat = ["", "🔄 TAKİP MESAJINA GÖRE (karar anındaki 4s kapanıştan gün sonuna; bölge-stop ölçüsünden bağımsız)"]
+    x = satir("hepsi", tk)
+    if x:
+        sat.append(x)
+    for ad, f in ARAC_GRUPLARI:
+        x = satir(ad, [k for k in tk if f(k)])
+        if x:
+            sat.append(x)
+    sat.append("  (örnek az olabilir; 'tuttu' kararından sonra gün sonuna kalan süre kısa kalabilir, özellikle 16:00 kararlarında)")
     return sat
 
 
@@ -2613,6 +2659,7 @@ def rapor_metni(olcumlu, gun_etiket, hisse_listesi_yaz=True, eksik=0, endeks=Non
         if x:
             sat.append(x)
     sat += bolge_satirlari(olcumlu)
+    sat += takip_getiri_satirlari(olcumlu)
     if hisse_listesi_yaz:
         sat.append("")
         sat.append("Hisse hisse (puana göre):")
