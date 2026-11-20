@@ -1710,6 +1710,7 @@ def destek_ozellikleri(df, df4, fiyat, ana, simdi):
                 # bölgenin oluştuğu/içinde dolaşılan günler sayılmaz
                 bagimsiz = [o for o in olaylar if o[0] >= 1 and kg[o[0] - 1] > ust * 1.01]
                 oz["test_n"] = len(bagimsiz)
+                oz["alt_kapanis"] = int((kg < alt).sum())      # son ~120 günde kapanışı bölgenin altında olan gün sayısı (bölge kırılmış mı?)
                 if bagimsiz:
                     son_i = bagimsiz[-1][-1]
                     sonra = yuk[son_i + 1:son_i + 6]
@@ -1901,8 +1902,13 @@ def baglam_satirlari(a):
         else:
             t = f"son 120 günde {oz['test_n']} kez test edildi"
             if oz.get("son_tepki") is not None:
-                t += f" (sonuncusundan sonra 5 günde %{_t(oz['son_tepki'], 1)} tepki)"
+                if oz["son_tepki"] < 0:
+                    t += f" (⚠️ sonuncusunda 5 günde bölgenin üstüne çıkamadı, en yüksek %{_t(oz['son_tepki'], 1)})"
+                else:
+                    t += f" (sonuncusundan sonra 5 günde bölgenin %{_t(oz['son_tepki'], 1)} üstüne çıktı)"
             parca.append(t)
+    if oz.get("alt_kapanis"):
+        parca.append(f"⚠️ son 120 günde {oz['alt_kapanis']} gün bölgenin altında kapandı")
     if parca:
         out.append("🧱 Bölge geçmişi: " + " · ".join(parca))
     return out
@@ -2297,6 +2303,8 @@ GENIS_BOLGE = 3.0           # bölge genişliği % olarak bundan büyükse ⚠�
 BAGLAM = {}                 # endeks: BIST100 gün içi %, genislik: artıda hisse oranı (0-1); tara_calistir() günceller
 KURAL_SURUMU = "v3-18Kas"   # kuralları değiştirdiğinde bunu da değiştir: rapor sinyalleri sürüme göre ayırır (eski kayıtlar 'eski' sayılır)
 BOLGE_TEPKI = 1.0          # bölge girişi için 'tepki' eşiği: girişten en az bu kadar % yükselme
+SABIT_HEDEF = 1.0          # adil ölçü: bölge genişliğinden bağımsız, girişe göre +%1 hedef / -%1 stop (dar bölge ve geniş bölge aynı ölçüyle kıyaslansın)
+SABIT_STOP = 1.0
 BOLGE_STOP_PAY = 0.3       # bölge girişi için stop: destek bölgesinin altından bu kadar % aşağısı (fitil payı)
 RAPOR_MAX_SATIR = 40       # raporda hisse hisse listelenecek en fazla satır
 TELEGRAM_PARCA = 3800      # Telegram mesajı 4096 karakteri geçemez; uzun rapor bu uzunlukta parçalara bölünür
@@ -2454,8 +2462,18 @@ def bolge_sonucu(k, sonra, kap):
         ilk = "bozuldu"
     else:
         ilk = "belirsiz"
+    ts = np.flatnonzero(h >= giris * (1 + SABIT_HEDEF / 100))
+    bs = np.flatnonzero(l <= giris * (1 - SABIT_STOP / 100))
+    t2 = int(ts[0]) if len(ts) else None
+    b2 = int(bs[0]) if len(bs) else None
+    if t2 is not None and (b2 is None or t2 < b2):
+        ilk_s = "tepki"
+    elif b2 is not None:
+        ilk_s = "bozuldu"
+    else:
+        ilk_s = "belirsiz"
     return dict(doldu=True, giris=giris, kapanis_yuzde=(kap / giris - 1) * 100, en_yuksek_yuzde=(float(h.max()) / giris - 1) * 100,
-                en_dusuk_yuzde=(float(l.min()) / giris - 1) * 100, ilk=ilk, saat=sonra.index[i0].strftime("%H:%M"))
+                en_dusuk_yuzde=(float(l.min()) / giris - 1) * 100, ilk=ilk, ilk_sabit=ilk_s, saat=sonra.index[i0].strftime("%H:%M"))
 
 
 def _yz(x, n=1):
@@ -2487,7 +2505,9 @@ def _bolge_grup(ad, liste):
         return None
     t = sum(1 for k in d if k["sonuc"]["bolge"]["ilk"] == "tepki")
     b = sum(1 for k in d if k["sonuc"]["bolge"]["ilk"] == "bozuldu")
-    return f"  {ad}: {len(liste)} sinyal · bölgeye inen {len(d)} · tepki önce {t} · bozulma önce {b}"
+    t2 = sum(1 for k in d if k["sonuc"]["bolge"].get("ilk_sabit") == "tepki")
+    b2 = sum(1 for k in d if k["sonuc"]["bolge"].get("ilk_sabit") == "bozuldu")
+    return f"  {ad}: {len(liste)} sinyal · bölgeye inen {len(d)} · tepki önce {t} · bozulma önce {b} · ±%{SABIT_HEDEF:g}: {t2}/{b2}"
 
 
 ARAC_GRUPLARI = (
@@ -2517,7 +2537,9 @@ def bolge_satirlari(olcumlu):
         b = sum(1 for k in d if k["sonuc"]["bolge"]["ilk"] == "bozuldu")
         sat += [f"İnenlerde gün sonu girişin üstünde: {yuk}/{n} · ort {_yz(ort)}%",
                 f"Ortalama: girişten sonra en yüksek {_yz(oy)}% · en düşük {_yz(od)}%",
-                f"Önce tepki (+%{BOLGE_TEPKI:g}): {t} · önce bozulma: {b} · ikisi de olmadı: {n - t - b}"]
+                f"Önce tepki (+%{BOLGE_TEPKI:g}): {t} · önce bozulma: {b} · ikisi de olmadı: {n - t - b}",
+                f"Adil ölçü (her sinyale aynı: giriş +%{SABIT_HEDEF:g} / -%{SABIT_STOP:g}): tepki önce {sum(1 for k in d if k['sonuc']['bolge'].get('ilk_sabit') == 'tepki')} · "
+                f"bozulma önce {sum(1 for k in d if k['sonuc']['bolge'].get('ilk_sabit') == 'bozuldu')}  (gruplarda satır sonundaki 'tepki/bozulma' bu ölçüdür)"]
     sat.append("Puana göre:")
     for ad, f in (("puan 5 ve üstü", lambda k: k["puan"] >= 5), ("puan 3-4", lambda k: 3 <= k["puan"] <= 4), ("puan 1-2", lambda k: k["puan"] <= 2)):
         x = _bolge_grup(ad, [k for k in vals if f(k)])
@@ -2549,6 +2571,12 @@ def bolge_satirlari(olcumlu):
                   ("dar bölge", lambda k: oz_(k, "bolge_genislik") is not None and oz_(k, "bolge_genislik") < GENIS_BOLGE),
                   ("bölgede ilk test", lambda k: oz_(k, "test_n") == 0),
                   ("bölge daha önce test edilmiş", lambda k: (oz_(k, "test_n") or 0) >= 1),
+                  ("mesaj anında fiyat zaten bölgede", lambda k: k.get("destek_ust") is not None and float(k["fiyat"]) <= float(k["destek_ust"]) * 1.001),
+                  ("mesaj anında fiyat bölgenin üstünde", lambda k: k.get("destek_ust") is not None and float(k["fiyat"]) > float(k["destek_ust"]) * 1.001),
+                  ("bölge son 120 günde kapanışla kırılmış", lambda k: (oz_(k, "alt_kapanis") or 0) >= 1),
+                  ("bölge kırılmamış", lambda k: oz_(k, "alt_kapanis") == 0),
+                  ("son testte bölgenin üstüne çıkamamış", lambda k: oz_(k, "son_tepki") is not None and oz_(k, "son_tepki") < 0),
+                  ("son testte bölgenin üstüne çıkmış", lambda k: oz_(k, "son_tepki") is not None and oz_(k, "son_tepki") >= 0),
                   (f"piyasa genişliği ≥ %{int(GENISLIK_ESIK * 100)}", lambda k: bag_(k, "genislik") is not None and bag_(k, "genislik") >= GENISLIK_ESIK),
                   (f"piyasa genişliği < %{int(GENISLIK_ESIK * 100)}", lambda k: bag_(k, "genislik") is not None and bag_(k, "genislik") < GENISLIK_ESIK)):
         x = _bolge_grup(ad, [k for k in vals if f(k)])
