@@ -9,7 +9,7 @@ Sabit kurallar:
 - Düşen trend çizgisi kırılımı (🚀): en az 3 temas, eğim %3, temas yakınlığı %0,5
 - Kırılım: kapanmış mum çizginin en az %0,2 üstünde kapanmış ya da aktif mum %0,5 üstünde, ve fiyat hâlâ çizgi üstünde
 - Dönüş teyidi: 6 şart (yeşil mum, hacim, dip korunması, fiyat KAMA üstünde, MACD ve Wave Trend yukarı kesişimi son 5 mumda);
-  🚀 = en az 3/6 ve hacim dahil, 🔸 = hacim yok ama diğer 5 teyidin hepsi var (5/6)
+  🚀 = hacim + 🟢🔵🌊'dan en az biri (k4: 🔒 ve 📈 karara girmez), 🔸 = hacim yok ama 🟢🔵🌊'nın üçü de var
 - Fiyatın hâlâ altında kaldığı başka geçerli çizgi varsa mesaja uyarı satırı eklenir
 - Aynı mesajdaki hisseler en çok teyide göre sıralanır, ilki ⭐ ile işaretlenir
 - Aşırı satış tepkisi (🔻): app.py'deki beş göstergeli tarama, ekran görüntüsündeki ayarlarla
@@ -60,8 +60,10 @@ MIN_MUM = 110 if ZAMAN_DILIMI == "4s" else 270   # saatlikte 270 (app.py ile ayn
 # Alti teyit: 🟢 yesil mum, 📊 hacim, 🔒 dip korunmus, 📈 fiyat KAMA'nin ustunde,
 #             🔵 MACD (mavi cizgi kirmiziyi yukari kesti), 🌊 Wave Trend (yesil cizgi kirmiziyi yukari kesti)
 TEYIT_TOPLAM = 6
-MIN_TEYIT = 2          # 🚀 icin 6 teyitten en az 2'si VE hacim sartlarin icinde
-MIN_TEYIT_HACIMSIZ = 5  # 🔸 (hacimsiz kirilim) icin: hacim disindaki 5 teyidin hepsi sart
+SAYILAN_TEYIT = ("🟢", "📊", "🔵", "🌊")   # k4: KARAR icin sayilan teyitler. 🔒 (dip korundu) ve 📈 (KAMA ustu) neredeyse hep "var" oldugundan
+                                           # sonucu ayirmiyordu: kayit/mesaj/rapor icin tutulur ama 🚀/🔸 kararinda SAYILMAZ
+MIN_TEYIT = 2          # 🚀 icin SAYILAN 4 teyitten (🟢📊🔵🌊) en az 2'si VE hacim (📊) sartlarin icinde
+MIN_TEYIT_HACIMSIZ = 3  # 🔸 (hacimsiz kirilim) icin: hacim disindaki sayilan 3 teyidin (🟢🔵🌊) hepsi sart
 TEYIT_SON_N = 3 if ZAMAN_DILIMI == "4s" else 5   # MACD ve Wave Trend kesisimi icin bakilan son mum sayisi (bolge sarti yok); 4 saatlikte 3 mum = yaklasik 1 islem gunu
 KIRILIM_KAPANMIS = 0.2  # KAPANMIS mum cizginin en az % kac ustunde kapanmali
 KIRILIM_AKTIF = 0.5     # AKTIF (son, kapanmamis) mum cizginin en az % kac ustunde olmali
@@ -118,9 +120,8 @@ GOVDE_ATR_ESIK = 1.0    # kırılım mumunun gövdesi / ATR14
 GENISLIK_ESIK = 0.5     # taranan hisselerin günlük değişimi pozitif olanların oranı
 TEYIT_ADLARI = (("🟢", "yeşil mum"), ("🔒", "dip korundu"), ("📊", "hacim"), ("📈", "KAMA üstü"), ("🔵", "MACD"), ("🌊", "WaveTrend"))
 GUNLUK_DEG = {}         # sembol -> günlük değişim (%); analiz() doldurur
-SON_FIYAT = {}          # sembol -> son fiyat (15 dk verinin son kapanışı); analiz() doldurur, genişlik hesabı için
 BAGLAM = {}             # tarama anının bağlamı: endeks (BIST100 günlük %), genislik (0-1); main() doldurur
-KURAL_SURUMU = "k3-18Kas"   # kuralları ya da mum ızgarasını değiştirdiğinde bunu da değiştir: rapor sinyalleri sürüme göre ayırır (eski kayıtlar "eski" sayılır)
+KURAL_SURUMU = "k4-21Kas"   # kuralları ya da mum ızgarasını değiştirdiğinde bunu da değiştir: rapor sinyalleri sürüme göre ayırır (eski kayıtlar "eski" sayılır)
 GIRIS_MIN_RG = 1.5   # "en fazla bu fiyata kadar gir" sınırı için istenen en düşük risk/getiri (kazanç ≥ risk x bu)
 DIRENC_PERIYOT = "6mo"  # 4 saatlik düşen çizgi direnci için saatlik mum geçmişi (yalnızca sinyal veren hisselere çekilir)
 # app.py'deki "Gelişmiş ayarlar" varsayılanları
@@ -705,9 +706,10 @@ def guclu_kirilim(df, sembol, tr):
     if wt_teyidi(df):                # son 5 mumda Wave Trend yukari kesisim
         teyit_n += 1
         isaret += "🌊"
-    if "📊" in isaret and teyit_n >= MIN_TEYIT:
+    karar_n = sum(1 for sim in isaret if sim in SAYILAN_TEYIT)   # 🔒 ve 📈 kayit icin tutulur, karara girmez
+    if "📊" in isaret and karar_n >= MIN_TEYIT:
         kademe = "guclu"
-    elif "📊" not in isaret and teyit_n >= MIN_TEYIT_HACIMSIZ:
+    elif "📊" not in isaret and karar_n >= MIN_TEYIT_HACIMSIZ:
         kademe = "hacimsiz"
     else:
         kademe = "elenen"            # kirilim var ama teyit yetmedi: bildirilmez, sadece rapor icin kaydedilir
@@ -947,7 +949,6 @@ def analiz(sembol, bugun):
     ds = SAATLIK.get(sembol, df)         # 4s modunda likidite ve hareketsiz saat ölçümü saatlik tablodan
     try:
         GUNLUK_DEG[sembol] = float(gunluk_degisim(df))
-        SON_FIYAT[sembol] = float(df["Close"].iloc[-1])
     except Exception:
         pass
     LIKIDITE[sembol] = gunluk_islem_tutari(ds, bugun)
@@ -990,8 +991,8 @@ def sayi(x, n=2, isaretli=False):
 
 
 def eksik_sartlar(isaret):
-    adlar = (("🟢", "yeşil mum"), ("📊", "hacim"), ("🔒", "dip korunması"), ("📈", "KAMA üstü"),
-             ("🔵", "MACD kesişimi"), ("🌊", "Wave Trend kesişimi"))
+    adlar = (("🟢", "yeşil mum"), ("📊", "hacim"),
+             ("🔵", "MACD kesişimi"), ("🌊", "Wave Trend kesişimi"))   # k4: 🔒/📈 karara girmediği için "eksik" listesinde yok
     return [ad for sim, ad in adlar if sim not in isaret]
 
 
@@ -1349,52 +1350,6 @@ def veri_cek_15dk(sembol):
     df.index = df.index.tz_convert("Europe/Istanbul")
     return df
 
-
-
-def onceki_kapanislar(semboller, bugun, parca=100):
-    """Yahoo GÜNLÜK verisinden her hissenin dünkü (bugünden önceki son) resmî kapanışı: {sembol: fiyat}.
-    15 dakikalık verinin son mumu (17:45) kapanış seansından önceki fiyattır; 19 Kasım'da 580 hissenin 370'inde
-    resmî kapanıştan farklı çıktı ve genişliği olduğundan düşük gösterdi. Bu yüzden genişlik günlük kapanışla hesaplanır."""
-    sonuc = {}
-    for i in range(0, len(semboller), parca):
-        grup = semboller[i:i + parca]
-        try:
-            veri = yf.download(" ".join(x + ".IS" for x in grup), period="10d", interval="1d", auto_adjust=False,
-                               group_by="ticker", progress=False, threads=True)
-        except Exception:
-            veri = None
-        if veri is None or veri.empty:
-            continue
-        for x in grup:
-            try:
-                d = veri[x + ".IS"] if isinstance(veri.columns, pd.MultiIndex) else veri
-                d = d["Close"].dropna()
-                d = d[np.array([g < bugun for g in pd.DatetimeIndex(d.index).date])]
-                if len(d):
-                    sonuc[x] = float(d.iloc[-1])
-            except Exception:
-                pass
-    return sonuc
-
-
-def BAGLAM_GENISLIK_HESAPLA(semboller, bugun):
-    """Piyasa genişliği = likit hisselerden (destek botuyla aynı küme: günlük işlem tutarı ≥ LIKIDITE_MIN) dünkü resmî
-    kapanışının üstünde olanların oranı. Günlük veri alınamazsa eski yönteme (15 dk verinin dünkü son mumu) döner."""
-    likit = [s for s in SON_FIYAT if not (LIKIDITE_MIN > 0 and LIKIDITE.get(s, float("nan")) < LIKIDITE_MIN)]
-    try:
-        onceki = onceki_kapanislar(likit, bugun)
-    except Exception as e:
-        print(f"Dünkü kapanışlar alınamadı ({type(e).__name__}: {e})")
-        onceki = {}
-    ciftler = [(SON_FIYAT[s], onceki[s]) for s in likit if s in onceki]
-    if len(ciftler) >= 50:
-        BAGLAM["genislik"] = sum(1 for f, k in ciftler if f > k) / len(ciftler)
-        print(f"Genişlik: {sum(1 for f, k in ciftler if f > k)}/{len(ciftler)} likit hisse dünkü kapanışın üstünde")
-        return
-    degs = [GUNLUK_DEG[s] for s in likit if s in GUNLUK_DEG and GUNLUK_DEG[s] == GUNLUK_DEG[s]]
-    if len(degs) >= 50:
-        BAGLAM["genislik"] = sum(1 for v in degs if v > 0) / len(degs)
-        print(f"Genişlik (yedek yöntem, 15 dk son mum): {len(degs)} hisse")
 
 def endeks_verisi():
     """BIST100 (XU100) 15 dakikalık mumlar; alınamazsa None."""
@@ -1960,7 +1915,9 @@ def main(mod=None):
             BAGLAM["endeks"] = float(e_gun)
     except Exception as e:
         print(f"BIST100 anlık değişimi alınamadı ({type(e).__name__}: {e})")
-    BAGLAM_GENISLIK_HESAPLA(semboller, bugun)
+    degs = [v for v in GUNLUK_DEG.values() if v == v]
+    if len(degs) >= 50:
+        BAGLAM["genislik"] = sum(1 for v in degs if v > 0) / len(degs)
     print("Bağlam:", {a: round(v, 2) for a, v in BAGLAM.items()})
 
     if sayac["veri_yok"] > 0.5 * len(semboller):
